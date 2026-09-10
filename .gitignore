@@ -1,0 +1,25 @@
+# Local secrets and configuration
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+secrets/
+certs/
+config.local.*
+
+# Generated outputs and local experiments
+bin/
+dist/
+coverage/
+*.log
+*.pcap
+*.pcapng
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
