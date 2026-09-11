@@ -60,7 +60,15 @@ docker compose up -d --build
 docker compose logs --tail=20
 ```
 
-This binds host TCP 443. If another service owns that port, choose a different published port and use `--server-port` on the client. Do not replace an existing web service configuration without planning the change. Open the selected port in both the host firewall and the provider firewall.
+This binds host TCP 443 by default. To select another port, set `ETL_PORT=24443`
+in a local `.env` file before running Compose and use `--server-port 24443` on the
+client. Do not replace an existing web service configuration without planning the
+change. Open the selected port in both the host firewall and the provider firewall.
+
+If the network substitutes a TLS inspection certificate, the ETL client must reject
+it. Do not disable certificate validation or trust an inspection CA to get the
+token through. A different allowed port may avoid port-specific inspection, but
+does not guarantee that the network permits or cannot identify ETL.
 
 The directory must contain actual certificate files, not symlinks pointing outside the mounted directory. Your certificate renewal process must securely update these files and run `docker compose restart etl` to load the renewed certificate. ETL does not watch certificate files automatically.
 
