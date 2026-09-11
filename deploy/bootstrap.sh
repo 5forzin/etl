@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Run as root on a fresh Ubuntu 24.04 host after DNS points to its public IP.
+if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi
 set -euo pipefail
 
 domain=${1:?Usage: bootstrap.sh DOMAIN COMMIT}
