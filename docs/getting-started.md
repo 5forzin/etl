@@ -88,7 +88,7 @@ For an Azure VM deployed with the bootstrap, PowerShell 7 users with Azure CLI
 access can retrieve the client token without opening SSH:
 
 ```powershell
-./deploy/enroll-azure.ps1 -ResourceGroup rg-etl-lab -VMName vm-etl -TokenPath ./secrets/token
+./deploy/enroll-azure.ps1 -ResourceGroup your-rg -VMName your-vm -TokenPath ./secrets/token
 ```
 
 Create the local private `secrets` directory first. The command encrypts the token
