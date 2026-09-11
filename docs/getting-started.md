@@ -76,6 +76,18 @@ The optional [systemd unit](../deploy/etl.service) expects Node at `/usr/bin/nod
 
 ## Connect from your computer
 
+For an Azure VM deployed with the bootstrap, PowerShell 7 users with Azure CLI
+access can retrieve the client token without opening SSH:
+
+```powershell
+./deploy/enroll-azure.ps1 -ResourceGroup rg-etl-lab -VMName vm-etl -TokenPath ./secrets/token
+```
+
+Create the local private `secrets` directory first. The command encrypts the token
+on the VM with a temporary RSA public key, then decrypts it locally; plaintext
+credentials are not emitted into Azure Run Command output. It restricts local
+file permissions and refuses to overwrite an existing token file.
+
 Put the server's token in `secrets/token` locally, then run:
 
 ```sh

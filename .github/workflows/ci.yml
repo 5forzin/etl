@@ -15,6 +15,13 @@ jobs:
           node-version: '24'
       - run: npm run check
       - run: npm test
+      - name: Check Azure enrollment script
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $etlErrors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$PWD/deploy/enroll-azure.ps1", [ref]$null, [ref]$etlErrors) | Out-Null
+          if ($etlErrors.Count) { $etlErrors; exit 1 }
   container:
     runs-on: ubuntu-latest
     steps:
