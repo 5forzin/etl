@@ -1,0 +1,14 @@
+services:
+  etl:
+    build: .
+    ports:
+      - "443:8443"
+    volumes:
+      - ./secrets:/run/etl:ro
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 256m
+    restart: unless-stopped

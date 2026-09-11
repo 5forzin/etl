@@ -1,0 +1,13 @@
+{
+  "name": "encrypted-transport-lab",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "ETL — self-hosted authenticated TLS tunnel with a local SOCKS5 client",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "start": "node src/cli.js",
+    "test": "node --test",
+    "check": "node --check src/cli.js && node --check src/tunnel.js && node --check src/io.js && node --check src/policy.js"
+  }
+}

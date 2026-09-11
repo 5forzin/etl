@@ -14,6 +14,7 @@ config.local.*
 bin/
 dist/
 coverage/
+node_modules/
 *.log
 *.pcap
 *.pcapng

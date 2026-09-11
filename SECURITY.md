@@ -1,6 +1,6 @@
 # Security
 
-ETL is at the design stage and is not ready to protect production traffic.
+ETL is an experimental TCP MVP, has not had an independent security audit, and is not ready to protect sensitive production traffic.
 
 Do not include credentials, private keys, personal browsing data, or unredacted packet captures in issues or pull requests.
 

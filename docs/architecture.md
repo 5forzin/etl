@@ -1,6 +1,6 @@
 # Architecture
 
-Status: initial proposal. These are implementation requirements, not claims about existing software.
+Status: TCP MVP implemented in Node.js 24 using built-in networking and TLS. See [the protocol](protocol.md) for current behavior and [the roadmap](roadmap.md) for remaining deployment and transport work. Some requirements below remain design targets, including per-client quotas and automated certificate lifecycle management.
 
 ## Components
 
