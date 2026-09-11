@@ -1,0 +1,42 @@
+name: External network diagnostics
+
+# Manual probe from a GitHub-hosted runner: verifies that the deployed lab
+# answers on its public port from an outside network. Sends no credentials.
+on:
+  workflow_dispatch:
+    inputs:
+      host:
+        description: Host to probe (pass your own deployed hostname)
+        required: true
+      port:
+        description: TCP port to probe
+        required: true
+        default: "443"
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: TCP and TLS probe
+        run: |
+          node -e '
+          const net = require("net");
+          const tls = require("tls");
+          const host = "${{ inputs.host }}";
+          const port = Number("${{ inputs.port }}");
+          const socket = net.connect({ host, port, timeout: 15000 });
+          socket.on("timeout", () => { console.log("RESULT tcp TIMEOUT"); socket.destroy(); process.exit(2); });
+          socket.on("error", (e) => { console.log("RESULT tcp ERROR " + (e.code || e.message)); process.exit(2); });
+          socket.on("connect", () => {
+            console.log("RESULT tcp CONNECTED " + host + ":" + port);
+            const t = tls.connect({ socket, servername: host, rejectUnauthorized: false }, () => {
+              // Diagnostic only: reads the offered certificate. No ETL credentials
+              // are sent and the local client never disables verification.
+              const c = t.getPeerCertificate();
+              console.log("RESULT tls HANDSHAKE " + t.getProtocol());
+              console.log("RESULT cert subject=" + JSON.stringify(c.subject) + " issuer=" + JSON.stringify(c.issuer));
+              t.destroy();
+            });
+            t.on("error", (e) => { console.log("RESULT tls ERROR " + (e.code || e.message)); process.exit(3); });
+          });
+          '
