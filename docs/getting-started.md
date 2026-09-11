@@ -7,7 +7,7 @@ ETL 0.1 is an experimental TCP proxy. It is not a device-wide VPN or an undetect
 - Node.js 24 or newer on the client and server, or Docker Compose for the server.
 - A public Linux server with outbound internet access and inbound TCP 443 available.
 - A domain pointing directly to that server. Disable ordinary HTTP CDN proxying for this hostname: ETL speaks custom TLS, not HTTP.
-- A valid TLS certificate and matching private key for the hostname. Use an ACME client or your existing certificate provider; automatic certificate issuance is not implemented in ETL yet.
+- A valid TLS certificate and matching private key for the hostname. Use an ACME client or the fresh-server bootstrap below.
 
 No npm dependencies are required. Clone the repository on each machine:
 
@@ -18,6 +18,29 @@ node src/cli.js --help
 ```
 
 ## Server with Docker Compose
+
+### Fresh Ubuntu server bootstrap
+
+On a dedicated, fresh Ubuntu 24.04 server, `deploy/bootstrap.sh DOMAIN FULL_COMMIT_SHA`
+installs Docker and Certbot, clones the specified ETL revision to `/opt/etl`, generates
+a private token, obtains a Let's Encrypt certificate and enables automated renewal.
+Run it as root after the domain resolves directly to the server and inbound TCP 80
+and 443 are permitted. It accepts the Let's Encrypt terms and registers without an
+email address. On hosts with less than 1 GB RAM and no swap, it also adds a 1 GB
+swap file at `/swapfile-etl` and an entry to `/etc/fstab`.
+
+This script installs system packages and enables services; use it on a dedicated
+host. It refuses to overwrite an existing `/opt/etl`. Review it before running.
+TCP 80 must remain reachable for HTTP-01 renewals. The renewal hook copies the
+new certificate into the container's secret directory and restarts ETL, briefly
+interrupting active sessions. Retrieve `/opt/etl/secrets/token` through a trusted
+administrative channel and save it privately on your client.
+
+The bootstrap is an initial deployment workflow, not an idempotent upgrade tool.
+For removal, stop the Compose service and handle the certificate, installed packages,
+and optional swap entry separately after checking whether they are still in use.
+
+### Existing certificate/manual setup
 
 Create a private `secrets` directory containing `fullchain.pem`, `privkey.pem`, and `token`. Generate a token with:
 

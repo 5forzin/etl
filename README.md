@@ -4,7 +4,7 @@ A self-hosted encrypted tunnel for people with a domain and a server.
 
 ETL aims to make deploying your own tunnel straightforward: configure a domain, run the server, and connect through a local client. The project explores transport design and traffic detectability through reproducible experiments.
 
-**Status: experimental TCP MVP.** Client and server are implemented. Automated certificate provisioning, UDP, TUN, and traffic camouflage are not implemented.
+**Status: experimental TCP MVP.** Client and server are implemented, with a fresh-Ubuntu bootstrap for certificates and Docker deployment. UDP, TUN, and traffic camouflage are not implemented.
 
 Start with the [installation and client guide](docs/getting-started.md).
 

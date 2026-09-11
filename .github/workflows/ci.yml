@@ -21,3 +21,4 @@ jobs:
       - uses: actions/checkout@v7
       - run: docker build -t etl:test .
       - run: docker run --rm etl:test --help
+      - run: bash -n deploy/bootstrap.sh deploy/renew-certificate.sh
