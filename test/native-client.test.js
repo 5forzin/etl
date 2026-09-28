@@ -44,7 +44,9 @@ test('native Windows client fails over after a second with independent credentia
       }).catch(() => {});
     }));
     const partialPort = await listen(partial);
-    for (const [primaryPort, timeout] of [[blackholePort, 1000], [partialPort, 200]]) {
+    // Exercise the production one-second budget for both stalled phases. A
+    // 200 ms backup handshake also measured Windows runner scheduling delays.
+    for (const [primaryPort, timeout] of [[blackholePort, 1000], [partialPort, 1000]]) {
       const localPort = await freePort();
       const args = ['--headless', '--server', 'localhost', '--server-port', String(primaryPort),
         '--fallback-server', 'localhost', '--fallback-port', String(backupPort),
@@ -62,7 +64,8 @@ test('native Windows client fails over after a second with independent credentia
       const started = performance.now();
       socket.write(Buffer.concat([Buffer.from([5, 1, 0, 3, host.length]), host,
         Buffer.from([destinationPort >> 8, destinationPort & 255]), payload]));
-      assert.equal((await readStage(socket, 10, 'backup connect'))[1], 0, `backup failed with ${timeout} ms budget`);
+      const phase = primaryPort === blackholePort ? 'TLS' : 'authentication';
+      assert.equal((await readStage(socket, 10, `${phase} backup connect`))[1], 0, `backup failed with ${timeout} ms budget`);
       const elapsed = performance.now() - started;
       assert.ok(elapsed >= timeout * 0.7 && elapsed < timeout + 2000, `setup took ${elapsed} ms`);
       assert.deepEqual(await read(socket, payload.length), payload);
