@@ -7,11 +7,13 @@
 *.p12
 *.pfx
 secrets/
+relay-secret.txt
 certs/
 config.local.*
 
 # Generated outputs and local experiments
 bin/
+build/
 dist/
 coverage/
 node_modules/
