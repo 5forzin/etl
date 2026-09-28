@@ -414,6 +414,14 @@ using ConnectClock = std::chrono::steady_clock;
 static SOCKET connectServer(const std::wstring& host, int port, const std::atomic<bool>& running,
                             ConnectClock::time_point deadline) {
   if (!running) return INVALID_SOCKET;
+  // Some MinGW header releases omit these Windows 8 APIs. Resolve the OS
+  // exports directly so the portable build still supports cancellable DNS.
+  using CancelLookup = INT (WSAAPI*)(LPHANDLE);
+  using LookupResult = INT (WSAAPI*)(LPOVERLAPPED);
+  HMODULE winsock = GetModuleHandleW(L"ws2_32.dll");
+  auto cancelLookup = reinterpret_cast<CancelLookup>(GetProcAddress(winsock, "GetAddrInfoExCancel"));
+  auto completedLookup = reinterpret_cast<LookupResult>(GetProcAddress(winsock, "GetAddrInfoExOverlappedResult"));
+  if (!cancelLookup || !completedLookup) return INVALID_SOCKET;
   ADDRINFOEXW hint{}; hint.ai_socktype = SOCK_STREAM; hint.ai_protocol = IPPROTO_TCP;
   ADDRINFOEXW* addresses = nullptr;
   auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(deadline - ConnectClock::now()).count();
@@ -434,11 +442,11 @@ static SOCKET connectServer(const std::wstring& host, int port, const std::atomi
       if (waited == WAIT_FAILED) break;
     }
     if (!completed) {
-      GetAddrInfoExCancel(&cancellation);
+      cancelLookup(&cancellation);
       // Keep the result and OVERLAPPED storage alive until cancellation finishes.
       WaitForSingleObject(lookup.hEvent, INFINITE);
     }
-    lookupResult = GetAddrInfoExOverlappedResult(&lookup);
+    lookupResult = completedLookup(&lookup);
   }
   CloseHandle(lookup.hEvent);
   if (lookupResult || !running || ConnectClock::now() >= deadline) {
