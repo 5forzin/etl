@@ -467,7 +467,9 @@ static SOCKET connectServer(const std::wstring& host, int port, const std::atomi
   }
 
   using Clock = ConnectClock;
-  constexpr auto delay = std::chrono::milliseconds(250);
+  const auto remainingBudget = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now());
+  const auto delay = std::max(std::chrono::milliseconds(1),
+    std::min(std::chrono::milliseconds(250), remainingBudget / 2));
   constexpr auto poll = std::chrono::milliseconds(100);
   auto nextAttempt = Clock::now();
   size_t next = 0;

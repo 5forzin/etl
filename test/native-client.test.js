@@ -62,7 +62,7 @@ test('native Windows client fails over after a second with independent credentia
       const started = performance.now();
       socket.write(Buffer.concat([Buffer.from([5, 1, 0, 3, host.length]), host,
         Buffer.from([destinationPort >> 8, destinationPort & 255]), payload]));
-      assert.equal((await readStage(socket, 10, 'backup connect'))[1], 0);
+      assert.equal((await readStage(socket, 10, 'backup connect'))[1], 0, `backup failed with ${timeout} ms budget`);
       const elapsed = performance.now() - started;
       assert.ok(elapsed >= timeout * 0.7 && elapsed < timeout + 2000, `setup took ${elapsed} ms`);
       assert.deepEqual(await read(socket, payload.length), payload);
