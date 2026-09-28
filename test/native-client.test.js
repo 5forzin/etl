@@ -12,6 +12,11 @@ import { track, protect, read, connected } from '../src/io.js';
 
 const executable = process.env.ETL_NATIVE_CLIENT;
 
+test('native Windows client protects stored tokens with DPAPI',
+  { skip: !executable || process.platform !== 'win32' }, () => {
+    execFileSync(executable, ['--self-test-token-storage'], { windowsHide: true });
+  });
+
 async function listen(server, host = '127.0.0.1') {
   server.listen(0, host);
   await once(server, 'listening');

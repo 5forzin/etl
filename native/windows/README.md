@@ -2,7 +2,7 @@
 
 Download `etl-client.exe`, `SHA256SUMS`, and `LICENSE-OpenSSL.txt` from the [GitHub release](https://github.com/5forzin/etl/releases). The portable build is a single Windows x64 executable; it needs no installer or MSYS2 DLLs. It is not code-signed. Verify the checksum with `Get-FileHash .\etl-client.exe -Algorithm SHA256` before running it.
 
-The client opens in the system tray. Select the ETL server, port, and a local token file, then connect. It listens only on `127.0.0.1`; configure an application to use SOCKS5 at `127.0.0.1:1080` with proxy-side DNS. It forwards TCP only. Settings are stored in `%APPDATA%\ETL\settings.ini`; the token itself is never included in the release or stored in that settings file.
+The client opens in the system tray. Enter the ETL server, port, and token directly, then connect. The token field is masked. It listens only on `127.0.0.1`; configure an application to use SOCKS5 at `127.0.0.1:1080` with proxy-side DNS. It forwards TCP only. Settings are stored in `%APPDATA%\ETL\settings.ini`; the token is stored there encrypted with Windows DPAPI for the current user, never as plaintext or in the release. An existing `token_file` setting is migrated automatically when the file is available. The headless test mode still accepts `--token-file`.
 
 To reproduce the portable build with MSYS2 UCRT64 (`gcc`, `openssl`, `cmake`, `ninja`):
 

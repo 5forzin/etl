@@ -35,6 +35,8 @@ constexpr int ID_EXIT = 202;
 struct Config {
   std::wstring server = L"etl.nora.systems";
   int serverPort = 443;
+  std::wstring protectedToken;
+  // Kept for headless automation; the desktop UI accepts the token directly.
   std::wstring tokenFile;
   int localPort = 1080;
   std::wstring caFile;
@@ -73,25 +75,10 @@ static std::wstring readSetting(const std::wstring& path, const wchar_t* name, c
   return buffer;
 }
 
-static Config loadConfig() {
-  Config c;
-  auto path = configPath();
-  c.server = readSetting(path, L"server", c.server.c_str());
-  c.tokenFile = readSetting(path, L"token_file", L"");
-  c.caFile = readSetting(path, L"ca_file", L"");
-  int value;
-  if (portValue(readSetting(path, L"server_port", L"443"), value)) c.serverPort = value;
-  if (portValue(readSetting(path, L"local_port", L"1080"), value)) c.localPort = value;
-  return c;
-}
-
-static void saveConfig(const Config& c) {
-  auto path = configPath();
-  WritePrivateProfileStringW(L"client", L"server", c.server.c_str(), path.c_str());
-  WritePrivateProfileStringW(L"client", L"server_port", std::to_wstring(c.serverPort).c_str(), path.c_str());
-  WritePrivateProfileStringW(L"client", L"token_file", c.tokenFile.c_str(), path.c_str());
-  WritePrivateProfileStringW(L"client", L"local_port", std::to_wstring(c.localPort).c_str(), path.c_str());
-  WritePrivateProfileStringW(L"client", L"ca_file", c.caFile.c_str(), path.c_str());
+static bool validToken(const std::string& token) {
+  return token.size() == 64 && std::all_of(token.begin(), token.end(), [](char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+  });
 }
 
 static bool readToken(const std::wstring& path, std::string& token) {
@@ -102,9 +89,92 @@ static bool readToken(const std::wstring& path, std::string& token) {
   file.seekg(0);
   token.assign(std::istreambuf_iterator<char>(file), {});
   while (!token.empty() && (token.back() == '\n' || token.back() == '\r' || token.back() == ' ')) token.pop_back();
-  return token.size() == 64 && std::all_of(token.begin(), token.end(), [](char c) {
-    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
-  });
+  if (validToken(token)) return true;
+  OPENSSL_cleanse(token.data(), token.size());
+  token.clear();
+  return false;
+}
+
+static bool protectToken(const std::string& token, std::wstring& encoded) {
+  if (!validToken(token)) return false;
+  DATA_BLOB plain{static_cast<DWORD>(token.size()), reinterpret_cast<BYTE*>(const_cast<char*>(token.data()))};
+  DATA_BLOB protectedData{};
+  if (!CryptProtectData(&plain, L"ETL token", nullptr, nullptr, nullptr,
+                        CRYPTPROTECT_UI_FORBIDDEN, &protectedData)) return false;
+  constexpr wchar_t digits[] = L"0123456789abcdef";
+  encoded.clear();
+  encoded.reserve(protectedData.cbData * 2);
+  for (DWORD i = 0; i < protectedData.cbData; ++i) {
+    encoded += digits[protectedData.pbData[i] >> 4];
+    encoded += digits[protectedData.pbData[i] & 15];
+  }
+  LocalFree(protectedData.pbData);
+  return true;
+}
+
+static bool unprotectToken(const std::wstring& encoded, std::string& token) {
+  if (encoded.empty() || encoded.size() % 2 || encoded.size() > 2048) return false;
+  auto digit = [](wchar_t c) -> int {
+    if (c >= L'0' && c <= L'9') return c - L'0';
+    if (c >= L'a' && c <= L'f') return c - L'a' + 10;
+    return -1;
+  };
+  std::vector<BYTE> bytes;
+  bytes.reserve(encoded.size() / 2);
+  for (size_t i = 0; i < encoded.size(); i += 2) {
+    int high = digit(encoded[i]), low = digit(encoded[i + 1]);
+    if (high < 0 || low < 0) return false;
+    bytes.push_back(static_cast<BYTE>((high << 4) | low));
+  }
+  DATA_BLOB protectedData{static_cast<DWORD>(bytes.size()), bytes.data()};
+  DATA_BLOB plain{};
+  if (!CryptUnprotectData(&protectedData, nullptr, nullptr, nullptr, nullptr,
+                          CRYPTPROTECT_UI_FORBIDDEN, &plain)) return false;
+  token.assign(reinterpret_cast<char*>(plain.pbData), plain.cbData);
+  SecureZeroMemory(plain.pbData, plain.cbData);
+  LocalFree(plain.pbData);
+  if (validToken(token)) return true;
+  OPENSSL_cleanse(token.data(), token.size());
+  token.clear();
+  return false;
+}
+
+static bool tokenForConfig(const Config& config, std::string& token) {
+  if (!config.protectedToken.empty()) return unprotectToken(config.protectedToken, token);
+  return !config.tokenFile.empty() && readToken(config.tokenFile, token);
+}
+
+static Config loadConfig() {
+  Config c;
+  auto path = configPath();
+  c.server = readSetting(path, L"server", c.server.c_str());
+  c.protectedToken = readSetting(path, L"token_protected", L"");
+  c.caFile = readSetting(path, L"ca_file", L"");
+  int value;
+  if (portValue(readSetting(path, L"server_port", L"443"), value)) c.serverPort = value;
+  if (portValue(readSetting(path, L"local_port", L"1080"), value)) c.localPort = value;
+  if (c.protectedToken.empty()) {
+    const auto legacyFile = readSetting(path, L"token_file", L"");
+    std::string token;
+    if (!legacyFile.empty() && readToken(legacyFile, token) && protectToken(token, c.protectedToken)) {
+      if (WritePrivateProfileStringW(L"client", L"token_protected", c.protectedToken.c_str(), path.c_str())) {
+        WritePrivateProfileStringW(L"client", L"token_file", nullptr, path.c_str());
+      }
+    }
+    OPENSSL_cleanse(token.data(), token.size());
+  }
+  return c;
+}
+
+static bool saveConfig(const Config& c) {
+  auto path = configPath();
+  bool ok = WritePrivateProfileStringW(L"client", L"server", c.server.c_str(), path.c_str()) &&
+    WritePrivateProfileStringW(L"client", L"server_port", std::to_wstring(c.serverPort).c_str(), path.c_str()) &&
+    WritePrivateProfileStringW(L"client", L"token_protected", c.protectedToken.c_str(), path.c_str()) &&
+    WritePrivateProfileStringW(L"client", L"local_port", std::to_wstring(c.localPort).c_str(), path.c_str()) &&
+    WritePrivateProfileStringW(L"client", L"ca_file", c.caFile.c_str(), path.c_str());
+  if (ok) ok = WritePrivateProfileStringW(L"client", L"token_file", nullptr, path.c_str());
+  return ok;
 }
 
 static bool socketRead(SOCKET s, void* p, size_t n, const std::atomic<bool>& running) {
@@ -322,7 +392,7 @@ class Service {
   bool start(const Config& config, std::wstring& error) {
     if (running_) return true;
     std::string token;
-    if (!readToken(config.tokenFile, token)) { error = L"Selecione um arquivo de token válido (64 caracteres hexadecimais)."; return false; }
+    if (!tokenForConfig(config, token)) { error = L"Informe um token válido (64 caracteres hexadecimais)."; return false; }
     OPENSSL_cleanse(token.data(), token.size());
     if (config.server.empty() || config.serverPort < 1 || config.localPort < 1) { error = L"Configuração inválida."; return false; }
     ctx_ = SSL_CTX_new(TLS_client_method());
@@ -411,8 +481,14 @@ class Service {
           SSL_set1_host(ssl, server.c_str()) == 1 &&
           SSL_connect(ssl) == 1 && SSL_get_verify_result(ssl) == X509_V_OK) {
         std::string token;
-        if (readToken(config_.tokenFile, token)) {
-          ok = writeFrame(ssl, "{\"v\":1,\"token\":\"" + token + "\"}");
+        if (tokenForConfig(config_, token)) {
+          std::string auth;
+          auth.reserve(token.size() + 20);
+          auth.assign("{\"v\":1,\"token\":\"");
+          auth.append(token);
+          auth.append("\"}");
+          ok = writeFrame(ssl, auth);
+          OPENSSL_cleanse(auth.data(), auth.size());
           OPENSSL_cleanse(token.data(), token.size());
           ok = ok && responseOK(ssl);
           std::string encoded = jsonEscape(host);
@@ -477,7 +553,9 @@ static bool exitAfterStop = false;
 static std::wstring field(HWND window, int id) {
   wchar_t buffer[1024]{};
   GetWindowTextW(GetDlgItem(window, id), buffer, 1024);
-  return buffer;
+  std::wstring result(buffer);
+  SecureZeroMemory(buffer, sizeof(buffer));
+  return result;
 }
 
 static void updateStatus(HWND window) {
@@ -509,7 +587,15 @@ static void connectOrStop(HWND window) {
   {
     Config next;
     next.server = field(window, ID_SERVER);
-    next.tokenFile = field(window, ID_TOKEN);
+    std::wstring entered = field(window, ID_TOKEN);
+    std::string token = utf8(entered);
+    SecureZeroMemory(entered.data(), entered.size() * sizeof(wchar_t));
+    if (!protectToken(token, next.protectedToken)) {
+      OPENSSL_cleanse(token.data(), token.size());
+      MessageBoxW(window, L"Informe um token válido (64 caracteres hexadecimais).", L"ETL", MB_ICONERROR);
+      return;
+    }
+    OPENSSL_cleanse(token.data(), token.size());
     next.caFile = field(window, ID_CA);
     if (!portValue(field(window, ID_SERVER_PORT), next.serverPort) ||
         !portValue(field(window, ID_LOCAL_PORT), next.localPort)) {
@@ -518,7 +604,7 @@ static void connectOrStop(HWND window) {
     std::wstring error;
     if (!service.start(next, error)) { MessageBoxW(window, error.c_str(), L"ETL", MB_ICONERROR); return; }
     config = next;
-    saveConfig(config);
+    if (!saveConfig(config)) MessageBoxW(window, L"Conectado, mas não foi possível salvar a configuração.", L"ETL", MB_ICONWARNING);
   }
   updateStatus(window);
 }
@@ -528,9 +614,9 @@ static void showWindow(HWND window) {
   SetForegroundWindow(window);
 }
 
-static void label(HWND window, int y, const wchar_t* text, int editId, const std::wstring& value) {
+static void label(HWND window, int y, const wchar_t* text, int editId, const std::wstring& value, DWORD style = 0) {
   CreateWindowW(L"STATIC", text, WS_CHILD | WS_VISIBLE, 16, y, 105, 22, window, nullptr, nullptr, nullptr);
-  CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", value.c_str(), WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+  CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", value.c_str(), WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | style,
     125, y - 2, 280, 25, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(editId)), nullptr, nullptr);
 }
 
@@ -539,7 +625,15 @@ static LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wparam, LPA
     case WM_CREATE:
       label(window, 20, L"Servidor", ID_SERVER, config.server);
       label(window, 55, L"Porta remota", ID_SERVER_PORT, std::to_wstring(config.serverPort));
-      label(window, 90, L"Arquivo token", ID_TOKEN, config.tokenFile);
+      {
+        std::string token;
+        std::wstring visible;
+        if (unprotectToken(config.protectedToken, token)) visible.assign(token.begin(), token.end());
+        OPENSSL_cleanse(token.data(), token.size());
+        label(window, 90, L"Token", ID_TOKEN, visible, ES_PASSWORD);
+        SecureZeroMemory(visible.data(), visible.size() * sizeof(wchar_t));
+        SendMessageW(GetDlgItem(window, ID_TOKEN), EM_LIMITTEXT, 64, 0);
+      }
       label(window, 125, L"Porta local", ID_LOCAL_PORT, std::to_wstring(config.localPort));
       label(window, 160, L"CA opcional", ID_CA, config.caFile);
       CreateWindowW(L"BUTTON", L"Conectar", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
@@ -592,6 +686,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   if (WSAStartup(MAKEWORD(2, 2), &data)) return 1;
   int argc = 0;
   LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+  if (argc == 2 && std::wstring(argv[1]) == L"--self-test-token-storage") {
+    std::string original(64, 'a'), restored;
+    std::wstring protectedValue;
+    bool ok = protectToken(original, protectedValue) &&
+      unprotectToken(protectedValue, restored) && restored == original;
+    OPENSSL_cleanse(original.data(), original.size());
+    OPENSSL_cleanse(restored.data(), restored.size());
+    LocalFree(argv); WSACleanup(); return ok ? 0 : 23;
+  }
   if (argc > 1 && std::wstring(argv[1]) == L"--headless") {
     Config c;
     for (int i = 2; i + 1 < argc; i += 2) {
