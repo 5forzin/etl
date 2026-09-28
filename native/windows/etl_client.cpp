@@ -418,9 +418,33 @@ static SOCKET connectServer(const std::wstring& host, int port, const std::atomi
   ADDRINFOEXW* addresses = nullptr;
   auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(deadline - ConnectClock::now()).count();
   if (remaining <= 0) return INVALID_SOCKET;
-  timeval dnsTimeout{static_cast<long>(remaining / 1000000), static_cast<long>(remaining % 1000000)};
-  if (GetAddrInfoExW(host.c_str(), std::to_wstring(port).c_str(), NS_DNS, nullptr, &hint,
-                    &addresses, &dnsTimeout, nullptr, nullptr, nullptr)) return INVALID_SOCKET;
+  OVERLAPPED lookup{};
+  lookup.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (!lookup.hEvent) return INVALID_SOCKET;
+  HANDLE cancellation = nullptr;
+  const auto service = std::to_wstring(port);
+  int lookupResult = GetAddrInfoExW(host.c_str(), service.c_str(), NS_DNS, nullptr, &hint,
+                                    &addresses, nullptr, &lookup, nullptr, &cancellation);
+  if (lookupResult == WSA_IO_PENDING) {
+    bool completed = false;
+    while (running && ConnectClock::now() < deadline) {
+      auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - ConnectClock::now()).count();
+      DWORD waited = WaitForSingleObject(lookup.hEvent, static_cast<DWORD>(std::max<int64_t>(1, std::min<int64_t>(100, ms))));
+      if (waited == WAIT_OBJECT_0) { completed = true; break; }
+      if (waited == WAIT_FAILED) break;
+    }
+    if (!completed) {
+      GetAddrInfoExCancel(&cancellation);
+      // Keep the result and OVERLAPPED storage alive until cancellation finishes.
+      WaitForSingleObject(lookup.hEvent, INFINITE);
+    }
+    lookupResult = GetAddrInfoExOverlappedResult(&lookup);
+  }
+  CloseHandle(lookup.hEvent);
+  if (lookupResult || !running || ConnectClock::now() >= deadline) {
+    if (addresses) FreeAddrInfoExW(addresses);
+    return INVALID_SOCKET;
+  }
   // Keep the OS-preferred family first, but give the other family a prompt try.
   std::vector<ADDRINFOEXW*> preferred, alternate, order;
   int preferredFamily = AF_UNSPEC;
