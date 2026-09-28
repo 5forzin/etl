@@ -29,3 +29,33 @@ jobs:
       - run: docker build -t etl:test .
       - run: docker run --rm etl:test --help
       - run: bash -n deploy/bootstrap.sh deploy/renew-certificate.sh
+  native-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
+        with:
+          msystem: UCRT64
+          update: true
+          path-type: inherit
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-openssl
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+      - name: Build, package and test the portable client
+        shell: msys2 {0}
+        run: |
+          cmake -S native/windows -B build/windows-portable -G Ninja -DCMAKE_BUILD_TYPE=Release -DETL_PORTABLE=ON
+          cmake --build build/windows-portable
+          pwsh -NoProfile -File native/windows/package.ps1 -Portable -RuntimeBin "$(cygpath -w /ucrt64/bin)"
+          export ETL_NATIVE_CLIENT="$(cygpath -w "$PWD/dist/windows-portable/etl-client.exe")"
+          export ETL_OPENSSL="$(cygpath -w /ucrt64/bin/openssl.exe)"
+          node --test test/native-client.test.js
+      - uses: actions/upload-artifact@v7
+        with:
+          name: etl-windows-portable
+          path: dist/windows-portable/

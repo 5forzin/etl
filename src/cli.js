@@ -13,6 +13,10 @@ node src/cli.js client --server vpn.example.com --token-file secrets/token
 Options:
   --port NUMBER          Server/listener port (server: 443; client: 1080)
   --server-port NUMBER   Remote TLS port (client: 443)
+  --fallback-server HOST Backup host for new connections
+  --fallback-port NUMBER Backup TLS port (default: remote port)
+  --fallback-token-file PATH  Backup credential (default: primary token)
+  --connect-timeout-ms N Tunnel setup budget per host (default: 1000)
   --listen IP            Server bind address (default: 0.0.0.0)
   --ca PATH              Additional trust anchor for a private/test CA
   --max-connections N    Maximum simultaneous connections (default: 128)
@@ -34,6 +38,8 @@ async function main() {
     server: { type: 'string' }, port: { type: 'string' },
     'server-port': { type: 'string' }, listen: { type: 'string' },
     ca: { type: 'string' }, 'max-connections': { type: 'string' },
+    'fallback-server': { type: 'string' }, 'fallback-port': { type: 'string' },
+    'fallback-token-file': { type: 'string' }, 'connect-timeout-ms': { type: 'string' },
   } });
   const [command] = positionals;
   if (values.help || !command) { console.log(help); return; }
@@ -56,7 +62,15 @@ async function main() {
   } else {
     if (!values.server) throw new Error('--server is required');
     if (values.listen) throw new Error('Client binds only to loopback; omit --listen');
-    service = createClient({ host: values.server, port: port(values['server-port'], 443),
+    if (!values['fallback-server'] && (values['fallback-port'] || values['fallback-token-file'])) {
+      throw new Error('--fallback-server is required for backup options');
+    }
+    const remotePort = port(values['server-port'], 443);
+    const fallbacks = values['fallback-server'] ? [{ host: values['fallback-server'],
+      port: port(values['fallback-port'], remotePort), token: values['fallback-token-file'] ?
+        tokenFile(values['fallback-token-file'])() : getToken() }] : [];
+    service = createClient({ host: values.server, port: remotePort, fallbacks,
+      connectTimeout: Number(values['connect-timeout-ms'] ?? 1000),
       token: getToken(), ca: values.ca ? readFileSync(values.ca) : undefined, maxConnections });
     bind = '127.0.0.1';
     listenPort = port(values.port, 1080);

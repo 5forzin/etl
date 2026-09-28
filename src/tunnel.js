@@ -100,22 +100,59 @@ function reply(socket, code) {
 }
 
 export function createClient({ host, port = 443, servername = host, token, ca,
+  fallbacks = [], connectTimeout = 1000,
   maxConnections = 128, handshakeTimeout = HANDSHAKE, idleTimeout = IDLE }) {
   validateToken(token);
+  if (!Number.isInteger(connectTimeout) || connectTimeout < 1 || connectTimeout > 60_000) {
+    throw new Error('connectTimeout must be between 1 and 60000 milliseconds');
+  }
+  const endpoints = [{ host, port, servername, token }, ...fallbacks.map((endpoint) => ({
+    host: endpoint.host, port: endpoint.port ?? port,
+    servername: endpoint.servername ?? endpoint.host, token: endpoint.token ?? token,
+  }))];
+  for (const endpoint of endpoints) {
+    validateToken(endpoint.token);
+    if (typeof endpoint.host !== 'string' || !endpoint.host ||
+        !Number.isInteger(endpoint.port) || endpoint.port < 1 || endpoint.port > 65535) {
+      throw new Error('Invalid tunnel endpoint');
+    }
+  }
   const server = net.createServer({ allowHalfOpen: true }, (socket) => {
     protect(socket, handshakeTimeout);
-    const deadline = setTimeout(() => socket.destroy(), handshakeTimeout);
+    let deadline = setTimeout(() => socket.destroy(), handshakeTimeout);
     let tunnel;
     socket.once('close', () => { clearTimeout(deadline); tunnel?.destroy(); });
     void (async () => {
       const destination = await socksDestination(socket);
       if (!destination || socket.destroyed) return;
-      tunnel = protect(tls.connect({ host, port, servername, ca,
-        rejectUnauthorized: true, minVersion: 'TLSv1.3', allowHalfOpen: true }), handshakeTimeout);
-      await connected(tunnel, 'secureConnect');
-      if (socket.destroyed) { tunnel.destroy(); return; }
-      writeFrame(tunnel, { v: 1, token });
-      if ((await readFrame(tunnel))?.code !== 'OK') throw new Error('Authentication failed');
+      clearTimeout(deadline);
+      const setupTimeout = handshakeTimeout + endpoints.length * connectTimeout;
+      socket.setTimeout(setupTimeout);
+      deadline = setTimeout(() => socket.destroy(), setupTimeout);
+      for (const endpoint of endpoints) {
+        if (socket.destroyed) return;
+        const candidate = protect(tls.connect({ host: endpoint.host, port: endpoint.port,
+          servername: endpoint.servername, ca, rejectUnauthorized: true,
+          minVersion: 'TLSv1.3', allowHalfOpen: true }), connectTimeout);
+        tunnel = candidate;
+        // One absolute budget covers DNS, TCP, TLS and authentication, even if
+        // a stalled endpoint sends occasional bytes. No application data is retried.
+        const attemptDeadline = setTimeout(() => candidate.destroy(), connectTimeout);
+        try {
+          await connected(candidate, 'secureConnect');
+          if (socket.destroyed) { candidate.destroy(); return; }
+          writeFrame(candidate, { v: 1, token: endpoint.token });
+          if ((await readFrame(candidate))?.code !== 'OK') throw new Error('Authentication failed');
+          candidate.setTimeout(handshakeTimeout);
+          break;
+        } catch {
+          candidate.destroy();
+          tunnel = undefined;
+        } finally {
+          clearTimeout(attemptDeadline);
+        }
+      }
+      if (!tunnel || socket.destroyed) throw new Error('No tunnel endpoint available');
       writeFrame(tunnel, destination);
       if ((await readFrame(tunnel))?.code !== 'OK') throw new Error('Destination failed');
       clearTimeout(deadline);
