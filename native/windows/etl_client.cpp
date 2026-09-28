@@ -10,7 +10,9 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cctype>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -253,8 +255,8 @@ static void socksReply(SOCKET s, unsigned char code) {
 }
 
 static bool socksRequest(SOCKET s, std::string& host, int& port, const std::atomic<bool>& running) {
-  unsigned char header[4];
-  if (!socketRead(s, header, 2, running) || header[0] != 5 || header[1] == 0) return false;
+  unsigned char header[4]{5};
+  if (!socketRead(s, header + 1, 1, running) || header[1] == 0) return false;
   std::vector<unsigned char> methods(header[1]);
   if (!socketRead(s, methods.data(), methods.size(), running)) return false;
   if (std::find(methods.begin(), methods.end(), 0) == methods.end()) {
@@ -280,6 +282,112 @@ static bool socksRequest(SOCKET s, std::string& host, int& port, const std::atom
   if (!socketRead(s, bytes, 2, running)) return false;
   port = (int(bytes[0]) << 8) | bytes[1];
   return port > 0 && !jsonEscape(host).empty();
+}
+
+struct HttpRequest {
+  std::string host;
+  int port = 0;
+  std::string initialData;
+  bool connect = false;
+};
+
+static bool parseAuthority(const std::string& authority, int defaultPort, std::string& host, int& port) {
+  if (authority.empty() || authority.size() > 261) return false;
+  std::string portText;
+  if (authority[0] == '[') {
+    size_t end = authority.find(']');
+    if (end == std::string::npos) return false;
+    host = authority.substr(1, end - 1);
+    if (end + 1 < authority.size()) {
+      if (authority[end + 1] != ':') return false;
+      portText = authority.substr(end + 2);
+    }
+  } else {
+    size_t colon = authority.rfind(':');
+    if (colon != std::string::npos) {
+      if (authority.find(':') != colon) return false;
+      host = authority.substr(0, colon);
+      portText = authority.substr(colon + 1);
+    } else host = authority;
+  }
+  if (host.empty() || host.size() > 253 || jsonEscape(host) != host ||
+      host.find_first_of(" /?#@\\") != std::string::npos) return false;
+  port = defaultPort;
+  if (!portText.empty()) {
+    if (portText.size() > 5 || !std::all_of(portText.begin(), portText.end(), [](char c) { return c >= '0' && c <= '9'; })) return false;
+    port = std::stoi(portText);
+  } else if (defaultPort == 0 || authority.back() == ':') return false;
+  return port >= 1 && port <= 65535;
+}
+
+static std::string lowerAscii(std::string value) {
+  for (char& c : value) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return value;
+}
+
+static bool httpRequest(SOCKET s, char first, HttpRequest& result, const std::atomic<bool>& running) {
+  std::string request(1, first);
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (request.size() < 8192 && running && std::chrono::steady_clock::now() < deadline) {
+    if (request.size() >= 4 && request.compare(request.size() - 4, 4, "\r\n\r\n") == 0) break;
+    fd_set readable; FD_ZERO(&readable); FD_SET(s, &readable);
+    timeval pollTimeout{0, 250000};
+    int ready = select(0, &readable, nullptr, nullptr, &pollTimeout);
+    if (ready == SOCKET_ERROR) return false;
+    if (!ready) continue;
+    char byte;
+    if (recv(s, &byte, 1, 0) != 1 || byte == '\0') return false;
+    request += byte;
+  }
+  if (request.size() < 4 || request.compare(request.size() - 4, 4, "\r\n\r\n") != 0) return false;
+  size_t lineEnd = request.find("\r\n");
+  if (lineEnd == std::string::npos) return false;
+  const std::string line = request.substr(0, lineEnd);
+  size_t firstSpace = line.find(' '), lastSpace = line.rfind(' ');
+  if (firstSpace == std::string::npos || lastSpace == firstSpace || line.find(' ', firstSpace + 1) != lastSpace) return false;
+  std::string method = line.substr(0, firstSpace);
+  std::string target = line.substr(firstSpace + 1, lastSpace - firstSpace - 1);
+  std::string version = line.substr(lastSpace + 1);
+  if (method.empty() || method.size() > 16 ||
+      !std::all_of(method.begin(), method.end(), [](char c) { return c >= 'A' && c <= 'Z'; }) ||
+      (version != "HTTP/1.0" && version != "HTTP/1.1")) return false;
+  if (method == "CONNECT") {
+    result.connect = true;
+    return parseAuthority(target, 0, result.host, result.port);
+  }
+  if (target.compare(0, 7, "http://") != 0) return false;
+  size_t pathStart = target.find_first_of("/?", 7);
+  std::string authority = target.substr(7, pathStart == std::string::npos ? std::string::npos : pathStart - 7);
+  if (!parseAuthority(authority, 80, result.host, result.port)) return false;
+  std::string path = pathStart == std::string::npos ? "/" : target.substr(pathStart);
+  if (path[0] == '?') path.insert(path.begin(), '/');
+  if (path.find('#') != std::string::npos) return false;
+  result.initialData = method + " " + path + " " + version + "\r\n";
+  bool hasHost = false;
+  for (size_t start = lineEnd + 2; start + 2 < request.size();) {
+    size_t end = request.find("\r\n", start);
+    if (end == std::string::npos) return false;
+    if (end == start) break;
+    std::string header = request.substr(start, end - start);
+    size_t colon = header.find(':');
+    if (colon == std::string::npos) return false;
+    std::string name = lowerAscii(header.substr(0, colon));
+    if (name == "host") hasHost = true;
+    if (name != "connection" && name != "proxy-connection" && name != "proxy-authorization") {
+      result.initialData += header + "\r\n";
+    }
+    start = end + 2;
+  }
+  if (!hasHost) result.initialData += "Host: " + authority + "\r\n";
+  result.initialData += "Connection: close\r\n\r\n";
+  return true;
+}
+
+static void httpReply(SOCKET s, int status) {
+  const char* response = status == 200 ? "HTTP/1.1 200 Connection Established\r\n\r\n" :
+    status == 400 ? "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n" :
+    "HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n";
+  socketWrite(s, response, strlen(response));
 }
 
 static SOCKET connectServer(const std::string& host, int port, const std::atomic<bool>& running) {
@@ -467,9 +575,21 @@ class Service {
   void process(SOCKET client) {
     std::string host;
     int port = 0;
-    if (!socksRequest(client, host, port, running_) || !running_) return;
+    unsigned char first;
+    if (!socketRead(client, &first, 1, running_) || !running_) return;
+    bool socks = first == 5;
+    HttpRequest http;
+    if (socks) {
+      if (!socksRequest(client, host, port, running_)) return;
+    } else {
+      if (!httpRequest(client, static_cast<char>(first), http, running_)) {
+        httpReply(client, 400); return;
+      }
+      host = http.host; port = http.port;
+    }
+    if (!running_) return;
     SOCKET remote = connectServer(utf8(config_.server), config_.serverPort, running_);
-    if (remote == INVALID_SOCKET) { socksReply(client, 1); return; }
+    if (remote == INVALID_SOCKET) { if (socks) socksReply(client, 1); else httpReply(client, 502); return; }
     if (!running_) { closesocket(remote); return; }
     { std::lock_guard<std::mutex> lock(mu_); sockets_.insert(remote); }
     SSL* ssl = SSL_new(ctx_);
@@ -496,15 +616,17 @@ class Service {
         }
       }
     }
+    if (ok && !socks && !http.connect) ok = sslWrite(ssl, http.initialData.data(), http.initialData.size());
     if (ok) {
-      socksReply(client, 0);
+      if (socks) socksReply(client, 0);
+      else if (http.connect) httpReply(client, 200);
       DWORD timeout = 120000;
       setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<char*>(&timeout), sizeof(timeout));
       setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<char*>(&timeout), sizeof(timeout));
       setsockopt(remote, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<char*>(&timeout), sizeof(timeout));
       setsockopt(remote, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<char*>(&timeout), sizeof(timeout));
       relay(client, remote, ssl);
-    } else socksReply(client, 1);
+    } else { if (socks) socksReply(client, 1); else httpReply(client, 502); }
     if (ssl) SSL_free(ssl);
     { std::lock_guard<std::mutex> lock(mu_); sockets_.erase(remote); }
     closesocket(remote);

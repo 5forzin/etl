@@ -89,6 +89,31 @@ test('native Windows client relays SOCKS5 through verified TLS to Node server',
     assert.deepEqual(await readStage(socket, payload.length, 'relay'), payload);
     socket.destroy();
 
+    const authority = `remote-only.example:${destinationPort}`;
+    const http = protect(net.connect({ host: '127.0.0.1', port: localPort }), 5000);
+    await connected(http);
+    http.write(`CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\n\r\n`);
+    const connectedReply = Buffer.from('HTTP/1.1 200 Connection Established\r\n\r\n');
+    assert.deepEqual(await readStage(http, connectedReply.length, 'HTTP CONNECT'), connectedReply);
+    const httpPayload = Buffer.from('native-http-connect-to-etl');
+    http.write(httpPayload);
+    assert.deepEqual(await readStage(http, httpPayload.length, 'HTTP tunnel'), httpPayload);
+    http.destroy();
+
+    const plain = protect(net.connect({ host: '127.0.0.1', port: localPort }), 5000);
+    await connected(plain);
+    plain.write(`GET http://${authority}/probe HTTP/1.1\r\nHost: remote-only.example\r\nProxy-Connection: keep-alive\r\n\r\n`);
+    const forwarded = Buffer.from('GET /probe HTTP/1.1\r\nHost: remote-only.example\r\nConnection: close\r\n\r\n');
+    assert.deepEqual(await readStage(plain, forwarded.length, 'HTTP forward'), forwarded);
+    plain.destroy();
+
+    const malformed = protect(net.connect({ host: '127.0.0.1', port: localPort }), 5000);
+    await connected(malformed);
+    malformed.write('CONNECT remote-only.example HTTP/1.1\r\n\r\n');
+    const badRequest = Buffer.from('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+    assert.deepEqual(await readStage(malformed, badRequest.length, 'HTTP validation'), badRequest);
+    malformed.destroy();
+
     const mismatchPort = await freePort();
     mismatched = spawn(executable, ['--headless', '--server', '127.0.0.1',
       '--server-port', String(serverPort), '--port', String(mismatchPort),
