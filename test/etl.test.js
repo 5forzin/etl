@@ -203,3 +203,72 @@ test('connection limit rejects additional sockets', { timeout: 3000 }, async (t)
   await secure(t, port);
   await assert.rejects(secure(t, port));
 });
+
+test('client abandons a TLS blackhole after the default second and uses a separate backup token',
+  { timeout: 6000 }, async (t) => {
+  let stalledSocket;
+  const stalled = track(net.createServer((socket) => {
+    stalledSocket = socket;
+    socket.on('error', () => {});
+    socket.resume();
+  }));
+  const stalledPort = await listen(stalled, t);
+  const destination = track(net.createServer((socket) => {
+    socket.on('error', () => {});
+    socket.pipe(socket);
+  }));
+  const targetPort = await listen(destination, t);
+  const backupToken = 'b'.repeat(64);
+  const backupPort = await tunnel(t, { getToken: () => backupToken,
+    resolve: async () => [{ address: '127.0.0.1', family: 4 }] });
+  const clientPort = await listen(createClient({ host: '127.0.0.1', port: stalledPort,
+    servername: 'localhost', token, ca: cert,
+    fallbacks: [{ host: '127.0.0.1', port: backupPort, servername: 'localhost', token: backupToken }] }), t);
+  const started = performance.now();
+  const { socket, code } = await socks(t, clientPort, 'remote.example', targetPort);
+  const elapsed = performance.now() - started;
+  assert.equal(code, 0);
+  assert.ok(elapsed >= 800 && elapsed < 2500, `setup took ${elapsed} ms`);
+  if (!stalledSocket.destroyed) await once(stalledSocket, 'close');
+  assert.equal(stalledSocket.destroyed, true);
+  // An established connection can idle longer than the host setup budget.
+  await new Promise((resolve) => setTimeout(resolve, 1100));
+  const payload = Buffer.from('backup-stays-connected');
+  socket.write(payload);
+  assert.deepEqual(await read(socket, payload.length), payload);
+});
+
+test('absolute authentication deadline survives partial replies and preserves queued payload',
+  { timeout: 5000 }, async (t) => {
+  const partial = track(tls.createServer({ key, cert, minVersion: 'TLSv1.3' }, (socket) => {
+    socket.on('error', () => {});
+    void readFrame(socket).then(() => {
+      socket.write(Buffer.from([0, 100]));
+      const drip = setInterval(() => socket.write(Buffer.from(' ')), 25);
+      socket.once('close', () => clearInterval(drip));
+    }).catch(() => {});
+  }));
+  const partialPort = await listen(partial, t);
+  const destination = track(net.createServer((socket) => {
+    socket.on('error', () => {});
+    socket.pipe(socket);
+  }));
+  const targetPort = await listen(destination, t);
+  const backupPort = await tunnel(t, { resolve: async () => [{ address: '127.0.0.1', family: 4 }] });
+  const clientPort = await listen(createClient({ host: '127.0.0.1', port: partialPort,
+    servername: 'localhost', token, ca: cert, connectTimeout: 200,
+    fallbacks: [{ host: '127.0.0.1', port: backupPort, servername: 'localhost' }] }), t);
+  const payload = randomBytes(32768);
+  const { socket, code } = await socks(t, clientPort, 'remote.example', targetPort, payload);
+  assert.equal(code, 0);
+  assert.deepEqual(await read(socket, payload.length), payload);
+});
+
+test('backup certificates and credentials remain mandatory', async (t) => {
+  const port = await tunnel(t);
+  const clientPort = await listen(createClient({ host: '127.0.0.1', port,
+    servername: 'wrong.example', token, ca: cert,
+    fallbacks: [{ host: '127.0.0.1', port, servername: 'localhost', token: 'b'.repeat(64) }] }), t);
+  assert.equal((await socks(t, clientPort, 'example.com', 443)).code, 1);
+  assert.throws(() => createClient({ host: 'localhost', token, connectTimeout: 0 }));
+});

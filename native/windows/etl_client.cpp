@@ -31,6 +31,10 @@ constexpr int ID_TOKEN = 104;
 constexpr int ID_LOCAL_PORT = 105;
 constexpr int ID_CA = 106;
 constexpr int ID_STATUS = 107;
+constexpr int ID_FALLBACK_SERVER = 108;
+constexpr int ID_FALLBACK_PORT = 109;
+constexpr int ID_FALLBACK_TOKEN = 110;
+constexpr int ID_CONNECT_TIMEOUT = 111;
 constexpr int ID_OPEN = 201;
 constexpr int ID_EXIT = 202;
 
@@ -40,6 +44,11 @@ struct Config {
   std::wstring protectedToken;
   // Kept for headless automation; the desktop UI accepts the token directly.
   std::wstring tokenFile;
+  std::wstring fallbackServer;
+  int fallbackPort = 443;
+  std::wstring fallbackProtectedToken;
+  std::wstring fallbackTokenFile;
+  int connectTimeoutMs = 1000;
   int localPort = 1080;
   std::wstring caFile;
 };
@@ -141,7 +150,9 @@ static bool unprotectToken(const std::wstring& encoded, std::string& token) {
   return false;
 }
 
-static bool tokenForConfig(const Config& config, std::string& token) {
+static bool tokenForConfig(const Config& config, std::string& token, bool fallback = false) {
+  if (fallback && !config.fallbackProtectedToken.empty()) return unprotectToken(config.fallbackProtectedToken, token);
+  if (fallback && !config.fallbackTokenFile.empty()) return readToken(config.fallbackTokenFile, token);
   if (!config.protectedToken.empty()) return unprotectToken(config.protectedToken, token);
   return !config.tokenFile.empty() && readToken(config.tokenFile, token);
 }
@@ -151,10 +162,14 @@ static Config loadConfig() {
   auto path = configPath();
   c.server = readSetting(path, L"server", c.server.c_str());
   c.protectedToken = readSetting(path, L"token_protected", L"");
+  c.fallbackServer = readSetting(path, L"fallback_server", L"");
+  c.fallbackProtectedToken = readSetting(path, L"fallback_token_protected", L"");
   c.caFile = readSetting(path, L"ca_file", L"");
   int value;
   if (portValue(readSetting(path, L"server_port", L"443"), value)) c.serverPort = value;
   if (portValue(readSetting(path, L"local_port", L"1080"), value)) c.localPort = value;
+  if (portValue(readSetting(path, L"fallback_port", L"443"), value)) c.fallbackPort = value;
+  if (portValue(readSetting(path, L"connect_timeout_ms", L"1000"), value) && value <= 60000) c.connectTimeoutMs = value;
   if (c.protectedToken.empty()) {
     const auto legacyFile = readSetting(path, L"token_file", L"");
     std::string token;
@@ -173,6 +188,10 @@ static bool saveConfig(const Config& c) {
   bool ok = WritePrivateProfileStringW(L"client", L"server", c.server.c_str(), path.c_str()) &&
     WritePrivateProfileStringW(L"client", L"server_port", std::to_wstring(c.serverPort).c_str(), path.c_str()) &&
     WritePrivateProfileStringW(L"client", L"token_protected", c.protectedToken.c_str(), path.c_str()) &&
+    WritePrivateProfileStringW(L"client", L"fallback_server", c.fallbackServer.c_str(), path.c_str()) &&
+    WritePrivateProfileStringW(L"client", L"fallback_port", std::to_wstring(c.fallbackPort).c_str(), path.c_str()) &&
+    WritePrivateProfileStringW(L"client", L"fallback_token_protected", c.fallbackProtectedToken.c_str(), path.c_str()) &&
+    WritePrivateProfileStringW(L"client", L"connect_timeout_ms", std::to_wstring(c.connectTimeoutMs).c_str(), path.c_str()) &&
     WritePrivateProfileStringW(L"client", L"local_port", std::to_wstring(c.localPort).c_str(), path.c_str()) &&
     WritePrivateProfileStringW(L"client", L"ca_file", c.caFile.c_str(), path.c_str());
   if (ok) ok = WritePrivateProfileStringW(L"client", L"token_file", nullptr, path.c_str());
@@ -390,13 +409,20 @@ static void httpReply(SOCKET s, int status) {
   socketWrite(s, response, strlen(response));
 }
 
-static SOCKET connectServer(const std::string& host, int port, const std::atomic<bool>& running) {
+using ConnectClock = std::chrono::steady_clock;
+
+static SOCKET connectServer(const std::wstring& host, int port, const std::atomic<bool>& running,
+                            ConnectClock::time_point deadline) {
   if (!running) return INVALID_SOCKET;
-  addrinfo hint{}; hint.ai_socktype = SOCK_STREAM; hint.ai_protocol = IPPROTO_TCP;
-  addrinfo* addresses = nullptr;
-  if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hint, &addresses)) return INVALID_SOCKET;
+  ADDRINFOEXW hint{}; hint.ai_socktype = SOCK_STREAM; hint.ai_protocol = IPPROTO_TCP;
+  ADDRINFOEXW* addresses = nullptr;
+  auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(deadline - ConnectClock::now()).count();
+  if (remaining <= 0) return INVALID_SOCKET;
+  timeval dnsTimeout{static_cast<long>(remaining / 1000000), static_cast<long>(remaining % 1000000)};
+  if (GetAddrInfoExW(host.c_str(), std::to_wstring(port).c_str(), NS_DNS, nullptr, &hint,
+                    &addresses, &dnsTimeout, nullptr, nullptr, nullptr)) return INVALID_SOCKET;
   // Keep the OS-preferred family first, but give the other family a prompt try.
-  std::vector<addrinfo*> preferred, alternate, order;
+  std::vector<ADDRINFOEXW*> preferred, alternate, order;
   int preferredFamily = AF_UNSPEC;
   for (auto* item = addresses; item; item = item->ai_next) {
     if (item->ai_family != AF_INET && item->ai_family != AF_INET6) continue;
@@ -408,10 +434,9 @@ static SOCKET connectServer(const std::string& host, int port, const std::atomic
     if (i < alternate.size()) order.push_back(alternate[i]);
   }
 
-  using Clock = std::chrono::steady_clock;
+  using Clock = ConnectClock;
   constexpr auto delay = std::chrono::milliseconds(250);
   constexpr auto poll = std::chrono::milliseconds(100);
-  const auto deadline = Clock::now() + std::chrono::seconds(10);
   auto nextAttempt = Clock::now();
   size_t next = 0;
   std::vector<SOCKET> pending;
@@ -468,14 +493,15 @@ static SOCKET connectServer(const std::string& host, int port, const std::atomic
     if (pending.empty()) nextAttempt = Clock::now();
   }
   for (SOCKET s : pending) closesocket(s);
-  freeaddrinfo(addresses);
+  FreeAddrInfoExW(addresses);
   if (result != INVALID_SOCKET) {
     u_long nonblocking = 0;
     if (ioctlsocket(result, FIONBIO, &nonblocking) != 0 || !running) {
       closesocket(result);
       return INVALID_SOCKET;
     }
-    DWORD timeout = 10000;
+    DWORD timeout = static_cast<DWORD>(std::max<int64_t>(1,
+      std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()).count()));
     setsockopt(result, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<char*>(&timeout), sizeof(timeout));
     setsockopt(result, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<char*>(&timeout), sizeof(timeout));
   }
@@ -502,6 +528,11 @@ class Service {
     std::string token;
     if (!tokenForConfig(config, token)) { error = L"Informe um token válido (64 caracteres hexadecimais)."; return false; }
     OPENSSL_cleanse(token.data(), token.size());
+    if (!config.fallbackServer.empty() && !tokenForConfig(config, token, true)) {
+      error = L"Token do servidor reserva inválido."; return false;
+    }
+    OPENSSL_cleanse(token.data(), token.size());
+    if (config.connectTimeoutMs < 1 || config.connectTimeoutMs > 60000) { error = L"Timeout inválido (1 a 60000 ms)."; return false; }
     if (config.server.empty() || config.serverPort < 1 || config.localPort < 1) { error = L"Configuração inválida."; return false; }
     ctx_ = SSL_CTX_new(TLS_client_method());
     if (!ctx_) { error = L"Não foi possível iniciar o TLS."; return false; }
@@ -588,34 +619,73 @@ class Service {
       host = http.host; port = http.port;
     }
     if (!running_) return;
-    SOCKET remote = connectServer(utf8(config_.server), config_.serverPort, running_);
-    if (remote == INVALID_SOCKET) { if (socks) socksReply(client, 1); else httpReply(client, 502); return; }
-    if (!running_) { closesocket(remote); return; }
-    { std::lock_guard<std::mutex> lock(mu_); sockets_.insert(remote); }
-    SSL* ssl = SSL_new(ctx_);
+    SOCKET remote = INVALID_SOCKET;
+    SSL* ssl = nullptr;
     bool ok = false;
-    if (ssl) {
-      std::string server = utf8(config_.server);
-      if (SSL_set_fd(ssl, static_cast<int>(remote)) == 1 &&
-          SSL_set_tlsext_host_name(ssl, server.c_str()) == 1 &&
-          SSL_set1_host(ssl, server.c_str()) == 1 &&
-          SSL_connect(ssl) == 1 && SSL_get_verify_result(ssl) == X509_V_OK) {
-        std::string token;
-        if (tokenForConfig(config_, token)) {
-          std::string auth;
-          auth.reserve(token.size() + 20);
-          auth.assign("{\"v\":1,\"token\":\"");
-          auth.append(token);
-          auth.append("\"}");
-          ok = writeFrame(ssl, auth);
-          OPENSSL_cleanse(auth.data(), auth.size());
-          OPENSSL_cleanse(token.data(), token.size());
-          ok = ok && responseOK(ssl);
-          std::string encoded = jsonEscape(host);
-          ok = ok && !encoded.empty() && writeFrame(ssl, "{\"host\":\"" + encoded + "\",\"port\":" + std::to_string(port) + "}") && responseOK(ssl);
+    const int attempts = config_.fallbackServer.empty() ? 1 : 2;
+    for (int attempt = 0; attempt < attempts && running_; ++attempt) {
+      const bool fallback = attempt != 0;
+      const auto& endpoint = fallback ? config_.fallbackServer : config_.server;
+      const int endpointPort = fallback ? config_.fallbackPort : config_.serverPort;
+      const auto deadline = ConnectClock::now() + std::chrono::milliseconds(config_.connectTimeoutMs);
+      remote = connectServer(endpoint, endpointPort, running_, deadline);
+      if (remote == INVALID_SOCKET) continue;
+      {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!running_) { closesocket(remote); remote = INVALID_SOCKET; break; }
+        sockets_.insert(remote);
+      }
+      // Interrupt blocking OpenSSL calls at the absolute deadline, including
+      // peers that keep sending partial control frames. Never retry payloads.
+      std::mutex attemptMutex;
+      std::condition_variable attemptWake;
+      bool attemptDone = false, timedOut = false;
+      const SOCKET attemptedSocket = remote;
+      std::thread guard([&] {
+        std::unique_lock<std::mutex> lock(attemptMutex);
+        if (!attemptWake.wait_until(lock, deadline, [&] { return attemptDone; })) {
+          timedOut = true;
+          shutdown(attemptedSocket, SD_BOTH);
+        }
+      });
+      ssl = SSL_new(ctx_);
+      if (ssl) {
+        std::string server = utf8(endpoint);
+        if (SSL_set_fd(ssl, static_cast<int>(remote)) == 1 &&
+            SSL_set_tlsext_host_name(ssl, server.c_str()) == 1 &&
+            SSL_set1_host(ssl, server.c_str()) == 1 &&
+            SSL_connect(ssl) == 1 && SSL_get_verify_result(ssl) == X509_V_OK) {
+          std::string token;
+          if (tokenForConfig(config_, token, fallback)) {
+            std::string auth;
+            auth.reserve(token.size() + 20);
+            auth.assign("{\"v\":1,\"token\":\"");
+            auth.append(token);
+            auth.append("\"}");
+            ok = writeFrame(ssl, auth);
+            OPENSSL_cleanse(auth.data(), auth.size());
+            OPENSSL_cleanse(token.data(), token.size());
+            ok = ok && responseOK(ssl);
+          }
         }
       }
+      { std::lock_guard<std::mutex> lock(attemptMutex); attemptDone = true; }
+      attemptWake.notify_one();
+      guard.join();
+      ok = ok && !timedOut && running_ && ConnectClock::now() < deadline;
+      if (ok) break;
+      if (ssl) SSL_free(ssl);
+      ssl = nullptr;
+      { std::lock_guard<std::mutex> lock(mu_); sockets_.erase(remote); }
+      closesocket(remote);
+      remote = INVALID_SOCKET;
     }
+    if (!ok) { if (socks) socksReply(client, 1); else httpReply(client, 502); return; }
+    DWORD setupTimeout = 10000;
+    setsockopt(remote, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<char*>(&setupTimeout), sizeof(setupTimeout));
+    setsockopt(remote, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<char*>(&setupTimeout), sizeof(setupTimeout));
+    std::string encoded = jsonEscape(host);
+    ok = !encoded.empty() && writeFrame(ssl, "{\"host\":\"" + encoded + "\",\"port\":" + std::to_string(port) + "}") && responseOK(ssl);
     if (ok && !socks && !http.connect) ok = sslWrite(ssl, http.initialData.data(), http.initialData.size());
     if (ok) {
       if (socks) socksReply(client, 0);
@@ -709,6 +779,7 @@ static void connectOrStop(HWND window) {
   {
     Config next;
     next.server = field(window, ID_SERVER);
+    next.fallbackServer = field(window, ID_FALLBACK_SERVER);
     std::wstring entered = field(window, ID_TOKEN);
     std::string token = utf8(entered);
     SecureZeroMemory(entered.data(), entered.size() * sizeof(wchar_t));
@@ -718,10 +789,23 @@ static void connectOrStop(HWND window) {
       return;
     }
     OPENSSL_cleanse(token.data(), token.size());
+    entered = field(window, ID_FALLBACK_TOKEN);
+    token = utf8(entered);
+    SecureZeroMemory(entered.data(), entered.size() * sizeof(wchar_t));
+    if (!token.empty() && !protectToken(token, next.fallbackProtectedToken)) {
+      OPENSSL_cleanse(token.data(), token.size());
+      MessageBoxW(window, L"Token reserva inválido; deixe vazio para usar o token principal.", L"ETL", MB_ICONERROR);
+      return;
+    }
+    OPENSSL_cleanse(token.data(), token.size());
     next.caFile = field(window, ID_CA);
     if (!portValue(field(window, ID_SERVER_PORT), next.serverPort) ||
+        !portValue(field(window, ID_FALLBACK_PORT), next.fallbackPort) ||
         !portValue(field(window, ID_LOCAL_PORT), next.localPort)) {
       MessageBoxW(window, L"Porta inválida.", L"ETL", MB_ICONERROR); return;
+    }
+    if (!portValue(field(window, ID_CONNECT_TIMEOUT), next.connectTimeoutMs) || next.connectTimeoutMs > 60000) {
+      MessageBoxW(window, L"Timeout inválido (1 a 60000 ms).", L"ETL", MB_ICONERROR); return;
     }
     std::wstring error;
     if (!service.start(next, error)) { MessageBoxW(window, error.c_str(), L"ETL", MB_ICONERROR); return; }
@@ -737,9 +821,9 @@ static void showWindow(HWND window) {
 }
 
 static void label(HWND window, int y, const wchar_t* text, int editId, const std::wstring& value, DWORD style = 0) {
-  CreateWindowW(L"STATIC", text, WS_CHILD | WS_VISIBLE, 16, y, 105, 22, window, nullptr, nullptr, nullptr);
+  CreateWindowW(L"STATIC", text, WS_CHILD | WS_VISIBLE, 16, y, 135, 22, window, nullptr, nullptr, nullptr);
   CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", value.c_str(), WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | style,
-    125, y - 2, 280, 25, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(editId)), nullptr, nullptr);
+    155, y - 2, 280, 25, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(editId)), nullptr, nullptr);
 }
 
 static LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
@@ -756,12 +840,24 @@ static LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wparam, LPA
         SecureZeroMemory(visible.data(), visible.size() * sizeof(wchar_t));
         SendMessageW(GetDlgItem(window, ID_TOKEN), EM_LIMITTEXT, 64, 0);
       }
-      label(window, 125, L"Porta local", ID_LOCAL_PORT, std::to_wstring(config.localPort));
-      label(window, 160, L"CA opcional", ID_CA, config.caFile);
+      label(window, 125, L"Servidor reserva", ID_FALLBACK_SERVER, config.fallbackServer);
+      label(window, 160, L"Porta reserva", ID_FALLBACK_PORT, std::to_wstring(config.fallbackPort));
+      {
+        std::string token;
+        std::wstring visible;
+        if (unprotectToken(config.fallbackProtectedToken, token)) visible.assign(token.begin(), token.end());
+        OPENSSL_cleanse(token.data(), token.size());
+        label(window, 195, L"Token reserva", ID_FALLBACK_TOKEN, visible, ES_PASSWORD);
+        SecureZeroMemory(visible.data(), visible.size() * sizeof(wchar_t));
+        SendMessageW(GetDlgItem(window, ID_FALLBACK_TOKEN), EM_LIMITTEXT, 64, 0);
+      }
+      label(window, 230, L"Timeout (ms)", ID_CONNECT_TIMEOUT, std::to_wstring(config.connectTimeoutMs));
+      label(window, 265, L"Porta local", ID_LOCAL_PORT, std::to_wstring(config.localPort));
+      label(window, 300, L"CA opcional", ID_CA, config.caFile);
       CreateWindowW(L"BUTTON", L"Conectar", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-        125, 202, 130, 32, window, reinterpret_cast<HMENU>(ID_CONNECT), nullptr, nullptr);
+        155, 342, 130, 32, window, reinterpret_cast<HMENU>(ID_CONNECT), nullptr, nullptr);
       CreateWindowW(L"STATIC", L"Desconectado", WS_CHILD | WS_VISIBLE,
-        16, 248, 380, 24, window, reinterpret_cast<HMENU>(ID_STATUS), nullptr, nullptr);
+        16, 388, 425, 24, window, reinterpret_cast<HMENU>(ID_STATUS), nullptr, nullptr);
       tray.cbSize = sizeof(tray); tray.hWnd = window; tray.uID = 1;
       tray.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP; tray.uCallbackMessage = WM_TRAY;
       tray.hIcon = LoadIconW(nullptr, IDI_INFORMATION);
@@ -822,9 +918,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     for (int i = 2; i + 1 < argc; i += 2) {
       std::wstring name = argv[i], value = argv[i + 1];
       if (name == L"--server") c.server = value;
+      else if (name == L"--fallback-server") c.fallbackServer = value;
+      else if (name == L"--fallback-token-file") c.fallbackTokenFile = value;
       else if (name == L"--token-file") c.tokenFile = value;
       else if (name == L"--ca") c.caFile = value;
       else if (name == L"--server-port") { if (!portValue(value, c.serverPort)) return 20; }
+      else if (name == L"--fallback-port") { if (!portValue(value, c.fallbackPort)) return 20; }
+      else if (name == L"--connect-timeout-ms") { if (!portValue(value, c.connectTimeoutMs) || c.connectTimeoutMs > 60000) return 20; }
       else if (name == L"--port") { if (!portValue(value, c.localPort)) return 21; }
       else return 22;
     }
@@ -839,7 +939,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   wc.lpszClassName = L"ETLNativeClient"; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
   RegisterClassW(&wc);
   HWND window = CreateWindowExW(0, wc.lpszClassName, L"ETL | Cliente", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-    CW_USEDEFAULT, CW_USEDEFAULT, 440, 315, nullptr, nullptr, instance, nullptr);
+    CW_USEDEFAULT, CW_USEDEFAULT, 470, 455, nullptr, nullptr, instance, nullptr);
   if (!window) { WSACleanup(); return 1; }
   std::wstring error;
   if (service.start(config, error)) updateStatus(window);

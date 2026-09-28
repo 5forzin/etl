@@ -104,6 +104,29 @@ node src/cli.js client --server vpn.example.com --token-file secrets/token
 
 For a server on a different port, add `--server-port 8443`.
 
+### Automatic backup host
+
+Configure a second independently deployed server for new connections:
+
+```sh
+node src/cli.js client --server etl.nora.systems --token-file secrets/token \
+  --fallback-server etl2.nora.systems --fallback-token-file secrets/token-etl2 \
+  --connect-timeout-ms 1000
+```
+
+Each host gets an absolute 1000 ms budget for DNS, TCP, verified TLS and ETL
+authentication. A timeout, refused connection, invalid certificate or rejected
+credential moves the new connection to the backup. Certificate verification and
+hostname matching remain mandatory on both hosts. `--fallback-port` defaults to
+the primary server port. Omit `--fallback-token-file` only when both servers use
+the same credential. Increase the timeout on high-latency networks if needed.
+
+After authentication, destination setup retains its separate 10-second deadline.
+Established TCP streams stay on their original host with the normal idle timeout;
+they cannot migrate, and application bytes are never replayed to another server.
+Every new connection tries the primary first, so it resumes using it after recovery.
+Leave `--fallback-server` unset to use a single host.
+
 Configure your browser's SOCKS5 proxy as `127.0.0.1:1080` and enable proxy-side DNS. For example, Firefox exposes a “Proxy DNS when using SOCKS v5” setting. A command-line check is:
 
 ```sh
@@ -129,7 +152,7 @@ Start the server on 8443 and connect with `--server localhost --server-port 8443
 - **Upgrade:** record the current Git commit, fetch and review the desired version, then rebuild with `docker compose up -d --build`. Back up configuration privately.
 - **Rollback:** deploy the previously recorded commit in a separate checkout with the existing secrets and recreate the container. Active connections are interrupted.
 - **Stop/uninstall:** `docker compose down` removes the Compose service and network. Source files, local image and secrets remain; remove those explicitly only when no longer needed. A manually installed systemd service must be stopped, disabled and removed separately.
-- **Limits:** 128 simultaneous connections per process, a 10-second setup deadline, and a 120-second idle timeout. Use `--max-connections` when running directly to change the connection cap. There is one shared credential in this MVP.
+- **Limits:** 128 simultaneous connections per process, a 10-second server setup deadline, a configurable 1-second client tunnel setup budget per host, and a 120-second idle timeout. Use `--max-connections` when running directly to change the connection cap. Each server has one shared credential in this MVP.
 
 Logs contain startup and listener errors, not per-destination browsing records. Container infrastructure and the hosting provider may have their own logs.
 

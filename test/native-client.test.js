@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
+import tls from 'node:tls';
 import { lookup } from 'node:dns/promises';
 import { once } from 'node:events';
 import { spawn, execFileSync } from 'node:child_process';
@@ -8,9 +9,78 @@ import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createTunnelServer } from '../src/tunnel.js';
-import { track, protect, read, connected } from '../src/io.js';
+import { track, protect, read, readFrame, connected } from '../src/io.js';
 
 const executable = process.env.ETL_NATIVE_CLIENT;
+
+test('native Windows client fails over after a second with independent credentials and an absolute auth budget',
+  { skip: !executable || process.platform !== 'win32', timeout: 15000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'etl-native-failover-'));
+  const certPath = join(dir, 'cert.pem'), keyPath = join(dir, 'key.pem');
+  const tokenPath = join(dir, 'token'), backupTokenPath = join(dir, 'backup-token');
+  let backup, destination, blackhole, partial, child;
+  try {
+    execFileSync(process.env.ETL_OPENSSL ?? 'openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes',
+      '-keyout', keyPath, '-out', certPath, '-days', '1', '-subj', '/CN=localhost',
+      '-addext', 'subjectAltName=DNS:localhost'], { stdio: 'pipe' });
+    writeFileSync(tokenPath, 'a'.repeat(64));
+    writeFileSync(backupTokenPath, 'b'.repeat(64));
+    const key = readFileSync(keyPath), cert = readFileSync(certPath);
+    destination = track(net.createServer((socket) => {
+      socket.on('error', () => {}); socket.pipe(socket);
+    }));
+    const destinationPort = await listen(destination);
+    backup = createTunnelServer({ key, cert, getToken: () => 'b'.repeat(64),
+      resolve: async () => [{ address: '127.0.0.1', family: 4 }] });
+    const backupPort = await listen(backup);
+    blackhole = track(net.createServer((socket) => { socket.on('error', () => {}); socket.resume(); }));
+    const blackholePort = await listen(blackhole);
+    partial = track(tls.createServer({ key, cert, minVersion: 'TLSv1.3' }, (socket) => {
+      socket.on('error', () => {});
+      void readFrame(socket).then(() => {
+        socket.write(Buffer.from([0, 100]));
+        const drip = setInterval(() => socket.write(Buffer.from(' ')), 25);
+        socket.once('close', () => clearInterval(drip));
+      }).catch(() => {});
+    }));
+    const partialPort = await listen(partial);
+    for (const [primaryPort, timeout] of [[blackholePort, 1000], [partialPort, 200]]) {
+      const localPort = await freePort();
+      const args = ['--headless', '--server', 'localhost', '--server-port', String(primaryPort),
+        '--fallback-server', 'localhost', '--fallback-port', String(backupPort),
+        '--fallback-token-file', backupTokenPath, '--port', String(localPort),
+        '--token-file', tokenPath, '--ca', certPath];
+      if (timeout !== 1000) args.push('--connect-timeout-ms', String(timeout));
+      child = spawn(executable, args, { stdio: 'ignore', windowsHide: true });
+      await awaitClient(localPort, child);
+      const socket = protect(net.connect({ host: '127.0.0.1', port: localPort }), 5000);
+      await connected(socket);
+      socket.write(Buffer.from([5, 1, 0]));
+      assert.deepEqual(await read(socket, 2), Buffer.from([5, 0]));
+      const host = Buffer.from('remote.example');
+      const payload = Buffer.from('native-backup-queued-payload');
+      const started = performance.now();
+      socket.write(Buffer.concat([Buffer.from([5, 1, 0, 3, host.length]), host,
+        Buffer.from([destinationPort >> 8, destinationPort & 255]), payload]));
+      assert.equal((await readStage(socket, 10, 'backup connect'))[1], 0);
+      const elapsed = performance.now() - started;
+      assert.ok(elapsed >= timeout * 0.7 && elapsed < timeout + 2000, `setup took ${elapsed} ms`);
+      assert.deepEqual(await read(socket, payload.length), payload);
+      await new Promise((resolve) => setTimeout(resolve, timeout + 100));
+      socket.write(payload);
+      assert.deepEqual(await read(socket, payload.length), payload);
+      socket.destroy();
+      const stopped = once(child, 'exit'); child.kill(); await stopped; child = undefined;
+    }
+  } finally {
+    child?.kill();
+    if (blackhole) await blackhole.shutdown();
+    if (partial) await partial.shutdown();
+    if (backup) await backup.shutdown();
+    if (destination) await destination.shutdown();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test('native Windows client protects stored tokens with DPAPI',
   { skip: !executable || process.platform !== 'win32' }, () => {
