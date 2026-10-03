@@ -33,7 +33,11 @@ export async function read(socket, n) {
 export async function readFrame(socket) {
   const length = (await read(socket, 2)).readUInt16BE();
   if (length < 2 || length > 1024) throw new Error('Invalid frame size');
-  return JSON.parse((await read(socket, length)).toString('utf8'));
+  const message = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(await read(socket, length)));
+  if (!message || typeof message !== 'object' || Array.isArray(message)) {
+    throw new Error('Expected a JSON object');
+  }
+  return message;
 }
 
 export function writeFrame(socket, message) {
@@ -81,12 +85,13 @@ export function relay(a, b, idleTimeout) {
 
 export function track(server) {
   const sockets = new Set();
+  let shutdown;
   server.on('connection', (socket) => {
     sockets.add(socket);
     socket.once('close', () => sockets.delete(socket));
   });
-  server.shutdown = () => new Promise((resolve, reject) => {
-    server.close((error) => error ? reject(error) : resolve());
+  server.shutdown = () => shutdown ??= new Promise((resolve, reject) => {
+    server.close((error) => error && error.code !== 'ERR_SERVER_NOT_RUNNING' ? reject(error) : resolve());
     for (const socket of sockets) socket.destroy();
   });
   return server;

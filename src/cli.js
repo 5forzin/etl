@@ -3,12 +3,15 @@ import { parseArgs } from 'node:util';
 import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { createClient, createTunnelServer, tokenFile } from './tunnel.js';
+import { diagnoseEndpoint, formatDiagnosis } from './doctor.js';
+import metadata from '../package.json' with { type: 'json' };
 
-const help = `ETL — Encrypted Transport Lab (experimental TCP MVP)
+const help = `ETL ${metadata.version} — Encrypted Transport Lab
 
 node src/cli.js token
 node src/cli.js server --cert fullchain.pem --key privkey.pem --token-file secrets/token
 node src/cli.js client --server vpn.example.com --token-file secrets/token
+node src/cli.js doctor --server vpn.example.com --server-port 443
 
 Options:
   --port NUMBER          Server/listener port (server: 443; client: 1080)
@@ -18,10 +21,13 @@ Options:
   --fallback-token-file PATH  Backup credential (default: primary token)
   --connect-timeout-ms N Tunnel setup budget per host (default: 1000)
   --listen IP            Server bind address (default: 0.0.0.0)
-  --ca PATH              Additional trust anchor for a private/test CA
+  --ca PATH              Private CA bundle (replaces Node's trust store)
   --max-connections N    Maximum simultaneous connections (default: 128)
+  --timeout MS           Doctor timeout per check (default: 10000)
+  --json                 Doctor machine-readable output
+  --version              Print version
 
-Client always binds to 127.0.0.1. Configure SOCKS5 with remote DNS.
+Client binds to 127.0.0.1 and accepts SOCKS5 and HTTP CONNECT.
 Token files contain one 64-character lowercase hex token.
 `;
 
@@ -40,10 +46,23 @@ async function main() {
     ca: { type: 'string' }, 'max-connections': { type: 'string' },
     'fallback-server': { type: 'string' }, 'fallback-port': { type: 'string' },
     'fallback-token-file': { type: 'string' }, 'connect-timeout-ms': { type: 'string' },
+    timeout: { type: 'string' }, json: { type: 'boolean' }, version: { type: 'boolean' },
   } });
   const [command] = positionals;
+  if (values.version) { console.log(metadata.version); return; }
   if (values.help || !command) { console.log(help); return; }
   if (positionals.length !== 1) throw new Error('Expected one command');
+  if (command === 'doctor') {
+    if (!values.server) throw new Error('--server is required');
+    if (values['token-file']) throw new Error('Doctor does not use credentials; omit --token-file');
+    const timeout = Number(values.timeout ?? 10000);
+    if (!Number.isInteger(timeout) || timeout < 100 || timeout > 120000) throw new Error('--timeout must be between 100 and 120000');
+    const report = await diagnoseEndpoint({ host: values.server, port: port(values['server-port'], 443),
+      timeout, ca: values.ca ? readFileSync(values.ca) : undefined });
+    console.log(values.json ? JSON.stringify(report, null, 2) : formatDiagnosis(report));
+    if (!report.ok) process.exitCode = 2;
+    return;
+  }
   if (command === 'token') { console.log(randomBytes(32).toString('hex')); return; }
   if (!['server', 'client'].includes(command)) throw new Error('Unknown command; use --help');
   if (!values['token-file']) throw new Error('--token-file is required');
@@ -80,7 +99,10 @@ async function main() {
     process.exitCode = 1;
   });
   service.listen(listenPort, bind, () => console.log(`ETL ${command} listening on ${bind}:${listenPort}`));
+  let stopping = false;
   const stop = () => {
+    if (stopping) return;
+    stopping = true;
     void service.shutdown().catch(() => { process.exitCode = 1; });
   };
   process.once('SIGINT', stop);

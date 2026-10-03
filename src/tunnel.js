@@ -4,10 +4,20 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { read, readFrame, writeFrame, protect, connected, relay, track } from './io.js';
 import { resolveDestination, validateDestination } from './policy.js';
+import { httpDestination, httpReply } from './http-proxy.js';
 
 const HANDSHAKE = 10_000;
 const IDLE = 120_000;
 const hash = (value) => createHash('sha256').update(value).digest();
+
+function validateLimits(maxConnections, handshakeTimeout, idleTimeout) {
+  for (const [name, value, maximum] of [['maxConnections', maxConnections, 10000],
+    ['handshakeTimeout', handshakeTimeout, 120000], ['idleTimeout', idleTimeout, 86400000]]) {
+    if (!Number.isInteger(value) || value < 1 || value > maximum) {
+      throw new Error(`${name} must be between 1 and ${maximum}`);
+    }
+  }
+}
 
 export function validateToken(token) {
   if (typeof token !== 'string' || !/^[a-f0-9]{64}$/.test(token)) {
@@ -25,6 +35,7 @@ export function tokenFile(path) {
 export function createTunnelServer({ key, cert, getToken, maxConnections = 128,
   handshakeTimeout = HANDSHAKE, idleTimeout = IDLE,
   resolve = resolveDestination }) {
+  validateLimits(maxConnections, handshakeTimeout, idleTimeout);
   validateToken(getToken());
   const server = tls.createServer({ key, cert, minVersion: 'TLSv1.3',
     handshakeTimeout, allowHalfOpen: true }, (socket) => {
@@ -68,8 +79,8 @@ export function createTunnelServer({ key, cert, getToken, maxConnections = 128,
   return track(server);
 }
 
-async function socksDestination(socket) {
-  const greeting = await read(socket, 2);
+async function socksDestination(socket, firstByte) {
+  const greeting = Buffer.from([firstByte, (await read(socket, 1))[0]]);
   if (greeting[0] !== 5 || greeting[1] === 0) throw new Error('Invalid SOCKS greeting');
   const methods = await read(socket, greeting[1]);
   if (!methods.includes(0)) {
@@ -102,6 +113,7 @@ function reply(socket, code) {
 export function createClient({ host, port = 443, servername = host, token, ca,
   fallbacks = [], connectTimeout = 1000,
   maxConnections = 128, handshakeTimeout = HANDSHAKE, idleTimeout = IDLE }) {
+  validateLimits(maxConnections, handshakeTimeout, idleTimeout);
   validateToken(token);
   if (!Number.isInteger(connectTimeout) || connectTimeout < 1 || connectTimeout > 60_000) {
     throw new Error('connectTimeout must be between 1 and 60000 milliseconds');
@@ -121,9 +133,13 @@ export function createClient({ host, port = 443, servername = host, token, ca,
     protect(socket, handshakeTimeout);
     let deadline = setTimeout(() => socket.destroy(), handshakeTimeout);
     let tunnel;
+    let isHttp = false;
     socket.once('close', () => { clearTimeout(deadline); tunnel?.destroy(); });
     void (async () => {
-      const destination = await socksDestination(socket);
+      const firstByte = (await read(socket, 1))[0];
+      isHttp = firstByte !== 5;
+      const destination = isHttp ? await httpDestination(socket, firstByte) :
+        await socksDestination(socket, firstByte);
       if (!destination || socket.destroyed) return;
       clearTimeout(deadline);
       const setupTimeout = handshakeTimeout + endpoints.length * connectTimeout;
@@ -156,11 +172,16 @@ export function createClient({ host, port = 443, servername = host, token, ca,
       writeFrame(tunnel, destination);
       if ((await readFrame(tunnel))?.code !== 'OK') throw new Error('Destination failed');
       clearTimeout(deadline);
-      reply(socket, 0);
+      if (isHttp) httpReply(socket, true);
+      else reply(socket, 0);
       relay(socket, tunnel, idleTimeout);
     })().catch(() => {
       tunnel?.destroy();
-      if (!socket.destroyed) { reply(socket, 1); socket.end(); }
+      if (!socket.destroyed) {
+        if (isHttp) httpReply(socket, false);
+        else reply(socket, 1);
+        socket.end();
+      }
     });
   });
   server.maxConnections = maxConnections;

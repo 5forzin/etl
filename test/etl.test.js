@@ -11,6 +11,23 @@ import { randomBytes } from 'node:crypto';
 import { createClient, createTunnelServer, tokenFile } from '../src/tunnel.js';
 import { isPublicAddress, resolveDestination } from '../src/policy.js';
 import { connected, protect, read, readFrame, writeFrame, track } from '../src/io.js';
+import { diagnoseEndpoint } from '../src/doctor.js';
+
+test('service limits cannot accidentally disable protection', () => {
+  for (const options of [{ maxConnections: 0 }, { maxConnections: Infinity }, { handshakeTimeout: -1 }, { idleTimeout: NaN }]) {
+    assert.throws(() => createClient({ host: 'localhost', token, ...options }));
+    assert.throws(() => createTunnelServer({ key, cert, getToken: () => token, ...options }));
+  }
+});
+
+test('doctor bounds stalled DNS and TLS checks', { timeout: 2000 }, async (t) => {
+  const dns = await diagnoseEndpoint({ host: 'example.com', timeout: 30, resolver: () => new Promise(() => {}) });
+  assert.equal(dns.checks[0].code, 'ETIMEDOUT');
+  const blackhole = track(net.createServer(socket => { socket.on('error', () => {}); socket.resume(); }));
+  const port = await listen(blackhole, t);
+  const report = await diagnoseEndpoint({ host: '127.0.0.1', port, timeout: 50 });
+  assert.equal(report.checks[2].code, 'ETIMEDOUT');
+});
 
 const token = 'a'.repeat(64);
 let directory, key, cert;
@@ -271,4 +288,68 @@ test('backup certificates and credentials remain mandatory', async (t) => {
     fallbacks: [{ host: '127.0.0.1', port, servername: 'localhost', token: 'b'.repeat(64) }] }), t);
   assert.equal((await socks(t, clientPort, 'example.com', 443)).code, 1);
   assert.throws(() => createClient({ host: 'localhost', token, connectTimeout: 0 }));
+});
+
+test('HTTP CONNECT preserves queued payload and resolves the destination remotely', async (t) => {
+  const destination = track(net.createServer((socket) => {
+    socket.on('error', () => {}); socket.pipe(socket);
+  }));
+  const targetPort = await listen(destination, t);
+  const port = await tunnel(t, { resolve: async (host, requestedPort) => {
+    assert.equal(host, 'remote.example'); assert.equal(requestedPort, targetPort);
+    return [{ address: '127.0.0.1', family: 4 }];
+  } });
+  const proxy = await listen(createClient({ host: '127.0.0.1', servername: 'localhost', port, token, ca: cert }), t);
+  const socket = protect(net.connect({ host: '127.0.0.1', port: proxy }), 2000);
+  t.after(() => socket.destroy()); await connected(socket);
+  const payload = randomBytes(32768);
+  socket.write(Buffer.concat([Buffer.from(`CONNECT remote.example:${targetPort} HTTP/1.1\r\nHost: remote.example\r\n\r\n`), payload]));
+  const expected = Buffer.from('HTTP/1.1 200 Connection Established\r\n\r\n');
+  assert.deepEqual(await read(socket, expected.length), expected);
+  assert.deepEqual(await read(socket, payload.length), payload);
+});
+
+test('HTTP rejects malformed requests, bodies and oversized headers before opening a tunnel', async (t) => {
+  let connections = 0;
+  const remote = track(net.createServer((socket) => { connections++; socket.destroy(); }));
+  const port = await listen(remote, t);
+  const proxy = await listen(createClient({ host: '127.0.0.1', port, token }), t);
+  for (const request of ['GET / HTTP/1.1\r\n\r\n', 'CONNECT user@example.com:443 HTTP/1.1\r\n\r\n',
+    'CONNECT example.com:443 HTTP/1.1\r\nContent-Length: 1\r\n\r\nx',
+    'CONNECT example.com:443 HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n',
+    `CONNECT example.com:443 HTTP/1.1\r\nX: ${'a'.repeat(17000)}\r\n\r\n`]) {
+    const socket = protect(net.connect({ host: '127.0.0.1', port: proxy }), 2000);
+    t.after(() => socket.destroy()); await connected(socket); socket.write(request);
+    const response = Buffer.from('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n');
+    assert.deepEqual(await read(socket, response.length), response); socket.destroy();
+  }
+  assert.equal(connections, 0);
+});
+
+test('control frames reject non-object JSON and invalid UTF-8', async (t) => {
+  const port = await tunnel(t);
+  for (const body of [Buffer.from('null'), Buffer.from('[]'), Buffer.from('42'), Buffer.from([123,34,120,34,58,34,255,34,125])]) {
+    const socket = await secure(t, port);
+    const size = Buffer.alloc(2); size.writeUInt16BE(body.length);
+    socket.write(Buffer.concat([size, body]));
+    assert.equal((await readFrame(socket)).code, 'FAILED'); socket.destroy();
+  }
+});
+
+test('shutdown is safe before listen and when requested more than once', async () => {
+  const server = track(net.createServer());
+  await Promise.all([server.shutdown(), server.shutdown()]);
+});
+
+test('doctor verifies identity without authenticating and reports DNS and TLS failures', async (t) => {
+  const port = await tunnel(t);
+  const resolver = async () => [{ address: '127.0.0.1', family: 4 }];
+  const good = await diagnoseEndpoint({ host: 'localhost', port, ca: cert, resolver });
+  assert.equal(good.ok, true); assert.deepEqual(good.checks.map(c => c.status), ['pass','pass','pass']);
+  const bad = await diagnoseEndpoint({ host: 'wrong.example', port, ca: cert, resolver });
+  assert.equal(bad.ok, false); assert.equal(bad.checks[2].code, 'ERR_TLS_CERT_ALTNAME_INVALID');
+  const dns = await diagnoseEndpoint({ host: 'example.com', port, resolver: async () => {
+    throw Object.assign(new Error('fixture'), { code: 'ENOTFOUND' });
+  } });
+  assert.deepEqual(dns.checks.map(c => c.status), ['fail','skip','skip']);
 });
