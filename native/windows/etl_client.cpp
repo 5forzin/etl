@@ -963,7 +963,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
   if (!argv) { WSACleanup(); return 1; }
   const bool previewOptions = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-options";
-  const std::wstring previewPath = argc == 3 && (std::wstring(argv[1]) == L"--self-test-ui" || previewOptions) ? argv[2] : L"";
+  const bool previewError = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-error";
+  const std::wstring previewPath = argc == 3 && (std::wstring(argv[1]) == L"--self-test-ui" || previewOptions || previewError) ? argv[2] : L"";
   if (argc == 2 && std::wstring(argv[1]) == L"--self-test-token-storage") {
     std::string original(64, 'a'), restored;
     std::wstring protectedValue;
@@ -1017,14 +1018,38 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     DestroyWindow(window); WSACleanup(); return 2;
   }
   if (!previewPath.empty()) {
-    if (previewOptions) desktop.showOptions();
-    for (int i = 0; i < 4; ++i) desktop.render(form, DesktopState{});
+    auto renderPreview = [&](const DesktopState& state, int frames = 24) {
+      for (int i = 0; i < frames; ++i) desktop.render(form, state, 1.f / 60);
+    };
+    auto height = [&]() { RECT client{}; GetClientRect(window, &client); return client.bottom; };
+    renderPreview(DesktopState{});
+    const int collapsed = height();
+    bool motion = true;
+    if (previewOptions) {
+      desktop.showOptions(); renderPreview(DesktopState{}, 2);
+      const int growing = height();
+      renderPreview(DesktopState{});
+      const int expanded = height();
+      desktop.showOptions(false); renderPreview(DesktopState{}, 2);
+      const int shrinking = height();
+      renderPreview(DesktopState{});
+      motion = growing > collapsed && growing < expanded &&
+        shrinking > collapsed && shrinking < expanded && height() == collapsed;
+      desktop.showOptions(); renderPreview(DesktopState{});
+    }
+    if (previewError) {
+      DesktopState state{};
+      state.error = "The remote server could not be reached. Check the address and port, then try again.";
+      state.failures = 1;
+      renderPreview(state);
+      motion = height() > collapsed;
+    }
     POINT drag{100, 20}, control{320, 20};
     ClientToScreen(window, &drag); ClientToScreen(window, &control);
     const bool chrome = !(GetWindowLongPtrW(window, GWL_STYLE) & WS_CAPTION) &&
       SendMessageW(window, WM_NCHITTEST, 0, MAKELPARAM(drag.x, drag.y)) == HTCAPTION &&
       SendMessageW(window, WM_NCHITTEST, 0, MAKELPARAM(control.x, control.y)) == HTCLIENT;
-    const bool ok = chrome && desktop.capture(previewPath);
+    const bool ok = chrome && motion && desktop.capture(previewPath);
     desktop.shutdown(); DestroyWindow(window); WSACleanup(); return ok ? 0 : 24;
   }
   ShowWindow(window, SW_SHOW);

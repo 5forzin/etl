@@ -23,15 +23,16 @@ struct DesktopState {
 class DesktopUi {
  public:
   bool initialize(HWND window);
-  bool render(DesktopForm& form, const DesktopState& state);
+  bool render(DesktopForm& form, const DesktopState& state, float previewStep = 0);
   void resize(unsigned width, unsigned height);
   void shutdown();
   bool capture(const std::wstring& path);
   bool message(HWND window, UINT message, WPARAM wparam, LPARAM lparam);
-  void showOptions() { options_ = true; }
+  void showOptions(bool show = true) { options_ = show; }
  private:
   bool createTarget();
   void releaseDevice();
+  void animateHeight(float target, float delta);
   HWND window_ = nullptr;
   ID3D11Device* device_ = nullptr;
   ID3D11DeviceContext* context_ = nullptr;
@@ -41,4 +42,7 @@ class DesktopUi {
   float active_ = 0;
   float hover_ = 0;
   bool options_ = false;
+  float height_ = 0, heightFrom_ = 0, heightTarget_ = 0, heightElapsed_ = 0;
+  float contentHeight_ = 400;
+  float optionsAlpha_ = 0;
 };

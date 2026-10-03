@@ -125,21 +125,51 @@ void DesktopUi::resize(unsigned width, unsigned height) {
   if (SUCCEEDED(swap_->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0))) createTarget();
 }
 
-bool DesktopUi::render(DesktopForm& form, const DesktopState& state) {
+void DesktopUi::animateHeight(float target, float delta) {
+  if (IsIconic(window_)) return;
+  RECT bounds{}; GetWindowRect(window_, &bounds);
+  if (!height_) height_ = heightFrom_ = heightTarget_ = static_cast<float>(bounds.bottom - bounds.top);
+  target = std::ceil(std::max(360.f, target));
+  if (target != heightTarget_) {
+    heightFrom_ = height_;
+    heightTarget_ = target;
+    heightElapsed_ = 0;
+  }
+  constexpr float duration = .28f;
+  heightElapsed_ = std::min(duration, heightElapsed_ + std::min(delta, .05f));
+  const float remaining = 1 - heightElapsed_ / duration;
+  height_ = heightFrom_ + (heightTarget_ - heightFrom_) * (1 - remaining * remaining * remaining);
+  const int height = static_cast<int>(std::lround(height_));
+  if (height == bounds.bottom - bounds.top) return;
+  int top = bounds.top;
+  MONITORINFO monitor{sizeof(monitor)};
+  if (GetMonitorInfoW(MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST), &monitor))
+    top = std::max(monitor.rcWork.top, std::min(bounds.top, monitor.rcWork.bottom - height));
+  // Called before NewFrame so the viewport and render target use the same size.
+  SetWindowPos(window_, nullptr, bounds.left, top, bounds.right - bounds.left, height,
+    SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER);
+}
+
+bool DesktopUi::render(DesktopForm& form, const DesktopState& state, float previewStep) {
   if (!initialized_ || !target_) {
     shutdown();
     if (!initialize(window_)) { Sleep(100); return false; }
   }
+  animateHeight(contentHeight_, previewStep > 0 ? previewStep : ImGui::GetIO().DeltaTime);
+  if (!target_) return false;
   ImGui_ImplDX11_NewFrame();
   ImGui_ImplWin32_NewFrame();
+  // Hidden previews advance motion deterministically without sleeping.
+  if (previewStep > 0) ImGui::GetIO().DeltaTime = previewStep;
   ImGui::NewFrame();
-  const float blend = 1 - std::exp(-ImGui::GetIO().DeltaTime / .18f);
+  const float delta = ImGui::GetIO().DeltaTime;
+  const float blend = 1 - std::exp(-delta / .18f);
   active_ += ((state.running && !state.stopping ? 1.f : 0.f) - active_) * blend;
   ImGui::SetNextWindowPos({0, 0});
   ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
   ImGui::Begin("etl", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-  // Custom chrome stays outside the scrolling content and its drag region.
+  // Window controls stay outside the native drag region.
   auto chromeButton = [](const char* id, int symbol) {
     const auto p = ImGui::GetCursorScreenPos();
     bool clicked = ImGui::InvisibleButton(id, {28, 28});
@@ -151,36 +181,16 @@ bool DesktopUi::render(DesktopForm& form, const DesktopState& state) {
     else if (symbol == 1) {
       d->AddLine({p.x + 10, p.y + 10}, {p.x + 18, p.y + 18}, color, 1.3f);
       d->AddLine({p.x + 18, p.y + 10}, {p.x + 10, p.y + 18}, color, 1.3f);
-    } else {
-      d->AddLine({p.x + 16, p.y + 9}, {p.x + 11, p.y + 14}, color, 1.3f);
-      d->AddLine({p.x + 11, p.y + 14}, {p.x + 16, p.y + 19}, color, 1.3f);
     }
     return clicked;
   };
-  if (options_) {
-    if (chromeButton("##back", 2)) options_ = false;
-    ImGui::SameLine(); ImGui::TextUnformatted("Options");
-  } else {
-    ImGui::PushFont(brand); ImGui::TextUnformatted("etl"); ImGui::PopFont();
-  }
+  ImGui::PushFont(brand); ImGui::TextUnformatted("etl"); ImGui::PopFont();
   ImGui::SameLine(); ImGui::SetCursorPosX(ImGui::GetWindowWidth() - 82);
   if (chromeButton("##minimize", 0)) ShowWindow(window_, SW_MINIMIZE);
   ImGui::SameLine(0, 6);
   if (chromeButton("##close", 1)) PostMessageW(window_, WM_CLOSE, 0, 0);
   ImGui::Dummy({0, 4});
   bool toggle = false;
-  ImGui::BeginChild("content", {0, 0}, ImGuiChildFlags_None);
-  if (options_) {
-    ImGui::BeginDisabled(state.running || state.stopping);
-    ImGui::SetNextItemWidth(110); ImGui::InputInt("Remote port", &form.remotePort, 0);
-    ImGui::SetNextItemWidth(110); ImGui::InputInt("Local port", &form.localPort, 0);
-    ImGui::SetNextItemWidth(110); ImGui::InputInt("Timeout · ms", &form.timeout, 0);
-    input("Backup", "", form.backup.data(), form.backup.size());
-    ImGui::SetNextItemWidth(110); ImGui::InputInt("Backup port", &form.backupPort, 0);
-    input("Backup token", form.savedBackupToken ? "Saved" : "Primary token", form.backupToken.data(), form.backupToken.size(), true);
-    input("CA", "", form.ca.data(), form.ca.size());
-    ImGui::EndDisabled();
-  } else {
   const float width = ImGui::GetContentRegionAvail().x;
   ImGui::SetCursorPosX((ImGui::GetWindowWidth() - 72) / 2);
   const ImVec2 start = ImGui::GetCursorScreenPos();
@@ -211,10 +221,10 @@ bool DesktopUi::render(DesktopForm& form, const DesktopState& state) {
   input("Token", form.savedToken ? "Saved" : "", form.token.data(), form.token.size(), true);
   ImGui::EndDisabled();
   ImGui::Dummy({0, 4});
-  ImGui::TextColored(muted, "%d connections", state.sessions);
-  ImGui::SameLine(width * .44f);
+  ImGui::TextColored(muted, "%d %s", state.sessions, state.sessions == 1 ? "connection" : "connections");
+  ImGui::SameLine(ImGui::GetStyle().WindowPadding.x + width * .44f);
   ImGui::TextColored(muted, "↑ %s", bytes(state.sent).c_str());
-  ImGui::SameLine(width * .75f);
+  ImGui::SameLine(ImGui::GetStyle().WindowPadding.x + width * .75f);
   ImGui::TextColored(muted, "↓ %s", bytes(state.received).c_str());
   ImGui::Dummy({0, 4});
   if (!state.error.empty()) {
@@ -222,15 +232,45 @@ bool DesktopUi::render(DesktopForm& form, const DesktopState& state) {
     ImGui::TextWrapped("%s", state.error.c_str());
     ImGui::PopStyleColor();
   }
-  if (state.failures) ImGui::TextColored(muted, "%llu failures", static_cast<unsigned long long>(state.failures));
+  if (state.failures) ImGui::TextColored(muted, "%llu %s", static_cast<unsigned long long>(state.failures),
+    state.failures == 1 ? "failure" : "failures");
   ImGui::PushStyleColor(ImGuiCol_Button, ImVec4{0, 0, 0, 0});
   ImGui::PushStyleColor(ImGuiCol_Text, muted);
   ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0);
-  if (ImGui::Button("Options", {-1, 28})) options_ = true;
+  if (ImGui::Button("Options", {-1, 28})) options_ = !options_;
+  const auto optionsBounds = ImGui::GetItemRectMax();
+  const float alphaBlend = 1 - std::exp(-delta / .08f);
+  optionsAlpha_ += ((options_ ? 1.f : 0.f) - optionsAlpha_) * alphaBlend;
+  // The chevron rotates as the disclosure opens and closes.
+  const ImVec2 pivot{optionsBounds.x - 14, optionsBounds.y - 14};
+  const float angle = optionsAlpha_ * 1.5707963f;
+  auto rotate = [&](float x, float y) {
+    return ImVec2{pivot.x + x * std::cos(angle) - y * std::sin(angle),
+      pivot.y + x * std::sin(angle) + y * std::cos(angle)};
+  };
+  draw->AddLine(rotate(-2, -4), rotate(2, 0), ImGui::GetColorU32(muted), 1.3f);
+  draw->AddLine(rotate(2, 0), rotate(-2, 4), ImGui::GetColorU32(muted), 1.3f);
   ImGui::PopStyleVar();
   ImGui::PopStyleColor(2);
+  float contentBottom = optionsBounds.y;
+  if (options_ || optionsAlpha_ > .01f) {
+    ImGui::Dummy({0, 4});
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * optionsAlpha_);
+    ImGui::BeginDisabled(state.running || state.stopping || !options_);
+    ImGui::SetNextItemWidth(110); ImGui::InputInt("Remote port", &form.remotePort, 0);
+    ImGui::SetNextItemWidth(110); ImGui::InputInt("Local port", &form.localPort, 0);
+    ImGui::SetNextItemWidth(110); ImGui::InputInt("Timeout · ms", &form.timeout, 0);
+    input("Backup", "", form.backup.data(), form.backup.size());
+    ImGui::SetNextItemWidth(110); ImGui::InputInt("Backup port", &form.backupPort, 0);
+    input("Backup token", form.savedBackupToken ? "Saved" : "Primary token", form.backupToken.data(), form.backupToken.size(), true);
+    input("CA", "", form.ca.data(), form.ca.size());
+    if (options_) contentBottom = ImGui::GetItemRectMax().y;
+    ImGui::EndDisabled();
+    ImGui::PopStyleVar();
   }
-  ImGui::EndChild();
+  contentHeight_ = contentBottom - ImGui::GetWindowPos().y + ImGui::GetStyle().WindowPadding.y;
+  // Keep keyboard navigation from scrolling content during its reveal.
+  ImGui::SetScrollY(0);
   ImGui::End();
   ImGui::Render();
   context_->OMSetRenderTargets(1, &target_, nullptr);
@@ -241,7 +281,7 @@ bool DesktopUi::render(DesktopForm& form, const DesktopState& state) {
   if (result == DXGI_ERROR_DEVICE_REMOVED || result == DXGI_ERROR_DEVICE_RESET) {
     shutdown();
     initialize(window_);
-  } else if (result == DXGI_STATUS_OCCLUDED) Sleep(100);
+  } else if (result == DXGI_STATUS_OCCLUDED && previewStep <= 0) Sleep(100);
   return toggle;
 }
 

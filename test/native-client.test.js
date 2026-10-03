@@ -308,16 +308,21 @@ test('native client rejects a trailing headless option',
   assert.throws(() => execFileSync(executable, ['--headless', '--server'], { windowsHide: true }), e => e.status === 22);
 });
 
-test('native desktop renders a DirectX frame without reading user settings or starting a proxy',
+test('native desktop renders compact frames and animates expansion and collapse without starting a proxy',
   { skip: !executable || process.platform !== 'win32', timeout: 10000 }, () => {
   const dir = mkdtempSync(join(tmpdir(), 'etl-ui-'));
   try {
-    const path = join(dir, 'preview.bmp');
-    execFileSync(executable, ['--self-test-ui', path], { windowsHide: true, timeout: 8000 });
-    const bitmap = readFileSync(path);
-    assert.equal(bitmap.subarray(0, 2).toString(), 'BM');
-    const width = bitmap.readInt32LE(18), height = Math.abs(bitmap.readInt32LE(22));
-    assert.ok(width >= 320 && width <= 400 && height >= 350 && height <= 440, 'desktop should remain compact');
-    assert.ok(bitmap.length > 400_000);
+    const heights = ['--self-test-ui', '--self-test-ui-options', '--self-test-ui-error'].map((flag, index) => {
+      const path = join(dir, `preview-${index}.bmp`);
+      execFileSync(executable, [flag, path], { windowsHide: true, timeout: 8000 });
+      const bitmap = readFileSync(path);
+      assert.equal(bitmap.subarray(0, 2).toString(), 'BM');
+      assert.equal(bitmap.readInt32LE(18), 360, 'content changes should preserve the compact width');
+      assert.ok(bitmap.length > 400_000);
+      return Math.abs(bitmap.readInt32LE(22));
+    });
+    assert.ok(heights[0] >= 350 && heights[0] <= 400, 'collapsed desktop should remain compact');
+    assert.ok(heights[1] > heights[0] + 250, 'Options should expand the native window');
+    assert.ok(heights[2] > heights[0], 'wrapped errors should expand the native window');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
