@@ -13,30 +13,18 @@ on:
         required: true
         default: "443"
 
+permissions:
+  contents: read
 jobs:
   probe:
     runs-on: ubuntu-latest
     steps:
-      - name: TCP and TLS probe
-        run: |
-          node -e '
-          const net = require("net");
-          const tls = require("tls");
-          const host = "${{ inputs.host }}";
-          const port = Number("${{ inputs.port }}");
-          const socket = net.connect({ host, port, timeout: 15000 });
-          socket.on("timeout", () => { console.log("RESULT tcp TIMEOUT"); socket.destroy(); process.exit(2); });
-          socket.on("error", (e) => { console.log("RESULT tcp ERROR " + (e.code || e.message)); process.exit(2); });
-          socket.on("connect", () => {
-            console.log("RESULT tcp CONNECTED " + host + ":" + port);
-            const t = tls.connect({ socket, servername: host, rejectUnauthorized: false }, () => {
-              // Diagnostic only: reads the offered certificate. No ETL credentials
-              // are sent and the local client never disables verification.
-              const c = t.getPeerCertificate();
-              console.log("RESULT tls HANDSHAKE " + t.getProtocol());
-              console.log("RESULT cert subject=" + JSON.stringify(c.subject) + " issuer=" + JSON.stringify(c.issuer));
-              t.destroy();
-            });
-            t.on("error", (e) => { console.log("RESULT tls ERROR " + (e.code || e.message)); process.exit(3); });
-          });
-          '
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+      - name: Verify DNS, TCP and TLS identity without credentials
+        env:
+          ETL_HOST: ${{ inputs.host }}
+          ETL_PORT: ${{ inputs.port }}
+        run: node src/cli.js doctor --server "$ETL_HOST" --server-port "$ETL_PORT" --timeout 15000 --json
