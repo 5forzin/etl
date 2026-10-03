@@ -6,8 +6,10 @@ forwards TCP through the same ETL v1 server as the Node client.
 
 ## Use
 
-Run `etl-client.exe`, enter the server and token, then Connect. Ports, backup,
-timeout and CA are under Options. The token input is masked. A saved token remains
+Run `etl-client.exe`, enter the server and token, then click the power button.
+The borderless window is 360 × 400, with a draggable header and custom minimize
+and close controls. Ports, backup, timeout and CA have a separate Options screen.
+The token input is masked. A saved token remains
 in use when the field is blank; entering a new token replaces it. Leaving the
 backup host empty disables failover. A new backup with no token uses the primary
 credential; an existing saved backup token is retained when its field is blank.
@@ -67,6 +69,12 @@ with the EXE, SHA256SUMS and dependency licenses. Published downloads live under
 release contains. The build is not code-signed. Verify downloads with
 `Get-FileHash ./etl-client.exe -Algorithm SHA256`.
 
+If another copy is running, package to a separate folder:
+
+~~~powershell
+./native/windows/package.ps1 -Portable -OutputDirectory dist/windows-compact
+~~~
+
 ## Verify
 
 ~~~powershell
@@ -79,6 +87,9 @@ The suite checks DPAPI, SOCKS/HTTP relaying, failover, certificate rejection,
 IPv6, negotiation and idle deadlines, argument validation and DirectX rendering.
 `--self-test-ui OUTPUT.bmp` creates a hidden preview using default settings;
 it neither loads a user profile nor opens a proxy. CI also saves this preview.
+`--self-test-ui-options OUTPUT.bmp` captures the Options screen. Both preview
+modes check that the native caption is absent and that header dragging leaves
+window controls clickable.
 
 Headless mode takes `--server`, `--server-port`, `--port`, `--token-file`,
 `--ca`, `--fallback-server`, `--fallback-port`, `--fallback-token-file` and

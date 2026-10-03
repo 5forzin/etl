@@ -1,5 +1,6 @@
 param(
   [string]$RuntimeBin = 'C:\msys64\ucrt64\bin',
+  [string]$OutputDirectory = '',
   [switch]$Portable
 )
 $ErrorActionPreference = 'Stop'
@@ -8,7 +9,9 @@ $buildName = if ($Portable) { 'windows-portable' } else { 'windows' }
 $built = Join-Path $root "build/$buildName/etl-client.exe"
 if (-not (Test-Path -LiteralPath $built)) { $built = Join-Path $root "build/$buildName/Release/etl-client.exe" }
 if (-not (Test-Path -LiteralPath $built)) { throw 'Build the client with CMake first' }
-$output = Join-Path $root "dist/$buildName"
+$output = if (-not $OutputDirectory) { Join-Path $root "dist/$buildName" }
+  elseif ([System.IO.Path]::IsPathRooted($OutputDirectory)) { $OutputDirectory }
+  else { Join-Path $root $OutputDirectory }
 New-Item -ItemType Directory -Force -Path $output | Out-Null
 $exe = Join-Path $output 'etl-client.exe'
 Copy-Item -LiteralPath $built -Destination $exe -Force

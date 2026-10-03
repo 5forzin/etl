@@ -13,7 +13,7 @@ tokens with DPAPI for the current user.
 
 Windows: build the client using the [Windows guide](native/windows/README.md),
 or check [releases](https://github.com/5forzin/etl/releases) for published builds.
-Enter your server and token, set the remote port under Options, then connect.
+Enter your server and token, set the remote port under Options, then click the power button.
 The new ImGui build is available only after it has been built or released from
 this revision; older downloads may still use the previous interface.
 
