@@ -50,6 +50,8 @@ struct Config {
   std::wstring fallbackProtectedToken;
   std::wstring fallbackTokenFile;
   int connectTimeoutMs = 1000;
+  int handshakeTimeoutMs = 10000;
+  int idleTimeoutMs = 120000;
   int localPort = 1080;
   std::wstring caFile;
 };
@@ -258,6 +260,28 @@ static bool responseOK(SSL* ssl) {
   std::string body(n, '\0');
   return sslRead(ssl, body.data(), n) && body == "{\"code\":\"OK\"}";
 }
+
+// A socket timeout resets whenever bytes arrive; a protocol deadline must not.
+class SocketBudget {
+ public:
+  SocketBudget(SOCKET socket, int milliseconds) : guard_([this, socket, milliseconds] {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (!wake_.wait_for(lock, std::chrono::milliseconds(milliseconds), [this] { return done_; })) {
+      shutdown(socket, SD_BOTH);
+    }
+  }) {}
+  void cancel() {
+    { std::lock_guard<std::mutex> lock(mutex_); done_ = true; }
+    wake_.notify_one();
+    if (guard_.joinable()) guard_.join();
+  }
+  ~SocketBudget() { cancel(); }
+ private:
+  std::mutex mutex_;
+  std::condition_variable wake_;
+  bool done_ = false;
+  std::thread guard_;
+};
 
 static std::string jsonEscape(const std::string& value) {
   std::string out;
@@ -568,7 +592,9 @@ class Service {
     }
     OPENSSL_cleanse(token.data(), token.size());
     if (config.connectTimeoutMs < 1 || config.connectTimeoutMs > 60000) { error = L"Timeout: use 1 to 60000 ms."; return false; }
-    if (config.server.empty() || config.serverPort < 1 || config.localPort < 1) { error = L"Invalid settings."; return false; }
+    if (config.server.empty() || config.serverPort < 1 || config.serverPort > 65535 ||
+        config.localPort < 1 || config.localPort > 65535 || config.fallbackPort < 1 || config.fallbackPort > 65535 ||
+        config.handshakeTimeoutMs < 1 || config.idleTimeoutMs < 1) { error = L"Invalid settings."; return false; }
     ctx_ = SSL_CTX_new(TLS_client_method());
     if (!ctx_) { error = L"TLS could not start."; return false; }
     SSL_CTX_set_min_proto_version(ctx_, TLS1_3_VERSION);
@@ -580,12 +606,17 @@ class Service {
     }
     SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (listener == INVALID_SOCKET) { error = L"Local listener could not start."; SSL_CTX_free(ctx_); ctx_ = nullptr; return false; }
-    sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); addr.sin_port = htons(config.localPort);
+    sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); addr.sin_port = htons(static_cast<u_short>(config.localPort));
     if (bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) || listen(listener, SOMAXCONN)) {
       error = L"Local port is busy or unavailable."; closesocket(listener); SSL_CTX_free(ctx_); ctx_ = nullptr; return false;
     }
     config_ = config; listener_ = listener; running_ = true;
-    acceptThread_ = std::thread([this] { acceptLoop(); });
+    sent_ = 0; received_ = 0; failures_ = 0;
+    try { acceptThread_ = std::thread([this] { acceptLoop(); }); }
+    catch (...) {
+      running_ = false; listener_ = INVALID_SOCKET; closesocket(listener);
+      SSL_CTX_free(ctx_); ctx_ = nullptr; error = L"Worker could not start."; return false;
+    }
     return true;
   }
 
@@ -594,9 +625,8 @@ class Service {
     SOCKET listener = listener_.exchange(INVALID_SOCKET);
     if (listener != INVALID_SOCKET) closesocket(listener);
     if (acceptThread_.joinable()) acceptThread_.join();
-    std::vector<SOCKET> live;
-    { std::lock_guard<std::mutex> lock(mu_); live.assign(sockets_.begin(), sockets_.end()); }
-    for (SOCKET s : live) shutdown(s, SD_BOTH);
+    // Keep handles stable while interrupting workers; a closed handle may be reused.
+    { std::lock_guard<std::mutex> lock(mu_); for (SOCKET s : sockets_) shutdown(s, SD_BOTH); }
     std::unique_lock<std::mutex> lock(mu_);
     drained_.wait(lock, [this] { return sessions_ == 0; });
     lock.unlock();
@@ -605,6 +635,9 @@ class Service {
 
   bool running() const { return running_; }
   int sessions() const { return sessions_; }
+  uint64_t sent() const { return sent_; }
+  uint64_t received() const { return received_; }
+  uint64_t failures() const { return failures_; }
 
  private:
   void acceptLoop() {
@@ -625,8 +658,8 @@ class Service {
       std::lock_guard<std::mutex> lock(mu_);
       sockets_.insert(client);
       ++sessions_;
-      std::thread([this, client] {
-        process(client);
+      try { std::thread([this, client] {
+        try { process(client); } catch (...) { ++failures_; }
         {
           std::lock_guard<std::mutex> lock(mu_);
           sockets_.erase(client);
@@ -634,11 +667,14 @@ class Service {
           --sessions_;
         }
         drained_.notify_all();
-      }).detach();
+      }).detach(); } catch (...) {
+        sockets_.erase(client); closesocket(client); --sessions_; ++failures_;
+      }
     }
   }
 
   void process(SOCKET client) {
+    SocketBudget negotiation(client, config_.handshakeTimeoutMs);
     std::string host;
     int port = 0;
     unsigned char first;
@@ -653,6 +689,7 @@ class Service {
       }
       host = http.host; port = http.port;
     }
+    negotiation.cancel();
     if (!running_) return;
     SOCKET remote = INVALID_SOCKET;
     SSL* ssl = nullptr;
@@ -715,13 +752,15 @@ class Service {
       closesocket(remote);
       remote = INVALID_SOCKET;
     }
-    if (!ok) { if (socks) socksReply(client, 1); else httpReply(client, 502); return; }
+    if (!ok) { ++failures_; if (socks) socksReply(client, 1); else httpReply(client, 502); return; }
+    SocketBudget destinationBudget(remote, config_.handshakeTimeoutMs);
     DWORD setupTimeout = 10000;
     setsockopt(remote, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<char*>(&setupTimeout), sizeof(setupTimeout));
     setsockopt(remote, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<char*>(&setupTimeout), sizeof(setupTimeout));
     std::string encoded = jsonEscape(host);
     ok = !encoded.empty() && writeFrame(ssl, "{\"host\":\"" + encoded + "\",\"port\":" + std::to_string(port) + "}") && responseOK(ssl);
     if (ok && !socks && !http.connect) ok = sslWrite(ssl, http.initialData.data(), http.initialData.size());
+    destinationBudget.cancel();
     if (ok) {
       if (socks) socksReply(client, 0);
       else if (http.connect) httpReply(client, 200);
@@ -731,7 +770,7 @@ class Service {
       setsockopt(remote, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<char*>(&timeout), sizeof(timeout));
       setsockopt(remote, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<char*>(&timeout), sizeof(timeout));
       relay(client, remote, ssl);
-    } else { if (socks) socksReply(client, 1); else httpReply(client, 502); }
+    } else { ++failures_; if (socks) socksReply(client, 1); else httpReply(client, 502); }
     if (ssl) SSL_free(ssl);
     { std::lock_guard<std::mutex> lock(mu_); sockets_.erase(remote); }
     closesocket(remote);
@@ -740,20 +779,28 @@ class Service {
   void relay(SOCKET local, SOCKET remote, SSL* ssl) {
     bool localOpen = true, remoteOpen = true;
     char buffer[16384];
+    auto lastActivity = ConnectClock::now();
     while (running_ && (localOpen || remoteOpen)) {
+      if (ConnectClock::now() - lastActivity >= std::chrono::milliseconds(config_.idleTimeoutMs)) break;
       fd_set readable; FD_ZERO(&readable);
       if (localOpen) FD_SET(local, &readable);
       if (remoteOpen) FD_SET(remote, &readable);
-      timeval timeout{1, 0};
+      timeval timeout{0, 100000};
       if (select(0, &readable, nullptr, nullptr, &timeout) == SOCKET_ERROR) break;
       if (localOpen && FD_ISSET(local, &readable)) {
         int n = recv(local, buffer, sizeof(buffer), 0);
-        if (n > 0) { if (!sslWrite(ssl, buffer, n)) break; }
+        if (n > 0) {
+          if (!sslWrite(ssl, buffer, n)) break;
+          sent_ += n; lastActivity = ConnectClock::now();
+        }
         else { localOpen = false; SSL_shutdown(ssl); }
       }
       if (remoteOpen && (FD_ISSET(remote, &readable) || SSL_pending(ssl) > 0)) {
         int n = SSL_read(ssl, buffer, sizeof(buffer));
-        if (n > 0) { if (!socketWrite(local, buffer, n)) break; }
+        if (n > 0) {
+          if (!socketWrite(local, buffer, n)) break;
+          received_ += n; lastActivity = ConnectClock::now();
+        }
         else { remoteOpen = false; shutdown(local, SD_SEND); }
       }
     }
@@ -764,6 +811,7 @@ class Service {
   std::atomic<SOCKET> listener_{INVALID_SOCKET};
   std::atomic<bool> running_{false};
   std::atomic<int> sessions_{0};
+  std::atomic<uint64_t> sent_{0}, received_{0}, failures_{0};
   std::thread acceptThread_;
   std::mutex mu_;
   std::condition_variable drained_;
@@ -904,6 +952,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   if (WSAStartup(MAKEWORD(2, 2), &data)) return 1;
   int argc = 0;
   LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+  if (!argv) { WSACleanup(); return 1; }
+  const std::wstring previewPath = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui" ? argv[2] : L"";
   if (argc == 2 && std::wstring(argv[1]) == L"--self-test-token-storage") {
     std::string original(64, 'a'), restored;
     std::wstring protectedValue;
@@ -914,6 +964,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     LocalFree(argv); WSACleanup(); return ok ? 0 : 23;
   }
   if (argc > 1 && std::wstring(argv[1]) == L"--headless") {
+    if (argc % 2 != 0) { LocalFree(argv); WSACleanup(); return 22; }
     Config c;
     for (int i = 2; i + 1 < argc; i += 2) {
       std::wstring name = argv[i], value = argv[i + 1];
@@ -925,6 +976,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
       else if (name == L"--server-port") { if (!portValue(value, c.serverPort)) return 20; }
       else if (name == L"--fallback-port") { if (!portValue(value, c.fallbackPort)) return 20; }
       else if (name == L"--connect-timeout-ms") { if (!portValue(value, c.connectTimeoutMs) || c.connectTimeoutMs > 60000) return 20; }
+      else if (name == L"--handshake-timeout-ms") { if (!portValue(value, c.handshakeTimeoutMs)) return 20; }
+      else if (name == L"--idle-timeout-ms") {
+        if (value.empty() || value.size() > 6 || !std::all_of(value.begin(), value.end(), [](wchar_t ch) { return ch >= L'0' && ch <= L'9'; })) return 20;
+        c.idleTimeoutMs = std::stoi(value); if (c.idleTimeoutMs < 1 || c.idleTimeoutMs > 600000) return 20;
+      }
       else if (name == L"--port") { if (!portValue(value, c.localPort)) return 21; }
       else return 22;
     }
@@ -934,7 +990,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     LocalFree(argv); WSACleanup(); return result;
   }
   LocalFree(argv);
-  config = loadConfig();
+  config = previewPath.empty() ? loadConfig() : Config{};
   loadForm();
   WNDCLASSW wc{}; wc.lpfnWndProc = windowProc; wc.hInstance = instance;
   wc.lpszClassName = L"ETLNativeClient"; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
@@ -946,6 +1002,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     MessageBoxW(window, L"DirectX 11 could not start.", L"ETL", MB_ICONERROR);
     DestroyWindow(window); WSACleanup(); return 2;
   }
+  if (!previewPath.empty()) {
+    for (int i = 0; i < 4; ++i) desktop.render(form, DesktopState{});
+    const bool ok = desktop.capture(previewPath);
+    desktop.shutdown(); DestroyWindow(window); WSACleanup(); return ok ? 0 : 24;
+  }
   ShowWindow(window, SW_SHOW);
   MSG message{};
   bool quit = false;
@@ -956,7 +1017,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     }
     if (quit) break;
     if (!IsWindowVisible(window) || IsIconic(window)) { WaitMessage(); continue; }
-    DesktopState state{service.running(), stopping, service.sessions(), 0, 0, 0, uiError};
+    DesktopState state{service.running(), stopping, service.sessions(), service.sent(), service.received(), service.failures(), uiError};
     if (desktop.render(form, state)) connectOrStop(window);
   }
   desktop.shutdown();

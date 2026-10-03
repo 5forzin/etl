@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <fstream>
+#include <filesystem>
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
@@ -219,4 +221,31 @@ void DesktopUi::shutdown() {
     initialized_ = false;
   }
   releaseDevice();
+}
+
+bool DesktopUi::capture(const std::wstring& path) {
+  ID3D11Texture2D *back = nullptr, *staging = nullptr;
+  if (!swap_ || FAILED(swap_->GetBuffer(0, IID_PPV_ARGS(&back)))) return false;
+  D3D11_TEXTURE2D_DESC desc{}; back->GetDesc(&desc);
+  desc.Usage = D3D11_USAGE_STAGING; desc.BindFlags = 0; desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ; desc.MiscFlags = 0;
+  if (FAILED(device_->CreateTexture2D(&desc, nullptr, &staging))) { back->Release(); return false; }
+  context_->CopyResource(staging, back); back->Release();
+  D3D11_MAPPED_SUBRESOURCE mapped{};
+  if (FAILED(context_->Map(staging, 0, D3D11_MAP_READ, 0, &mapped))) { staging->Release(); return false; }
+  std::ofstream file(std::filesystem::path(path), std::ios::binary);
+  BITMAPFILEHEADER header{}; header.bfType = 0x4d42; header.bfOffBits = sizeof(header) + sizeof(BITMAPINFOHEADER);
+  header.bfSize = header.bfOffBits + desc.Width * desc.Height * 4;
+  BITMAPINFOHEADER info{}; info.biSize = sizeof(info); info.biWidth = desc.Width; info.biHeight = -static_cast<LONG>(desc.Height);
+  info.biPlanes = 1; info.biBitCount = 32; info.biCompression = BI_RGB;
+  file.write(reinterpret_cast<const char*>(&header), sizeof(header));
+  file.write(reinterpret_cast<const char*>(&info), sizeof(info));
+  for (UINT y = 0; y < desc.Height; ++y) {
+    auto* row = static_cast<unsigned char*>(mapped.pData) + y * mapped.RowPitch;
+    for (UINT x = 0; x < desc.Width; ++x) {
+      const char bgra[]{static_cast<char>(row[x*4+2]), static_cast<char>(row[x*4+1]), static_cast<char>(row[x*4]), static_cast<char>(255)};
+      file.write(bgra, 4);
+    }
+  }
+  const bool ok = file.good();
+  context_->Unmap(staging, 0); staging->Release(); return ok;
 }

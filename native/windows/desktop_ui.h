@@ -26,6 +26,7 @@ class DesktopUi {
   bool render(DesktopForm& form, const DesktopState& state);
   void resize(unsigned width, unsigned height);
   void shutdown();
+  bool capture(const std::wstring& path);
   bool message(HWND window, UINT message, WPARAM wparam, LPARAM lparam);
  private:
   bool createTarget();

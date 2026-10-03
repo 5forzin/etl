@@ -261,3 +261,62 @@ test('native Windows client reaches an IPv6-only ETL server through localhost',
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('native client expires incomplete negotiations and idle relays',
+  { skip: !executable || process.platform !== 'win32', timeout: 7000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'etl-native-deadlines-'));
+  let server, destination, child;
+  try {
+    const certPath = join(dir, 'cert.pem'), keyPath = join(dir, 'key.pem'), tokenPath = join(dir, 'token');
+    execFileSync(process.env.ETL_OPENSSL ?? 'openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes',
+      '-keyout', keyPath, '-out', certPath, '-days', '1', '-subj', '/CN=localhost',
+      '-addext', 'subjectAltName=DNS:localhost'], { stdio: 'pipe' });
+    writeFileSync(tokenPath, 'a'.repeat(64));
+    destination = track(net.createServer(socket => { socket.on('error', () => {}); socket.pipe(socket); }));
+    const targetPort = await listen(destination);
+    server = createTunnelServer({ key: readFileSync(keyPath), cert: readFileSync(certPath), getToken: () => 'a'.repeat(64),
+      resolve: async () => [{ address: '127.0.0.1', family: 4 }] });
+    const remotePort = await listen(server), localPort = await freePort();
+    child = spawn(executable, ['--headless', '--server', 'localhost', '--server-port', String(remotePort),
+      '--token-file', tokenPath, '--ca', certPath, '--port', String(localPort),
+      '--handshake-timeout-ms', '500', '--idle-timeout-ms', '300'], { stdio: 'ignore', windowsHide: true });
+    await awaitClient(localPort, child);
+    const incomplete = net.connect({ host: '127.0.0.1', port: localPort });
+    await connected(incomplete); incomplete.on('error', () => {}); incomplete.resume();
+    const closed = once(incomplete, 'close');
+    const started = performance.now(); incomplete.write('CONNECT ');
+    const drip = setInterval(() => incomplete.write('x'), 100);
+    try { await closed; } finally { clearInterval(drip); incomplete.destroy(); }
+    assert.ok(performance.now() - started >= 350, 'header closed before its deadline');
+    const socket = protect(net.connect({ host: '127.0.0.1', port: localPort }), 2000);
+    await connected(socket); socket.write(Buffer.from([5, 1, 0]));
+    assert.deepEqual(await read(socket, 2), Buffer.from([5, 0]));
+    const host = Buffer.from('remote.example');
+    socket.write(Buffer.concat([Buffer.from([5,1,0,3,host.length]),host,Buffer.from([targetPort >> 8, targetPort & 255])]));
+    assert.equal((await read(socket, 10))[1], 0);
+    socket.write('idle-test'); assert.equal((await read(socket, 9)).toString(), 'idle-test');
+    const idleClose = once(socket, 'close'); socket.resume(); await idleClose;
+    assert.equal(socket.destroyed, true);
+  } finally {
+    child?.kill(); if (server) await server.shutdown(); if (destination) await destination.shutdown();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('native client rejects a trailing headless option',
+  { skip: !executable || process.platform !== 'win32' }, () => {
+  assert.throws(() => execFileSync(executable, ['--headless', '--server'], { windowsHide: true }), e => e.status === 22);
+});
+
+test('native desktop renders a DirectX frame without reading user settings or starting a proxy',
+  { skip: !executable || process.platform !== 'win32', timeout: 10000 }, () => {
+  const dir = mkdtempSync(join(tmpdir(), 'etl-ui-'));
+  try {
+    const path = join(dir, 'preview.bmp');
+    execFileSync(executable, ['--self-test-ui', path], { windowsHide: true, timeout: 8000 });
+    const bitmap = readFileSync(path);
+    assert.equal(bitmap.subarray(0, 2).toString(), 'BM');
+    assert.ok(bitmap.readInt32LE(18) >= 500);
+    assert.ok(bitmap.length > 1_000_000);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
