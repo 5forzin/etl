@@ -7,8 +7,9 @@ forwards TCP through the same ETL v1 server as the Node client.
 ## Use
 
 Run `etl-client.exe`, enter the server and token, then click the power button.
-The borderless window is 360 × 400, with a draggable header and custom minimize
-and close controls. Ports, backup, timeout and CA have a separate Options screen.
+The borderless window is 360 pixels wide, with a draggable header and custom
+minimize and close controls. Options expands ports, backup, timeout and CA below
+the main controls. The window grows and shrinks smoothly to fit, without scrollbars.
 The token input is masked. A saved token remains
 in use when the field is blank; entering a new token replaces it. Leaving the
 backup host empty disables failover. A new backup with no token uses the primary
@@ -87,9 +88,10 @@ The suite checks DPAPI, SOCKS/HTTP relaying, failover, certificate rejection,
 IPv6, negotiation and idle deadlines, argument validation and DirectX rendering.
 `--self-test-ui OUTPUT.bmp` creates a hidden preview using default settings;
 it neither loads a user profile nor opens a proxy. CI also saves this preview.
-`--self-test-ui-options OUTPUT.bmp` captures the Options screen. Both preview
-modes check that the native caption is absent and that header dragging leaves
-window controls clickable.
+`--self-test-ui-options OUTPUT.bmp` checks animated expansion and collapse, then
+captures expanded Options. `--self-test-ui-error OUTPUT.bmp` captures a wrapped
+error. Preview modes use a fixed animation step and check that the native caption
+is absent and header dragging leaves window controls clickable.
 
 Headless mode takes `--server`, `--server-port`, `--port`, `--token-file`,
 `--ca`, `--fallback-server`, `--fallback-port`, `--fallback-token-file` and

@@ -1,14 +1,20 @@
 # Windows interface
 
 [Figma sketch](https://www.figma.com/design/BQNC74KJoWRbj8JC0fIpOl?node-id=5-136).
-The Proxy and Options screens are 360 × 400. They use editable layers, auto
-layout, color variables and a shared input component. The client displays traffic
+The collapsed and expanded sketches are 360 pixels wide. They use editable
+layers, auto layout, color variables and a shared input component. The client displays traffic
 counters from its current session.
 
 The main screen contains local proxy status, server, token and traffic. The power
-icon connects or disconnects. Ports, backup, timeout and CA have a separate Options
-screen so opening settings keeps the window compact. Both screens fit without
-scrolling at the default size; longer errors can scroll within the content area.
+icon connects or disconnects. Options reveals ports, backup, timeout and CA below
+the main controls. The window measures its content and adjusts its height without
+scrollbars. Wrapped errors also change the required height.
+
+Opening and closing Options animates the native window height over 280 ms with
+cubic ease-out. Fields fade in and the disclosure chevron rotates. Reversing the
+animation starts from the current height. Width stays fixed and the renderer
+resizes its DirectX target before drawing each frame. The window moves upward
+only when growth would put its bottom below the monitor's work area.
 
 The native window has no caption or border. Drag the header to move it; custom
 controls minimize or close it. Windows 11 supplies rounded corners when supported.
