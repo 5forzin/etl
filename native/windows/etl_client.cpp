@@ -22,6 +22,8 @@
 #include <vector>
 #include <algorithm>
 #include "desktop_ui.h"
+#include <windowsx.h>
+#include <dwmapi.h>
 
 constexpr UINT WM_TRAY = WM_APP + 1;
 constexpr UINT WM_SERVICE_STOPPED = WM_APP + 2;
@@ -894,7 +896,7 @@ static void connectOrStop(HWND window) {
 }
 
 static void showWindow(HWND window) {
-  ShowWindow(window, SW_SHOW);
+  ShowWindow(window, IsIconic(window) ? SW_RESTORE : SW_SHOW);
   SetForegroundWindow(window);
 }
 
@@ -911,8 +913,15 @@ static LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wparam, LPA
     case WM_SIZE:
       if (wparam != SIZE_MINIMIZED) desktop.resize(LOWORD(lparam), HIWORD(lparam));
       return 0;
-    case WM_GETMINMAXINFO:
-      reinterpret_cast<MINMAXINFO*>(lparam)->ptMinTrackSize = {520, 720}; return 0;
+    case WM_NCHITTEST: {
+      POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+      ScreenToClient(window, &point);
+      RECT client{}; GetClientRect(window, &client);
+      // Reserve the back button and window controls for normal client input.
+      if (point.y >= 0 && point.y < 50 && point.x >= 54 && point.x < client.right - 90) return HTCAPTION;
+      return HTCLIENT;
+    }
+    case WM_NCLBUTTONDBLCLK: return 0;
     case WM_COMMAND:
       if (LOWORD(wparam) == ID_CONNECT) connectOrStop(window);
       else if (LOWORD(wparam) == ID_OPEN) showWindow(window);
@@ -953,7 +962,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   int argc = 0;
   LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
   if (!argv) { WSACleanup(); return 1; }
-  const std::wstring previewPath = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui" ? argv[2] : L"";
+  const bool previewOptions = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-options";
+  const std::wstring previewPath = argc == 3 && (std::wstring(argv[1]) == L"--self-test-ui" || previewOptions) ? argv[2] : L"";
   if (argc == 2 && std::wstring(argv[1]) == L"--self-test-token-storage") {
     std::string original(64, 'a'), restored;
     std::wstring protectedValue;
@@ -995,16 +1005,26 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   WNDCLASSW wc{}; wc.lpfnWndProc = windowProc; wc.hInstance = instance;
   wc.lpszClassName = L"ETLNativeClient"; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
   RegisterClassW(&wc);
-  HWND window = CreateWindowExW(0, wc.lpszClassName, L"ETL", WS_OVERLAPPEDWINDOW,
-    CW_USEDEFAULT, CW_USEDEFAULT, 540, 760, nullptr, nullptr, instance, nullptr);
+  HWND window = CreateWindowExW(WS_EX_APPWINDOW, wc.lpszClassName, L"ETL", WS_POPUP | WS_MINIMIZEBOX | WS_SYSMENU,
+    CW_USEDEFAULT, CW_USEDEFAULT, 360, 400, nullptr, nullptr, instance, nullptr);
   if (!window) { WSACleanup(); return 1; }
+  const int rounded = 2;
+  const DWORD noBorder = 0xfffffffe;
+  DwmSetWindowAttribute(window, static_cast<DWMWINDOWATTRIBUTE>(33), &rounded, sizeof(rounded));
+  DwmSetWindowAttribute(window, static_cast<DWMWINDOWATTRIBUTE>(34), &noBorder, sizeof(noBorder));
   if (!desktop.initialize(window)) {
     MessageBoxW(window, L"DirectX 11 could not start.", L"ETL", MB_ICONERROR);
     DestroyWindow(window); WSACleanup(); return 2;
   }
   if (!previewPath.empty()) {
+    if (previewOptions) desktop.showOptions();
     for (int i = 0; i < 4; ++i) desktop.render(form, DesktopState{});
-    const bool ok = desktop.capture(previewPath);
+    POINT drag{100, 20}, control{320, 20};
+    ClientToScreen(window, &drag); ClientToScreen(window, &control);
+    const bool chrome = !(GetWindowLongPtrW(window, GWL_STYLE) & WS_CAPTION) &&
+      SendMessageW(window, WM_NCHITTEST, 0, MAKELPARAM(drag.x, drag.y)) == HTCAPTION &&
+      SendMessageW(window, WM_NCHITTEST, 0, MAKELPARAM(control.x, control.y)) == HTCLIENT;
+    const bool ok = chrome && desktop.capture(previewPath);
     desktop.shutdown(); DestroyWindow(window); WSACleanup(); return ok ? 0 : 24;
   }
   ShowWindow(window, SW_SHOW);

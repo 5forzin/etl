@@ -82,16 +82,16 @@ bool DesktopUi::initialize(HWND window) {
   io.LogFilename = nullptr;
   ImFontConfig font;
   font.FontDataOwnedByAtlas = false;
-  body = io.Fonts->AddFontFromMemoryTTF(const_cast<unsigned char*>(etlFont), sizeof(etlFont), 16, &font);
-  heading = io.Fonts->AddFontFromMemoryTTF(const_cast<unsigned char*>(etlFont), sizeof(etlFont), 24, &font);
-  brand = io.Fonts->AddFontFromMemoryTTF(const_cast<unsigned char*>(etlFont), sizeof(etlFont), 28, &font);
+  body = io.Fonts->AddFontFromMemoryTTF(const_cast<unsigned char*>(etlFont), sizeof(etlFont), 14, &font);
+  heading = io.Fonts->AddFontFromMemoryTTF(const_cast<unsigned char*>(etlFont), sizeof(etlFont), 20, &font);
+  brand = io.Fonts->AddFontFromMemoryTTF(const_cast<unsigned char*>(etlFont), sizeof(etlFont), 22, &font);
   if (!body || !heading || !brand) { ImGui::DestroyContext(); releaseDevice(); return false; }
   auto& style = ImGui::GetStyle();
   ImGui::StyleColorsDark();
-  style.WindowPadding = {32, 28};
-  style.FramePadding = {16, 13};
-  style.ItemSpacing = {14, 12};
-  style.FrameRounding = 12;
+  style.WindowPadding = {20, 16};
+  style.FramePadding = {12, 8};
+  style.ItemSpacing = {10, 6};
+  style.FrameRounding = 10;
   style.WindowBorderSize = 0;
   style.FrameBorderSize = 1;
   style.Colors[ImGuiCol_WindowBg] = background;
@@ -138,27 +138,66 @@ bool DesktopUi::render(DesktopForm& form, const DesktopState& state) {
   ImGui::SetNextWindowPos({0, 0});
   ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
   ImGui::Begin("etl", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
-    ImGuiWindowFlags_NoSavedSettings);
-  ImGui::PushFont(brand);
-  ImGui::TextUnformatted("etl");
-  ImGui::PopFont();
-  ImGui::Spacing();
+    ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+  // Custom chrome stays outside the scrolling content and its drag region.
+  auto chromeButton = [](const char* id, int symbol) {
+    const auto p = ImGui::GetCursorScreenPos();
+    bool clicked = ImGui::InvisibleButton(id, {28, 28});
+    auto* d = ImGui::GetWindowDrawList();
+    if (ImGui::IsItemHovered() || ImGui::IsItemFocused())
+      d->AddRectFilled(p, {p.x + 28, p.y + 28}, ImGui::GetColorU32(surface), 7);
+    const ImU32 color = ImGui::GetColorU32(muted);
+    if (symbol == 0) d->AddLine({p.x + 9, p.y + 15}, {p.x + 19, p.y + 15}, color, 1.3f);
+    else if (symbol == 1) {
+      d->AddLine({p.x + 10, p.y + 10}, {p.x + 18, p.y + 18}, color, 1.3f);
+      d->AddLine({p.x + 18, p.y + 10}, {p.x + 10, p.y + 18}, color, 1.3f);
+    } else {
+      d->AddLine({p.x + 16, p.y + 9}, {p.x + 11, p.y + 14}, color, 1.3f);
+      d->AddLine({p.x + 11, p.y + 14}, {p.x + 16, p.y + 19}, color, 1.3f);
+    }
+    return clicked;
+  };
+  if (options_) {
+    if (chromeButton("##back", 2)) options_ = false;
+    ImGui::SameLine(); ImGui::TextUnformatted("Options");
+  } else {
+    ImGui::PushFont(brand); ImGui::TextUnformatted("etl"); ImGui::PopFont();
+  }
+  ImGui::SameLine(); ImGui::SetCursorPosX(ImGui::GetWindowWidth() - 82);
+  if (chromeButton("##minimize", 0)) ShowWindow(window_, SW_MINIMIZE);
+  ImGui::SameLine(0, 6);
+  if (chromeButton("##close", 1)) PostMessageW(window_, WM_CLOSE, 0, 0);
+  ImGui::Dummy({0, 4});
+  bool toggle = false;
+  ImGui::BeginChild("content", {0, 0}, ImGuiChildFlags_None);
+  if (options_) {
+    ImGui::BeginDisabled(state.running || state.stopping);
+    ImGui::SetNextItemWidth(110); ImGui::InputInt("Remote port", &form.remotePort, 0);
+    ImGui::SetNextItemWidth(110); ImGui::InputInt("Local port", &form.localPort, 0);
+    ImGui::SetNextItemWidth(110); ImGui::InputInt("Timeout · ms", &form.timeout, 0);
+    input("Backup", "", form.backup.data(), form.backup.size());
+    ImGui::SetNextItemWidth(110); ImGui::InputInt("Backup port", &form.backupPort, 0);
+    input("Backup token", form.savedBackupToken ? "Saved" : "Primary token", form.backupToken.data(), form.backupToken.size(), true);
+    input("CA", "", form.ca.data(), form.ca.size());
+    ImGui::EndDisabled();
+  } else {
   const float width = ImGui::GetContentRegionAvail().x;
-  ImGui::SetCursorPosX((ImGui::GetWindowWidth() - 112) / 2);
+  ImGui::SetCursorPosX((ImGui::GetWindowWidth() - 72) / 2);
   const ImVec2 start = ImGui::GetCursorScreenPos();
   ImGui::BeginDisabled(state.stopping);
-  bool toggle = ImGui::InvisibleButton("##power", {112, 112});
+  toggle = ImGui::InvisibleButton("##power", {72, 72});
   ImGui::EndDisabled();
-  ImVec2 c{start.x + 56, start.y + 56};
+  ImVec2 c{start.x + 36, start.y + 36};
   auto* draw = ImGui::GetWindowDrawList();
   hover_ += ((ImGui::IsItemHovered() ? 1.f : 0.f) - hover_) * blend;
   const ImU32 color = ImGui::GetColorU32(ImVec4{.63f + .09f * active_, .67f + .25f * active_, .64f + .17f * active_, 1});
-  draw->AddCircleFilled(c, 55, ImGui::GetColorU32(ImVec4{surface.x + .052f*hover_, surface.y + .077f*hover_, surface.z + .055f*hover_, 1}), 64);
-  draw->AddCircle(c, 55, ImGui::GetColorU32(ImVec4{.20f, .24f, .21f, 1}), 64);
-  draw->PathArcTo(c, 17, -.92f, 4.06f, 40);
-  draw->PathStroke(color, 0, 2.5f);
-  draw->AddLine({c.x, c.y - 23}, {c.x, c.y - 3}, color, 2.5f);
-  if (ImGui::IsItemFocused()) draw->AddCircle(c, 59, color, 64, 2);
+  draw->AddCircleFilled(c, 35, ImGui::GetColorU32(ImVec4{surface.x + .052f*hover_, surface.y + .077f*hover_, surface.z + .055f*hover_, 1}), 64);
+  draw->AddCircle(c, 35, ImGui::GetColorU32(ImVec4{.20f + .12f * active_, .24f + .23f * active_, .21f + .15f * active_, 1}), 64);
+  draw->PathArcTo(c, 11, -.92f, 4.06f, 32);
+  draw->PathStroke(color, 0, 2);
+  draw->AddLine({c.x, c.y - 15}, {c.x, c.y - 2}, color, 2);
+  if (ImGui::IsItemFocused()) draw->AddCircle(c, 38, color, 64, 2);
+  if (ImGui::IsItemHovered()) ImGui::SetTooltip(state.running ? "Disconnect" : "Connect");
   ImGui::PushFont(heading);
   centerText(state.stopping ? "Stopping" : state.running ? "Proxy active" : "Off");
   ImGui::PopFont();
@@ -166,43 +205,32 @@ bool DesktopUi::render(DesktopForm& form, const DesktopState& state) {
   std::string endpoint = "127.0.0.1:" + std::to_string(form.localPort);
   centerText(endpoint.c_str());
   ImGui::PopStyleColor();
-  ImGui::Dummy({0, 16});
+  ImGui::Dummy({0, 2});
   ImGui::BeginDisabled(state.running || state.stopping);
   input("Server", "etl.nora.systems", form.server.data(), form.server.size());
   input("Token", form.savedToken ? "Saved" : "", form.token.data(), form.token.size(), true);
   ImGui::EndDisabled();
   ImGui::Dummy({0, 4});
   ImGui::TextColored(muted, "%d connections", state.sessions);
-  ImGui::SameLine(width * .40f);
+  ImGui::SameLine(width * .44f);
   ImGui::TextColored(muted, "↑ %s", bytes(state.sent).c_str());
-  ImGui::SameLine(width * .73f);
+  ImGui::SameLine(width * .75f);
   ImGui::TextColored(muted, "↓ %s", bytes(state.received).c_str());
   ImGui::Dummy({0, 4});
-  ImGui::BeginDisabled(state.stopping);
-  ImGui::PushStyleColor(ImGuiCol_Button, accent);
-  ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4{.80f, .96f, .87f, 1});
-  ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4{.62f, .83f, .72f, 1});
-  ImGui::PushStyleColor(ImGuiCol_Text, background);
-  toggle |= ImGui::Button(state.stopping ? "Stopping" : state.running ? "Disconnect" : "Connect", {-1, 46});
-  ImGui::PopStyleColor(4);
-  ImGui::EndDisabled();
   if (!state.error.empty()) {
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{1, .65f, .60f, 1});
     ImGui::TextWrapped("%s", state.error.c_str());
     ImGui::PopStyleColor();
   }
   if (state.failures) ImGui::TextColored(muted, "%llu failures", static_cast<unsigned long long>(state.failures));
-  if (ImGui::CollapsingHeader("Options")) {
-    ImGui::BeginDisabled(state.running || state.stopping);
-    ImGui::SetNextItemWidth(140); ImGui::InputInt("Remote port", &form.remotePort, 0);
-    ImGui::SetNextItemWidth(140); ImGui::InputInt("Local port", &form.localPort, 0);
-    ImGui::SetNextItemWidth(140); ImGui::InputInt("Timeout · ms", &form.timeout, 0);
-    input("Backup", "", form.backup.data(), form.backup.size());
-    ImGui::SetNextItemWidth(140); ImGui::InputInt("Backup port", &form.backupPort, 0);
-    input("Backup token", form.savedBackupToken ? "Saved" : "Primary token", form.backupToken.data(), form.backupToken.size(), true);
-    input("CA", "", form.ca.data(), form.ca.size());
-    ImGui::EndDisabled();
+  ImGui::PushStyleColor(ImGuiCol_Button, ImVec4{0, 0, 0, 0});
+  ImGui::PushStyleColor(ImGuiCol_Text, muted);
+  ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0);
+  if (ImGui::Button("Options", {-1, 28})) options_ = true;
+  ImGui::PopStyleVar();
+  ImGui::PopStyleColor(2);
   }
+  ImGui::EndChild();
   ImGui::End();
   ImGui::Render();
   context_->OMSetRenderTargets(1, &target_, nullptr);

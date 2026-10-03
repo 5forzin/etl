@@ -316,7 +316,8 @@ test('native desktop renders a DirectX frame without reading user settings or st
     execFileSync(executable, ['--self-test-ui', path], { windowsHide: true, timeout: 8000 });
     const bitmap = readFileSync(path);
     assert.equal(bitmap.subarray(0, 2).toString(), 'BM');
-    assert.ok(bitmap.readInt32LE(18) >= 500);
-    assert.ok(bitmap.length > 1_000_000);
+    const width = bitmap.readInt32LE(18), height = Math.abs(bitmap.readInt32LE(22));
+    assert.ok(width >= 320 && width <= 400 && height >= 350 && height <= 440, 'desktop should remain compact');
+    assert.ok(bitmap.length > 400_000);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

@@ -1,12 +1,18 @@
 # Windows interface
 
 [Figma sketch](https://www.figma.com/design/BQNC74KJoWRbj8JC0fIpOl?node-id=5-136).
-The Proxy and Settings screens use editable layers, auto layout, color variables
-and a button from Simple Design System. Traffic figures in the sketch are sample
-values; the client displays counters from its current session.
+The Proxy and Options screens are 360 × 400. They use editable layers, auto
+layout, color variables and a shared input component. The client displays traffic
+counters from its current session.
 
-The main screen contains local proxy status, server, token and connection action.
-Ports, backup, timeout and CA live under Options. Closing the window keeps the
+The main screen contains local proxy status, server, token and traffic. The power
+icon connects or disconnects. Ports, backup, timeout and CA have a separate Options
+screen so opening settings keeps the window compact. Both screens fit without
+scrolling at the default size; longer errors can scroll within the content area.
+
+The native window has no caption or border. Drag the header to move it; custom
+controls minimize or close it. Windows 11 supplies rounded corners when supported.
+Closing the window keeps the
 proxy in the tray; Exit closes its connections. “Proxy active” means the local
 listener is open. The remote connection is verified when an application uses it.
 

@@ -28,6 +28,7 @@ class DesktopUi {
   void shutdown();
   bool capture(const std::wstring& path);
   bool message(HWND window, UINT message, WPARAM wparam, LPARAM lparam);
+  void showOptions() { options_ = true; }
  private:
   bool createTarget();
   void releaseDevice();
@@ -39,4 +40,5 @@ class DesktopUi {
   bool initialized_ = false;
   float active_ = 0;
   float hover_ = 0;
+  bool options_ = false;
 };
