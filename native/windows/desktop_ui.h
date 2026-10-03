@@ -38,4 +38,5 @@ class DesktopUi {
   ID3D11RenderTargetView* target_ = nullptr;
   bool initialized_ = false;
   float active_ = 0;
+  float hover_ = 0;
 };

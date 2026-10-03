@@ -126,7 +126,10 @@ void DesktopUi::resize(unsigned width, unsigned height) {
 }
 
 bool DesktopUi::render(DesktopForm& form, const DesktopState& state) {
-  if (!initialized_ || !target_) return false;
+  if (!initialized_ || !target_) {
+    shutdown();
+    if (!initialize(window_)) { Sleep(100); return false; }
+  }
   ImGui_ImplDX11_NewFrame();
   ImGui_ImplWin32_NewFrame();
   ImGui::NewFrame();
@@ -148,10 +151,11 @@ bool DesktopUi::render(DesktopForm& form, const DesktopState& state) {
   ImGui::EndDisabled();
   ImVec2 c{start.x + 56, start.y + 56};
   auto* draw = ImGui::GetWindowDrawList();
+  hover_ += ((ImGui::IsItemHovered() ? 1.f : 0.f) - hover_) * blend;
   const ImU32 color = ImGui::GetColorU32(ImVec4{.63f + .09f * active_, .67f + .25f * active_, .64f + .17f * active_, 1});
-  draw->AddCircleFilled(c, 55, ImGui::GetColorU32(ImGui::IsItemHovered() ? ImVec4{.17f,.21f,.18f,1} : surface), 64);
+  draw->AddCircleFilled(c, 55, ImGui::GetColorU32(ImVec4{surface.x + .052f*hover_, surface.y + .077f*hover_, surface.z + .055f*hover_, 1}), 64);
   draw->AddCircle(c, 55, ImGui::GetColorU32(ImVec4{.20f, .24f, .21f, 1}), 64);
-  draw->PathArcTo(c, 17, -3.9f, .76f, 40);
+  draw->PathArcTo(c, 17, -.92f, 4.06f, 40);
   draw->PathStroke(color, 0, 2.5f);
   draw->AddLine({c.x, c.y - 23}, {c.x, c.y - 3}, color, 2.5f);
   if (ImGui::IsItemFocused()) draw->AddCircle(c, 59, color, 64, 2);
