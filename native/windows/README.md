@@ -1,31 +1,89 @@
-# Windows portable client
+# Windows client
 
-Download `etl-client.exe`, `SHA256SUMS`, and `LICENSE-OpenSSL.txt` from the [GitHub release](https://github.com/5forzin/etl/releases). The portable build is a single Windows x64 executable; it needs no installer or MSYS2 DLLs. It is not code-signed. Verify the checksum with `Get-FileHash .\etl-client.exe -Algorithm SHA256` before running it.
+The desktop client uses Dear ImGui, DirectX 11 and an embedded Inter font. It
+opens a local proxy for SOCKS5, HTTP CONNECT and ordinary HTTP requests. It
+forwards TCP through the same ETL v1 server as the Node client.
 
-The client opens in the system tray. Enter the ETL server, port, and token directly, then connect. The token field is masked. It listens only on `127.0.0.1`. The same local port accepts SOCKS5 and HTTP proxy requests: use `socks5h://127.0.0.1:1080` for SOCKS5 or `http://127.0.0.1:1080` in ZCode's **Settings → General → HTTP Proxy** field, then restart ZCode. HTTP `CONNECT` and ordinary absolute-form HTTP requests are supported. It forwards TCP only. Settings are stored in `%APPDATA%\ETL\settings.ini`; the token is stored there encrypted with Windows DPAPI for the current user, never as plaintext or in the release. An existing `token_file` setting is migrated automatically when the file is available. The headless test mode still accepts `--token-file`.
+## Use
 
-The optional **Servidor reserva**, **Porta reserva** and masked **Token reserva**
-fields configure automatic failover for new connections. Use `etl2.nora.systems`
-as the backup for `etl.nora.systems`, with the backup server's own ETL token.
-An empty backup token reuses the primary token; an empty backup host disables
-failover. Both credentials are stored with Windows DPAPI. **Timeout (ms)** defaults
-to `1000` and covers DNS, TCP, verified TLS and authentication for each host.
-Existing streams keep their normal idle timeout and do not migrate or replay data.
+Run `etl-client.exe`, enter the server and token, then Connect. Ports, backup,
+timeout and CA are under Options. The token input is masked. A saved token remains
+in use when the field is blank; entering a new token replaces it. Leaving the
+backup host empty disables failover. A new backup with no token uses the primary
+credential; an existing saved backup token is retained when its field is blank.
 
-Headless mode accepts `--fallback-server`, `--fallback-port`,
-`--fallback-token-file` and `--connect-timeout-ms`. See the
-[connection guide](../../docs/getting-started.md#automatic-backup-host) for the
-equivalent Node.js options. CI builds and tests a portable Windows artifact.
+“Proxy active” means `127.0.0.1:<local port>` is listening. It does not mean the
+remote host has been authenticated; that happens for each application connection.
+The counters show bytes relayed since the last local start. Closing the window
+keeps the client in the tray. Use the tray's Exit action to stop it.
 
-To reproduce the portable build with MSYS2 UCRT64 (`gcc`, `openssl`, `cmake`, `ninja`):
+~~~powershell
+curl.exe --proxy socks5h://127.0.0.1:1080 https://example.com
+curl.exe --proxy http://127.0.0.1:1080 https://example.com
+~~~
 
-```powershell
+Settings live in `%APPDATA%\ETL\settings.ini`. Tokens are encrypted with
+current-user DPAPI. Legacy token-file settings migrate when the file is readable.
+Tokens are not included in the executable or release. An existing client profile
+is loaded but does not start automatically when the desktop opens.
+
+Each server attempt has a default one-second deadline covering DNS, TCP, verified
+TLS and authentication. New connections may use a backup with its own token.
+Active streams never move between servers. TLS verification stays enabled.
+
+## Build a portable executable
+
+MSYS2 UCRT64 with GCC, OpenSSL, CMake and Ninja:
+
+~~~powershell
 $env:PATH = 'C:\msys64\ucrt64\bin;' + $env:PATH
 cmake -S native/windows -B build/windows-portable -G Ninja -DCMAKE_BUILD_TYPE=Release -DETL_PORTABLE=ON
 cmake --build build/windows-portable
-.\native\windows\package.ps1 -Portable
-$env:ETL_NATIVE_CLIENT = (Resolve-Path .\dist\windows-portable\etl-client.exe).Path
-node --test test/native-client.test.js
-```
+./native/windows/package.ps1 -Portable
+~~~
 
-The package script checks that the EXE has no MSYS2 runtime DLL imports and writes `dist/windows-portable/SHA256SUMS`.
+MSVC with Visual Studio's C++ desktop workload and vcpkg:
+
+~~~powershell
+git clone https://github.com/microsoft/vcpkg.git build/vcpkg
+git -C build/vcpkg checkout da2be01c400dd3ed102c1198752ef44c76aabe37
+./build/vcpkg/bootstrap-vcpkg.bat -disableMetrics
+./build/vcpkg/vcpkg.exe install openssl:x64-windows-static
+$etlToolchain = (Resolve-Path build/vcpkg/scripts/buildsystems/vcpkg.cmake).Path
+cmake -S native/windows -B build/windows-portable -A x64 "-DCMAKE_TOOLCHAIN_FILE=$etlToolchain" -DVCPKG_TARGET_TRIPLET=x64-windows-static -DETL_PORTABLE=ON
+cmake --build build/windows-portable --config Release
+./native/windows/package.ps1 -Portable
+~~~
+
+Use separate build directories when switching compilers. Dear ImGui is fetched at
+the commit pinned in CMake. Inter is checked into assets and embedded at build
+time. The executable uses static OpenSSL/compiler libraries and Windows system
+DLLs, including DirectX 11. It requires no installed font, Node or MSYS2 runtime.
+If hardware rendering is unavailable it tries WARP software rendering.
+
+The package script inspects DLL imports and writes `dist/windows-portable/`
+with the EXE, SHA256SUMS and dependency licenses. Published downloads live under
+[GitHub releases](https://github.com/5forzin/etl/releases); check which revision a
+release contains. The build is not code-signed. Verify downloads with
+`Get-FileHash ./etl-client.exe -Algorithm SHA256`.
+
+## Verify
+
+~~~powershell
+$env:ETL_NATIVE_CLIENT = (Resolve-Path dist/windows-portable/etl-client.exe).Path
+$env:ETL_OPENSSL = 'C:\Program Files\Git\usr\bin\openssl.exe'
+node --test test/native-client.test.js
+~~~
+
+The suite checks DPAPI, SOCKS/HTTP relaying, failover, certificate rejection,
+IPv6, negotiation and idle deadlines, argument validation and DirectX rendering.
+`--self-test-ui OUTPUT.bmp` creates a hidden preview using default settings;
+it neither loads a user profile nor opens a proxy. CI also saves this preview.
+
+Headless mode takes `--server`, `--server-port`, `--port`, `--token-file`,
+`--ca`, `--fallback-server`, `--fallback-port`, `--fallback-token-file` and
+`--connect-timeout-ms`. It additionally accepts `--handshake-timeout-ms`
+(1–65535; default 10000) and `--idle-timeout-ms` (1–600000; default 120000).
+Headless mode never renders the desktop.
+
+See the [design notes and Figma sketch](../../docs/desktop-design.md).

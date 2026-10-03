@@ -1,166 +1,164 @@
-# Getting started
+# Setup and operations
 
-ETL 0.1 is an experimental TCP proxy. It is not a device-wide VPN or an undetectable transport.
+Use the [Windows client](../native/windows/README.md) for a portable desktop
+application, or Node.js 24+ for the CLI. The Node client needs no npm dependencies.
+Tests require OpenSSL; Git for Windows' bundled executable is detected by the
+Node test suite.
 
-## Requirements
+## Server prerequisites
 
-- Node.js 24 or newer on the client and server, or Docker Compose for the server.
-- A public Linux server with outbound internet access and inbound TCP 443 available.
-- A domain pointing directly to that server. Disable ordinary HTTP CDN proxying for this hostname: ETL speaks custom TLS, not HTTP.
-- A valid TLS certificate and matching private key for the hostname. Use an ACME client or the fresh-server bootstrap below.
+Use a public Linux server, a domain resolving directly to it, an available TCP
+port and a matching TLS certificate. Ordinary HTTP CDN proxying does not carry
+ETL's custom TLS protocol. The default port is 443; any configured port must be
+open in the host and provider firewalls. Do not replace an existing website's
+listener to make room for ETL.
 
-No npm dependencies are required. Clone the repository on each machine:
-
-```sh
+~~~sh
 git clone https://github.com/5forzin/etl.git
 cd etl
 node src/cli.js --help
-```
+~~~
 
-## Server with Docker Compose
+## Existing server with Docker
 
-### Fresh Ubuntu server bootstrap
+Prepare `secrets/fullchain.pem`, `secrets/privkey.pem` and `secrets/token`.
+The certificate files must be real files rather than symlinks outside the mount.
+For a new secrets directory on Linux:
 
-On a dedicated, fresh Ubuntu 24.04 server, `deploy/bootstrap.sh DOMAIN FULL_COMMIT_SHA`
-installs Docker and Certbot, clones the specified ETL revision to `/opt/etl`, generates
-a private token, obtains a Let's Encrypt certificate and enables automated renewal.
-Run it as root after the domain resolves directly to the server and inbound TCP 80
-and 443 are permitted. It accepts the Let's Encrypt terms and registers without an
-email address. On hosts with less than 1 GB RAM and no swap, it also adds a 1 GB
-swap file at `/swapfile-etl` and an entry to `/etc/fstab`.
-
-This script installs system packages and enables services; use it on a dedicated
-host. It refuses to overwrite an existing `/opt/etl`. Review it before running.
-TCP 80 must remain reachable for HTTP-01 renewals. The renewal hook copies the
-new certificate into the container's secret directory and restarts ETL, briefly
-interrupting active sessions. Retrieve `/opt/etl/secrets/token` through a trusted
-administrative channel and save it privately on your client.
-
-The bootstrap is an initial deployment workflow, not an idempotent upgrade tool.
-For removal, stop the Compose service and handle the certificate, installed packages,
-and optional swap entry separately after checking whether they are still in use.
-
-### Existing certificate/manual setup
-
-Create a private `secrets` directory containing `fullchain.pem`, `privkey.pem`, and `token`. Generate a token with:
-
-```sh
-node src/cli.js token
-```
-
-Save the generated value as a single line in `secrets/token` and transfer it to the client through a trusted channel. Treat it as a password. Do not put it in command-line arguments, Git, or screenshots.
-
-The container runs as UID/GID 1000. On Linux, give that identity read access to the directory and files. For example, for a newly prepared ETL secrets directory:
-
-```sh
+~~~sh
+install -d -m 700 secrets
+umask 077
+node src/cli.js token > secrets/token
+# Copy the certificate chain and key into secrets before continuing.
 sudo chown -R 1000:1000 secrets
 sudo chmod 700 secrets
 sudo chmod 600 secrets/token secrets/privkey.pem secrets/fullchain.pem
 docker compose up -d --build
 docker compose logs --tail=20
-```
+~~~
 
-This binds host TCP 443 by default. To select another port, set `ETL_PORT=24443`
-in a local `.env` file before running Compose and use `--server-port 24443` on the
-client. Do not replace an existing web service configuration without planning the
-change. Open the selected port in both the host firewall and the provider firewall.
+Do not regenerate a deployed token by rerunning the example. The container reads
+secrets as UID/GID 1000. Set `ETL_PORT=24443` in a private local `.env` to select
+another public port; the container still listens on 8443.
 
-If the network substitutes a TLS inspection certificate, the ETL client must reject
-it. Do not disable certificate validation or trust an inspection CA to get the
-token through. A different allowed port may avoid port-specific inspection, but
-does not guarantee that the network permits or cannot identify ETL.
+## Fresh Ubuntu host
 
-The directory must contain actual certificate files, not symlinks pointing outside the mounted directory. Your certificate renewal process must securely update these files and run `docker compose restart etl` to load the renewed certificate. ETL does not watch certificate files automatically.
+`deploy/bootstrap.sh DOMAIN FULL_COMMIT_SHA` targets a dedicated Ubuntu 24.04
+host. Run it as root after DNS and inbound TCP 80/443 are ready. Review the script
+first: it installs Docker, Git, Certbot and OpenSSL, enables services, clones the
+requested revision to `/opt/etl`, creates a token and obtains a certificate. It
+refuses an existing `/opt/etl`.
 
-## Run directly with Node
+The script accepts Let's Encrypt's terms without registering an email address.
+On hosts with less than 1 GB RAM and no active swap, it also creates a 1 GB swap
+file and adds it to `/etc/fstab`. It is an initial installer, not an upgrade tool.
+HTTP-01 renewal requires port 80 to remain reachable. Its deploy hook copies the
+renewed files and restarts ETL, interrupting active streams.
 
-For an unprivileged test, use port 8443:
+## Direct Node server
 
-```sh
+~~~sh
 node src/cli.js server --port 8443 --cert secrets/fullchain.pem --key secrets/privkey.pem --token-file secrets/token
-```
+~~~
 
-The optional [systemd unit](../deploy/etl.service) expects Node at `/usr/bin/node`, the repository at `/opt/etl`, a dedicated `etl` user/group, and certificate/token files under `/etc/etl` readable by that user. Adapt and provision those paths before installing the unit. It grants only the capability needed to bind port 443; no installer changes your host automatically.
+The [systemd unit](../deploy/etl.service) instead expects `/usr/bin/node`, a
+dedicated `etl` user/group, source at `/opt/etl` and readable secrets under
+`/etc/etl`. Provision those paths before installing the unit. It grants the
+capability needed to bind port 443.
 
-## Connect from your computer
+## Verify and connect
 
-For an Azure VM deployed with the bootstrap, PowerShell 7 users with Azure CLI
-access can retrieve the client token without opening SSH:
+Copy the server token to a private client file through a trusted administrative
+channel. Keep it out of shell arguments, Git and screenshots. Before using it:
 
-```powershell
-./deploy/enroll-azure.ps1 -ResourceGroup your-rg -VMName your-vm -TokenPath ./secrets/token
-```
+~~~sh
+node src/cli.js doctor --server tunnel.example.com --server-port 24443
+node src/cli.js client --server tunnel.example.com --server-port 24443 --token-file secrets/token
+curl --proxy socks5h://127.0.0.1:1080 https://example.com
+curl --proxy http://127.0.0.1:1080 https://example.com
+~~~
 
-Create the local private `secrets` directory first. The command encrypts the token
-on the VM with a temporary RSA public key, then decrypts it locally; plaintext
-credentials are not emitted into Azure Run Command output. It restricts local
-file permissions and refuses to overwrite an existing token file.
+Doctor checks DNS, TCP, TLS 1.3 and certificate identity without sending a token
+or destination. Add `--json` for a versioned report. Exit 0 means those checks
+passed, 2 means a network/TLS check failed, and 1 means invalid configuration.
+It does not prove ETL authentication or destination access works. The diagnostic
+workflow in GitHub Actions runs the same verified checks.
 
-Put the server's token in `secrets/token` locally, then run:
+Use `curl.exe` on Windows. `socks5h` sends destination names through ETL. Enable
+proxy-side DNS in browsers as well. Node's HTTP port accepts CONNECT for HTTPS;
+the Windows client additionally supports plain HTTP proxy requests. In ZCode,
+set its HTTP Proxy to `http://127.0.0.1:1080` and restart the application.
 
-```sh
-node src/cli.js client --server vpn.example.com --token-file secrets/token
-```
-
-For a server on a different port, add `--server-port 8443`.
+If certificate verification fails, fix the certificate or endpoint. For a private
+CA, pass `--ca PATH`; in Node this replaces the normal trust store, while the
+native client adds it to its Windows/OpenSSL roots. Never disable verification.
 
 ### Automatic backup host
 
-Configure a second independently deployed server for new connections:
-
-```sh
-node src/cli.js client --server etl.nora.systems --token-file secrets/token \
-  --fallback-server etl2.nora.systems --fallback-token-file secrets/token-etl2 \
+~~~sh
+node src/cli.js client --server tunnel.example.com --token-file secrets/token \
+  --fallback-server backup.example.com --fallback-token-file secrets/backup-token \
   --connect-timeout-ms 1000
-```
+~~~
 
-Each host gets an absolute 1000 ms budget for DNS, TCP, verified TLS and ETL
-authentication. A timeout, refused connection, invalid certificate or rejected
-credential moves the new connection to the backup. Certificate verification and
-hostname matching remain mandatory on both hosts. `--fallback-port` defaults to
-the primary server port. Omit `--fallback-token-file` only when both servers use
-the same credential. Increase the timeout on high-latency networks if needed.
+Each host gets one setup budget covering DNS through authentication. Failures in
+those phases move the new connection to the backup. Omit the backup token file
+only if both servers share a credential. `--fallback-port` defaults to the
+primary port in Node. On Windows both ports are explicit settings, defaulting to
+443. Increase the timeout for slow networks.
 
-After authentication, destination setup retains its separate 10-second deadline.
-Established TCP streams stay on their original host with the normal idle timeout;
-they cannot migrate, and application bytes are never replayed to another server.
-Every new connection tries the primary first, so it resumes using it after recovery.
-Leave `--fallback-server` unset to use a single host.
+After authentication, destination setup has its own deadline. Established streams
+never migrate and payloads are never replayed. Every new connection tries the
+primary first. Leaving the backup host empty disables failover.
 
-Configure your browser's SOCKS5 proxy as `127.0.0.1:1080` and enable proxy-side DNS. For example, Firefox exposes a “Proxy DNS when using SOCKS v5” setting. A command-line check is:
+### Azure token enrollment
 
-```sh
-curl --proxy socks5h://127.0.0.1:1080 https://example.com
-```
+For an Azure VM prepared by the bootstrap, PowerShell 7 and Azure CLI can retrieve
+the token through encrypted Run Command output:
 
-On Windows, use `curl.exe`. The `socks5h` scheme sends the destination hostname through the tunnel for server-side resolution. An application that resolves names locally can still leak DNS queries. Browser UDP/WebRTC and other applications are outside this TCP proxy's coverage.
+~~~powershell
+./deploy/enroll-azure.ps1 -ResourceGroup your-rg -VMName your-vm -TokenPath ./secrets/token
+~~~
 
-## Local certificate testing
+Create the destination directory first. The script restricts local permissions
+and refuses to overwrite an existing token. This helper is for Azure; other hosts
+use their normal trusted administrative channel.
 
-With OpenSSL available, create an ephemeral localhost certificate in an ignored directory:
+## Certificates and local tests
 
-```sh
+For an isolated local test, create a one-day certificate in an ignored directory:
+
+~~~sh
 mkdir secrets
 openssl req -x509 -newkey rsa:2048 -nodes -keyout secrets/privkey.pem -out secrets/fullchain.pem -days 1 -subj /CN=localhost -addext subjectAltName=DNS:localhost
-```
+~~~
 
-Start the server on 8443 and connect with `--server localhost --server-port 8443 --ca secrets/fullchain.pem`. Certificate verification remains enabled. The server still rejects private destinations: use a public destination for manual testing. The automated suite uses an injected resolver solely within its local lab.
+Run the server on 8443 and the client with `--server localhost --server-port 8443
+--ca secrets/fullchain.pem`. Private destinations remain blocked. Automated
+tests inject a local resolver only within their fixtures.
 
-## Operations
+Certificates are loaded at startup. After replacing the mounted certificate and
+key, run `docker compose restart etl`. The supplied renewal hook targets the
+bootstrap's certificate name and paths; adapt it for other deployments.
 
-- **Revoke access:** atomically replace `secrets/token` with a newly generated token. New connections must use the new value. Restart the server to terminate already authenticated sessions; restart clients after updating their token file.
-- **Upgrade:** record the current Git commit, fetch and review the desired version, then rebuild with `docker compose up -d --build`. Back up configuration privately.
-- **Rollback:** deploy the previously recorded commit in a separate checkout with the existing secrets and recreate the container. Active connections are interrupted.
-- **Stop/uninstall:** `docker compose down` removes the Compose service and network. Source files, local image and secrets remain; remove those explicitly only when no longer needed. A manually installed systemd service must be stopped, disabled and removed separately.
-- **Limits:** 128 simultaneous connections per process, a 10-second server setup deadline, a configurable 1-second client tunnel setup budget per host, and a 120-second idle timeout. Use `--max-connections` when running directly to change the connection cap. Each server has one shared credential in this MVP.
+## Rotation, upgrades and rollback
 
-Logs contain startup and listener errors, not per-destination browsing records. Container infrastructure and the hosting provider may have their own logs.
+To revoke new sessions, generate a new private token file and atomically replace
+`secrets/token`. Update clients and restart them. Restart the server if existing
+authenticated streams must end immediately.
 
-## Development checks
+For an upgrade, record the current revision and container image, fetch the desired
+revision in a separate checkout, and review/test it before rebuilding. Preserve
+the existing secrets and configuration privately. Keep the previous image until
+the new service passes doctor and an authenticated proxy request. A deployment
+copy without Git metadata must be backed up or tied to a known release first.
 
-```sh
-npm run check
-npm test
-```
+Rollback recreates the service from that recorded revision/image with the same
+secrets. Container recreation interrupts active sessions. `docker compose down`
+stops the service and removes its network; source, images, certificates and token
+files remain. Remove them separately only after checking their use. A systemd
+installation must be stopped and disabled separately.
 
-Tests require OpenSSL to generate ephemeral TLS fixtures. On Windows, Git for Windows' bundled OpenSSL is detected automatically; otherwise put OpenSSL on PATH or set `ETL_OPENSSL` to its executable path. Tests use local listeners, never depend on a live internet destination, and remove their generated keys afterward.
+Defaults are 128 concurrent connections, ten seconds for negotiation/setup and
+120 seconds of relay inactivity. `--max-connections` changes the Node cap. See
+the [architecture](architecture.md) for per-host setup budgets and trust boundaries.

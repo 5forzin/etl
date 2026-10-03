@@ -1,47 +1,62 @@
-# ETL — Encrypted Transport Lab
+# ETL
 
-A self-hosted encrypted tunnel for people with a domain and a server.
+ETL forwards TCP traffic through a server you control. A local SOCKS5 or HTTP
+proxy opens a TLS 1.3 connection, authenticates with a token, and asks the server
+to connect to the destination. Destination DNS runs on that server.
 
-ETL aims to make deploying your own tunnel straightforward: configure a domain, run the server, and connect through a local client. The project explores transport design and traffic detectability through reproducible experiments.
+The Node.js client and server use built-in modules. The Windows client is a
+portable C++ executable with Dear ImGui, DirectX 11 and Inter. It supports SOCKS5,
+HTTP CONNECT, ordinary HTTP proxy requests, and a backup server. Windows stores
+tokens with DPAPI for the current user.
 
-**Status: experimental TCP MVP.** Client and server are implemented, with a fresh-Ubuntu bootstrap for certificates and Docker deployment. UDP, TUN, and traffic camouflage are not implemented.
+## Connect
 
-Start with the [installation and client guide](docs/getting-started.md).
+Windows: build the client using the [Windows guide](native/windows/README.md),
+or check [releases](https://github.com/5forzin/etl/releases) for published builds.
+Enter your server and token, set the remote port under Options, then connect.
+The new ImGui build is available only after it has been built or released from
+this revision; older downloads may still use the previous interface.
 
-## Project goals
+With Node.js 24 or later:
 
-- Simple deployment on a Linux server with a public IP and a domain.
-- A client and server developed as part of this project, without depending on WireGuard.
-- Established TLS implementations for encryption and certificate validation.
-- Authenticated access and destination DNS resolution on the server.
-- Documented behavior, limitations, and repeatable network tests.
+~~~sh
+node src/cli.js doctor --server tunnel.example.com
+node src/cli.js client --server tunnel.example.com --token-file secrets/token
+curl --proxy socks5h://127.0.0.1:1080 https://example.com
+~~~
 
-## Current implementation
+Use `curl.exe` on Windows. Both clients bind to `127.0.0.1`. Node accepts
+HTTP CONNECT on the same port; the native client also handles plain HTTP URLs.
+For a non-default server port, add `--server-port 24443`.
 
-The MVP exposes a SOCKS5 proxy on the client machine and forwards TCP connections through an authenticated TLS 1.3 connection to the ETL server. Applications must use proxy-side DNS to keep destination lookups on the server. It uses Node.js 24+ and only built-in modules.
+See [setup and operations](docs/getting-started.md) for certificates, Docker,
+token provisioning and backup configuration.
 
-```text
-Browser → Local ETL SOCKS5 proxy → TLS tunnel → ETL server → Destination
-```
+## Scope
 
-The server will need inbound TCP port 443, outbound connectivity, and a valid certificate for its domain. Certificate provisioning and renewal are part of the deployment design. Sharing port 443 with an existing website requires a supported configuration and is not assumed in the initial MVP.
+ETL currently forwards TCP. It has no UDP relay, TUN adapter or system-wide
+routing. Applications must use the proxy. SOCKS clients should send hostnames
+through it (`socks5h`); local DNS, UDP and WebRTC stay outside its coverage.
 
-UDP forwarding and device-wide routing through a TUN interface are later milestones. The initial release will not route every application automatically.
+TLS protects the client-to-server link. The network can still see the endpoint
+and traffic patterns. The exit host can see destination metadata. ETL has not
+had an independent security audit and makes no anonymity or detectability claim.
 
-## Security and detectability
+## Develop
 
-ETL does not promise undetectability or anonymity. A network can observe the tunnel endpoint, connection metadata, and traffic patterns, and may block the connection. The server operator and hosting provider remain part of the trust model. TLS transport alone does not make a custom protocol look like ordinary web browsing.
-
-See [architecture](docs/architecture.md), [wire protocol](docs/protocol.md), [roadmap](docs/roadmap.md), and [security policy](SECURITY.md).
-
-## Development
-
-```sh
-node src/cli.js --help
+~~~sh
 npm run check
 npm test
-```
+~~~
 
-Tests generate temporary certificates with OpenSSL and exercise local SOCKS/TLS relaying, authentication, certificate verification, and destination policy. Docker Compose and a systemd unit are provided for deployment; see the guide for certificate and permission prerequisites.
+Tests create temporary certificates with OpenSSL and use local listeners. Set
+`ETL_NATIVE_CLIENT` to a built Windows EXE to include native integration and
+DirectX rendering checks. Otherwise those tests are skipped.
 
-Never commit credentials, private keys, client profiles, or production configuration.
+- [Architecture](docs/architecture.md)
+- [Protocol](docs/protocol.md)
+- [Windows design and Figma sketch](docs/desktop-design.md)
+- [Next work](docs/roadmap.md)
+- [Security](SECURITY.md)
+
+Keep tokens, private keys and client settings out of Git.

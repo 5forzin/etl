@@ -1,41 +1,30 @@
-# Roadmap
+# Next work
 
-## 0. Foundation
+The current revision forwards TCP through verified TLS, supports SOCKS5 and HTTP
+CONNECT, and can fail over before opening a destination. Windows also forwards
+ordinary HTTP requests and has a portable ImGui/DirectX 11 client. Setup,
+certificate renewal, token rotation and rollback are documented.
 
-- [x] Define project identity and intended audience.
-- [x] Document the proposed architecture and trust boundaries.
-- [x] Select implementation language and TLS library: Node.js 24, built-in TLS.
-- [x] Specify version 1 framing, authentication, configuration, and error codes.
+## Priorities
 
-## 1. Functional TCP MVP
+1. **Separate credentials and quotas.** Replace the shared server token with
+   revocable client identities; test that one client cannot exhaust another's
+   capacity. Keep v1 compatibility explicit during the migration.
+2. **Measure load.** Record throughput, setup latency, memory and shutdown time
+   under concurrent sessions, slow readers, stalled DNS and destination failures.
+3. **Exercise deployment.** Run the public bootstrap, renewal and rollback on a
+   clean Ubuntu host. The existing live host is not evidence that a clean install
+   works from the current revision.
+4. **Improve desktop integration.** Validate high-DPI layouts, GPU reset recovery,
+   keyboard operation and accessibility. ImGui's screen reader support remains
+   limited.
 
-- [x] Implement the server with TLS and mandatory authentication.
-- [x] Implement a loopback SOCKS5 client with CONNECT support.
-- [x] Resolve destination domains on the server.
-- [x] Implement shared-token rotation, destination restrictions, and global connection/time limits.
-- [x] Test relaying, invalid input, authentication, DNS policy, and certificates.
-- [ ] Add per-client credentials, quotas, and broader cancellation/load testing.
+## Transport experiments
 
-## 2. Easy self-hosting
+Evaluate QUIC only after measuring whether setup cost or TCP loss is the limiting
+factor. A UDP relay needs its own destination policy, resource limits and tests.
+TUN requires explicit IPv4, IPv6, DNS and failure routing before it can claim
+device-wide coverage. None of these features has shipped.
 
-- [ ] Package reproducible releases with checksums.
-- [x] Provide a Linux service and a documented installation workflow.
-- [ ] Automate certificate provisioning and renewal using a defined deployment model.
-- [ ] Provide client configuration generation without exposing secrets.
-- [x] Document upgrade, rollback, and uninstall procedures.
-- [ ] Validate deployment on a clean server using only the public guide.
-
-## 3. Network experiments
-
-- [ ] Publish a reproducible lab and baseline captures with sensitive data removed.
-- [ ] Measure throughput, latency, resource use, and failure behavior.
-- [ ] Evaluate traffic classification and active-probing behavior.
-- [ ] Document observed detectability and supported network conditions.
-
-## 4. Expanded transport
-
-- [ ] Evaluate UDP forwarding and QUIC as an additional transport.
-- [ ] Add TUN integration and explicit IPv4, IPv6, and DNS routing behavior.
-- [ ] Design and test device-wide failure handling and leak protection.
-
-These milestones describe planned work and do not imply release dates or existing capabilities.
+Detectability experiments must include the network environment, baseline,
+capture method and observed limits. Passing one filter is not a general guarantee.

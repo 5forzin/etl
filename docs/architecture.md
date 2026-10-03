@@ -1,42 +1,74 @@
 # Architecture
 
-Status: TCP MVP implemented in Node.js 24 using built-in networking and TLS. See [the protocol](protocol.md) for current behavior and [the roadmap](roadmap.md) for remaining deployment and transport work. Some requirements below remain design targets, including per-client quotas and automated certificate lifecycle management.
+Each proxied TCP connection gets its own TLS connection. ETL does not multiplex
+streams or replay application data after a failure.
 
-## Components
+~~~text
+Application → loopback proxy → TLS 1.3 → ETL server → destination
+~~~
 
-The client binds a SOCKS5 endpoint to loopback by default. For the first MVP it accepts CONNECT requests for TCP destinations; unsupported commands must fail explicitly. It forwards domain names to the server for resolution when the application supplies a domain instead of a resolved IP.
+## Client
 
-The server terminates TLS, authenticates the client, validates the requested destination against its access policy, and relays bytes. No destination connection or DNS lookup is made for an unauthenticated request.
+The Node client accepts SOCKS5 CONNECT and HTTP CONNECT. The native Windows client
+also rewrites absolute-form HTTP requests for the destination. Both use the same
+[ETL v1 protocol](protocol.md), verify the server certificate and authenticate
+before requesting a destination.
 
-The initial implementation should favor one authenticated tunnel connection per proxied TCP connection. Multiplexing can be evaluated after the basic relay, cancellation, resource limits, and error handling are validated.
+New connections try the primary host first, then the optional backup. Each attempt
+has one deadline covering DNS, TCP, TLS and authentication; the default is one
+second. Once a host accepts authentication, destination setup gets a separate
+deadline. A destination failure does not trigger failover. Existing streams stay
+on their original server and close if it fails.
 
-## Transport
+The Windows renderer lives in `native/windows/desktop_ui.cpp`; networking and
+DPAPI storage remain in `etl_client.cpp`. DirectX 11 falls back to WARP when a
+hardware device cannot be created. Hidden or minimized windows wait for messages
+instead of rendering. The main screen shows listener state and byte counters,
+not a remote health guarantee. No remote connection exists until an application
+uses the proxy.
 
-Use a maintained TLS library with hostname and certificate verification enabled. Do not implement cryptographic primitives or disable certificate checks. Define a versioned application protocol with bounded message lengths, explicit response codes, and handshake deadlines.
+## Server
 
-Credentials must be provisioned separately from public configuration, revocable, and excluded from logs. Do not enable replayable early data for authentication or destination-opening requests.
+The server accepts TLS 1.3, reads an authentication frame, and compares token
+digests in constant time. It reads the token file on each authentication so an
+atomic replacement revokes future sessions. Existing sessions require a restart
+to terminate.
 
-## Deployment experience
+Only authenticated clients can request DNS or destination connections. The
+destination policy rejects private, loopback, link-local, metadata, mapped IPv4
+and special-use addresses. A DNS answer containing any blocked address rejects
+the whole request. Connections use validated numeric addresses without resolving
+the hostname again.
 
-The intended user supplies a domain pointing to a public Linux server, installs ETL, provisions a certificate and credential, and imports a client configuration. The implementation must document prerequisites and provide an actionable error when a port is occupied or DNS is misconfigured.
+## Limits and failure handling
 
-The deployment workflow must cover certificate renewal, service restart, upgrades, rollback, and uninstall. Installers must explain changes to the host and avoid silently replacing firewall or web-server configuration.
+| Control | Default |
+| --- | --- |
+| Concurrent accepted connections | 128 per process |
+| ETL control payload | 2–1024 bytes |
+| Local HTTP header | 16 KiB |
+| Local negotiation | 10 seconds |
+| Server authentication through destination setup | 10 seconds total |
+| Client attempt through authentication | 1 second per host |
+| Client destination setup | 10 seconds |
+| Relay inactivity | 120 seconds |
 
-## Trust boundaries and resource controls
+Absolute deadlines expire even when a peer drips bytes. The native relay tracks
+actual activity to enforce its idle limit. Shutdown interrupts listeners and
+active sockets; Node shutdown is safe to request more than once. Node pipes
+provide backpressure, while the native relay uses bounded 16 KiB buffers and
+blocking writes with timeouts.
 
-- The local proxy listens on loopback unless explicitly configured otherwise.
-- The remote server requires authentication and must never default to an open proxy.
-- Block loopback, link-local, private, and infrastructure metadata destinations by default, including IPv6 equivalents. Evaluate resolved addresses and connect only to validated addresses to limit DNS rebinding risks.
-- Bound concurrent sessions, handshake size, connection time, idle time, and per-client resource use.
-- Operational logs should avoid destination histories, payloads, and credentials by default. Document any configurable logging and retention.
-- A failed tunnel must close the proxied connection. Device-wide leak protection requires a separate TUN and routing design.
+## Trust and deployment
 
-## Limitations
+Local processes can use the loopback proxy without authentication. The tunnel
+has one shared token per server, not user accounts or per-user quotas. Windows
+encrypts stored tokens with current-user DPAPI; a process running as that same
+user can decrypt them. Node reads private token files.
 
-The access network sees the server IP and traffic patterns and may see the TLS hostname. It can block the server or recognize the transport. The exit server can see destination metadata and any application traffic that is not independently encrypted. A single self-hosted endpoint does not provide anonymity among a large population of users.
+Compose runs the server as an unprivileged user with a read-only filesystem,
+dropped capabilities and memory/process limits. The systemd unit is an alternative
+for direct Node deployment. Certificates are loaded at startup, so renewal restarts
+the service and interrupts its streams. See [operations](getting-started.md).
 
-## Validation before release
-
-Verify authentication rejection and revocation, malformed-frame handling, DNS behavior, destination restrictions, concurrent relay correctness, timeouts, and certificate validation. Exercise the documented installation on a clean server and connection from a separate client.
-
-For detectability experiments, record the environment, baseline traffic, captures, detection method, and limitations. Treat passing a particular filter as an experimental result, not a general guarantee.
+QUIC, UDP, TUN, multiplexing and traffic camouflage are not implemented.
