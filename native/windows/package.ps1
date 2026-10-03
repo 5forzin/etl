@@ -6,6 +6,7 @@ $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
 $buildName = if ($Portable) { 'windows-portable' } else { 'windows' }
 $built = Join-Path $root "build/$buildName/etl-client.exe"
+if (-not (Test-Path -LiteralPath $built)) { $built = Join-Path $root "build/$buildName/Release/etl-client.exe" }
 if (-not (Test-Path -LiteralPath $built)) { throw 'Build the client with CMake first' }
 $output = Join-Path $root "dist/$buildName"
 New-Item -ItemType Directory -Force -Path $output | Out-Null
@@ -13,11 +14,19 @@ $exe = Join-Path $output 'etl-client.exe'
 Copy-Item -LiteralPath $built -Destination $exe -Force
 if ($Portable) {
   $objdump = Join-Path $RuntimeBin 'objdump.exe'
-  if (-not (Test-Path -LiteralPath $objdump)) { throw "Missing dependency inspector: $objdump" }
-  $imports = & $objdump -p $exe | Where-Object { $_ -match 'DLL Name:' }
+  if (Test-Path -LiteralPath $objdump) {
+    $imports = & $objdump -p $exe | Where-Object { $_ -match 'DLL Name:' }
+  } else {
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+    if (-not (Test-Path -LiteralPath $vswhere)) { throw 'No objdump or Visual Studio dependency inspector' }
+    $vs = & $vswhere -latest -property installationPath
+    $compiler = Get-ChildItem -LiteralPath (Join-Path $vs 'VC/Tools/MSVC') -Directory | Sort-Object Name -Descending | Select-Object -First 1
+    $dumpbin = Join-Path $compiler.FullName 'bin/Hostx64/x64/dumpbin.exe'
+    $imports = & $dumpbin /DEPENDENTS $exe | Where-Object { $_ -match '^\s+\S+\.dll\s*$' }
+  }
   if ($LASTEXITCODE -ne 0 -or -not $imports) { throw 'Cannot inspect EXE dependencies' }
-  if ($imports | Where-Object { $_ -match 'DLL Name:\s*(libssl|libcrypto|libwinpthread|libgcc|libstdc\+\+)' }) {
-    throw "Portable EXE still imports an MSYS2 runtime library: $($imports -join ', ')"
+  if ($imports | Where-Object { $_ -match '(libssl|libcrypto|libwinpthread|libgcc|libstdc\+\+|vcruntime|msvcp)' }) {
+    throw "Portable EXE still imports a compiler or OpenSSL runtime library: $($imports -join ', ')"
   }
   $hash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
   [System.IO.File]::WriteAllText((Join-Path $output 'SHA256SUMS'), "$hash  etl-client.exe`n")
@@ -28,5 +37,8 @@ if ($Portable) {
     if (-not (Test-Path -LiteralPath $source)) { throw "Missing runtime library: $dll" }
     Copy-Item -LiteralPath $source -Destination $output
   }
+}
+foreach ($license in @('LICENSE-ImGui.txt', 'LICENSE-Inter.txt')) {
+  Copy-Item -LiteralPath (Join-Path (Split-Path $built) $license) -Destination $output -Force
 }
 Get-ChildItem -LiteralPath $output | Select-Object Name, Length

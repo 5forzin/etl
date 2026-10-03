@@ -21,6 +21,7 @@
 #include <thread>
 #include <vector>
 #include <algorithm>
+#include "desktop_ui.h"
 
 constexpr UINT WM_TRAY = WM_APP + 1;
 constexpr UINT WM_SERVICE_STOPPED = WM_APP + 2;
@@ -560,28 +561,28 @@ class Service {
   bool start(const Config& config, std::wstring& error) {
     if (running_) return true;
     std::string token;
-    if (!tokenForConfig(config, token)) { error = L"Informe um token válido (64 caracteres hexadecimais)."; return false; }
+    if (!tokenForConfig(config, token)) { error = L"Token: use 64 lowercase hex characters."; return false; }
     OPENSSL_cleanse(token.data(), token.size());
     if (!config.fallbackServer.empty() && !tokenForConfig(config, token, true)) {
-      error = L"Token do servidor reserva inválido."; return false;
+      error = L"Invalid backup token."; return false;
     }
     OPENSSL_cleanse(token.data(), token.size());
-    if (config.connectTimeoutMs < 1 || config.connectTimeoutMs > 60000) { error = L"Timeout inválido (1 a 60000 ms)."; return false; }
-    if (config.server.empty() || config.serverPort < 1 || config.localPort < 1) { error = L"Configuração inválida."; return false; }
+    if (config.connectTimeoutMs < 1 || config.connectTimeoutMs > 60000) { error = L"Timeout: use 1 to 60000 ms."; return false; }
+    if (config.server.empty() || config.serverPort < 1 || config.localPort < 1) { error = L"Invalid settings."; return false; }
     ctx_ = SSL_CTX_new(TLS_client_method());
-    if (!ctx_) { error = L"Não foi possível iniciar o TLS."; return false; }
+    if (!ctx_) { error = L"TLS could not start."; return false; }
     SSL_CTX_set_min_proto_version(ctx_, TLS1_3_VERSION);
     SSL_CTX_set_verify(ctx_, SSL_VERIFY_PEER, nullptr);
     SSL_CTX_set_default_verify_paths(ctx_);
     addWindowsTrust(ctx_);
     if (!config.caFile.empty() && SSL_CTX_load_verify_file(ctx_, utf8(config.caFile).c_str()) != 1) {
-      error = L"Arquivo CA inválido."; SSL_CTX_free(ctx_); ctx_ = nullptr; return false;
+      error = L"Invalid CA file."; SSL_CTX_free(ctx_); ctx_ = nullptr; return false;
     }
     SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (listener == INVALID_SOCKET) { error = L"Não foi possível criar o listener local."; SSL_CTX_free(ctx_); ctx_ = nullptr; return false; }
+    if (listener == INVALID_SOCKET) { error = L"Local listener could not start."; SSL_CTX_free(ctx_); ctx_ = nullptr; return false; }
     sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); addr.sin_port = htons(config.localPort);
     if (bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) || listen(listener, SOMAXCONN)) {
-      error = L"Porta local ocupada ou indisponível."; closesocket(listener); SSL_CTX_free(ctx_); ctx_ = nullptr; return false;
+      error = L"Local port is busy or unavailable."; closesocket(listener); SSL_CTX_free(ctx_); ctx_ = nullptr; return false;
     }
     config_ = config; listener_ = listener; running_ = true;
     acceptThread_ = std::thread([this] { acceptLoop(); });
@@ -776,76 +777,71 @@ static std::thread stopThread;
 static bool stopping = false;
 static bool exitAfterStop = false;
 
-static std::wstring field(HWND window, int id) {
-  wchar_t buffer[1024]{};
-  GetWindowTextW(GetDlgItem(window, id), buffer, 1024);
-  std::wstring result(buffer);
-  SecureZeroMemory(buffer, sizeof(buffer));
-  return result;
+static DesktopUi desktop;
+static DesktopForm form;
+static std::string uiError;
+
+static std::wstring wide(const char* value) {
+  int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value, -1, nullptr, 0);
+  if (n <= 0) return {};
+  std::wstring result(n, L'\0');
+  MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value, -1, result.data(), n);
+  result.pop_back(); return result;
 }
 
-static void updateStatus(HWND window) {
-  std::wstring status = stopping ? L"Desconectando..." : service.running() ? L"Ativo em 127.0.0.1:" + std::to_wstring(config.localPort) +
-    L" | conexões: " + std::to_wstring(service.sessions()) : L"Desconectado";
-  SetWindowTextW(GetDlgItem(window, ID_STATUS), status.c_str());
-  SetWindowTextW(GetDlgItem(window, ID_CONNECT), stopping ? L"Desconectando..." : service.running() ? L"Desconectar" : L"Conectar");
-  EnableWindow(GetDlgItem(window, ID_CONNECT), !stopping);
-  wcscpy_s(tray.szTip, L"ETL - ");
-  wcsncat_s(tray.szTip, stopping ? L"desconectando" : service.running() ? L"ativo" : L"desconectado", _TRUNCATE);
+static void loadForm() {
+  const auto copy = [](auto& to, const std::wstring& value) {
+    const auto encoded = utf8(value);
+    std::copy_n(encoded.c_str(), std::min(encoded.size(), to.size() - 1), to.data());
+  };
+  copy(form.server, config.server); copy(form.backup, config.fallbackServer); copy(form.ca, config.caFile);
+  form.remotePort = config.serverPort; form.backupPort = config.fallbackPort;
+  form.localPort = config.localPort; form.timeout = config.connectTimeoutMs;
+  form.savedToken = !config.protectedToken.empty();
+  form.savedBackupToken = !config.fallbackProtectedToken.empty();
+}
+
+static void updateStatus(HWND) {
+  wcscpy_s(tray.szTip, stopping ? L"ETL - stopping" : service.running() ? L"ETL - proxy active" : L"ETL - off");
   Shell_NotifyIconW(NIM_MODIFY, &tray);
 }
 
 static void beginStop(HWND window, bool exit) {
   if (stopping) { exitAfterStop |= exit; return; }
   if (!service.running()) { if (exit) DestroyWindow(window); return; }
-  stopping = true;
-  exitAfterStop = exit;
-  updateStatus(window);
+  stopping = true; exitAfterStop = exit; updateStatus(window);
   stopThread = std::thread([window] {
-    service.stop();
-    PostMessageW(window, WM_SERVICE_STOPPED, 0, 0);
+    service.stop(); PostMessageW(window, WM_SERVICE_STOPPED, 0, 0);
   });
 }
 
 static void connectOrStop(HWND window) {
   if (stopping) return;
   if (service.running()) { beginStop(window, false); return; }
-  {
-    Config next;
-    next.server = field(window, ID_SERVER);
-    next.fallbackServer = field(window, ID_FALLBACK_SERVER);
-    std::wstring entered = field(window, ID_TOKEN);
-    std::string token = utf8(entered);
-    SecureZeroMemory(entered.data(), entered.size() * sizeof(wchar_t));
-    if (!protectToken(token, next.protectedToken)) {
-      OPENSSL_cleanse(token.data(), token.size());
-      MessageBoxW(window, L"Informe um token válido (64 caracteres hexadecimais).", L"ETL", MB_ICONERROR);
-      return;
-    }
-    OPENSSL_cleanse(token.data(), token.size());
-    entered = field(window, ID_FALLBACK_TOKEN);
-    token = utf8(entered);
-    SecureZeroMemory(entered.data(), entered.size() * sizeof(wchar_t));
-    if (!token.empty() && !protectToken(token, next.fallbackProtectedToken)) {
-      OPENSSL_cleanse(token.data(), token.size());
-      MessageBoxW(window, L"Token reserva inválido; deixe vazio para usar o token principal.", L"ETL", MB_ICONERROR);
-      return;
-    }
-    OPENSSL_cleanse(token.data(), token.size());
-    next.caFile = field(window, ID_CA);
-    if (!portValue(field(window, ID_SERVER_PORT), next.serverPort) ||
-        !portValue(field(window, ID_FALLBACK_PORT), next.fallbackPort) ||
-        !portValue(field(window, ID_LOCAL_PORT), next.localPort)) {
-      MessageBoxW(window, L"Porta inválida.", L"ETL", MB_ICONERROR); return;
-    }
-    if (!portValue(field(window, ID_CONNECT_TIMEOUT), next.connectTimeoutMs) || next.connectTimeoutMs > 60000) {
-      MessageBoxW(window, L"Timeout inválido (1 a 60000 ms).", L"ETL", MB_ICONERROR); return;
-    }
-    std::wstring error;
-    if (!service.start(next, error)) { MessageBoxW(window, error.c_str(), L"ETL", MB_ICONERROR); return; }
-    config = next;
-    if (!saveConfig(config)) MessageBoxW(window, L"Conectado, mas não foi possível salvar a configuração.", L"ETL", MB_ICONWARNING);
+  Config next = config;
+  next.server = wide(form.server.data()); next.fallbackServer = wide(form.backup.data());
+  next.serverPort = form.remotePort; next.fallbackPort = form.backupPort;
+  next.localPort = form.localPort; next.connectTimeoutMs = form.timeout; next.caFile = wide(form.ca.data());
+  if (next.server.empty() || next.serverPort < 1 || next.serverPort > 65535 ||
+      next.localPort < 1 || next.localPort > 65535 || next.fallbackPort < 1 || next.fallbackPort > 65535 ||
+      next.connectTimeoutMs < 1 || next.connectTimeoutMs > 60000) {
+    uiError = "Check host, ports and timeout."; return;
   }
+  if (form.token[0] && !protectToken(form.token.data(), next.protectedToken)) {
+    uiError = "Token: use 64 lowercase hex characters."; return;
+  }
+  if (form.backupToken[0] && !protectToken(form.backupToken.data(), next.fallbackProtectedToken)) {
+    uiError = "Backup token: use 64 lowercase hex characters."; return;
+  }
+  if (next.fallbackServer.empty()) next.fallbackProtectedToken.clear();
+  next.tokenFile.clear(); next.fallbackTokenFile.clear();
+  std::wstring error;
+  if (!service.start(next, error)) { uiError = utf8(error); return; }
+  config = next;
+  SecureZeroMemory(form.token.data(), form.token.size());
+  SecureZeroMemory(form.backupToken.data(), form.backupToken.size());
+  form.savedToken = !config.protectedToken.empty(); form.savedBackupToken = !config.fallbackProtectedToken.empty();
+  uiError = saveConfig(config) ? "" : "Proxy active. Settings could not be saved.";
   updateStatus(window);
 }
 
@@ -854,51 +850,21 @@ static void showWindow(HWND window) {
   SetForegroundWindow(window);
 }
 
-static void label(HWND window, int y, const wchar_t* text, int editId, const std::wstring& value, DWORD style = 0) {
-  CreateWindowW(L"STATIC", text, WS_CHILD | WS_VISIBLE, 16, y, 135, 22, window, nullptr, nullptr, nullptr);
-  CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", value.c_str(), WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | style,
-    155, y - 2, 280, 25, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(editId)), nullptr, nullptr);
-}
-
 static LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
+  if (desktop.message(window, message, wparam, lparam)) return 1;
   switch (message) {
     case WM_CREATE:
-      label(window, 20, L"Servidor", ID_SERVER, config.server);
-      label(window, 55, L"Porta remota", ID_SERVER_PORT, std::to_wstring(config.serverPort));
-      {
-        std::string token;
-        std::wstring visible;
-        if (unprotectToken(config.protectedToken, token)) visible.assign(token.begin(), token.end());
-        OPENSSL_cleanse(token.data(), token.size());
-        label(window, 90, L"Token", ID_TOKEN, visible, ES_PASSWORD);
-        SecureZeroMemory(visible.data(), visible.size() * sizeof(wchar_t));
-        SendMessageW(GetDlgItem(window, ID_TOKEN), EM_LIMITTEXT, 64, 0);
-      }
-      label(window, 125, L"Servidor reserva", ID_FALLBACK_SERVER, config.fallbackServer);
-      label(window, 160, L"Porta reserva", ID_FALLBACK_PORT, std::to_wstring(config.fallbackPort));
-      {
-        std::string token;
-        std::wstring visible;
-        if (unprotectToken(config.fallbackProtectedToken, token)) visible.assign(token.begin(), token.end());
-        OPENSSL_cleanse(token.data(), token.size());
-        label(window, 195, L"Token reserva", ID_FALLBACK_TOKEN, visible, ES_PASSWORD);
-        SecureZeroMemory(visible.data(), visible.size() * sizeof(wchar_t));
-        SendMessageW(GetDlgItem(window, ID_FALLBACK_TOKEN), EM_LIMITTEXT, 64, 0);
-      }
-      label(window, 230, L"Timeout (ms)", ID_CONNECT_TIMEOUT, std::to_wstring(config.connectTimeoutMs));
-      label(window, 265, L"Porta local", ID_LOCAL_PORT, std::to_wstring(config.localPort));
-      label(window, 300, L"CA opcional", ID_CA, config.caFile);
-      CreateWindowW(L"BUTTON", L"Conectar", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-        155, 342, 130, 32, window, reinterpret_cast<HMENU>(ID_CONNECT), nullptr, nullptr);
-      CreateWindowW(L"STATIC", L"Desconectado", WS_CHILD | WS_VISIBLE,
-        16, 388, 425, 24, window, reinterpret_cast<HMENU>(ID_STATUS), nullptr, nullptr);
       tray.cbSize = sizeof(tray); tray.hWnd = window; tray.uID = 1;
       tray.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP; tray.uCallbackMessage = WM_TRAY;
       tray.hIcon = LoadIconW(nullptr, IDI_INFORMATION);
-      wcscpy_s(tray.szTip, L"ETL - desconectado");
+      wcscpy_s(tray.szTip, L"ETL - off");
       Shell_NotifyIconW(NIM_ADD, &tray);
-      SetTimer(window, 1, 1000, nullptr);
+      SetTimer(window, 1, 1000, nullptr); return 0;
+    case WM_SIZE:
+      if (wparam != SIZE_MINIMIZED) desktop.resize(LOWORD(lparam), HIWORD(lparam));
       return 0;
+    case WM_GETMINMAXINFO:
+      reinterpret_cast<MINMAXINFO*>(lparam)->ptMinTrackSize = {520, 720}; return 0;
     case WM_COMMAND:
       if (LOWORD(wparam) == ID_CONNECT) connectOrStop(window);
       else if (LOWORD(wparam) == ID_OPEN) showWindow(window);
@@ -916,11 +882,11 @@ static LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wparam, LPA
       else if (LOWORD(lparam) == WM_RBUTTONUP) {
         POINT point; GetCursorPos(&point);
         HMENU menu = CreatePopupMenu();
-        AppendMenuW(menu, MF_STRING, ID_OPEN, L"Abrir ETL");
+        AppendMenuW(menu, MF_STRING, ID_OPEN, L"Open ETL");
         AppendMenuW(menu, MF_STRING | (stopping ? MF_GRAYED : 0), ID_CONNECT,
-          stopping ? L"Desconectando..." : service.running() ? L"Desconectar" : L"Conectar");
+          stopping ? L"Stopping" : service.running() ? L"Disconnect" : L"Connect");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING, ID_EXIT, L"Sair");
+        AppendMenuW(menu, MF_STRING, ID_EXIT, L"Exit");
         SetForegroundWindow(window);
         TrackPopupMenu(menu, TPM_RIGHTBUTTON, point.x, point.y, 0, window, nullptr);
         DestroyMenu(menu);
@@ -969,16 +935,33 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   }
   LocalFree(argv);
   config = loadConfig();
+  loadForm();
   WNDCLASSW wc{}; wc.lpfnWndProc = windowProc; wc.hInstance = instance;
   wc.lpszClassName = L"ETLNativeClient"; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
   RegisterClassW(&wc);
-  HWND window = CreateWindowExW(0, wc.lpszClassName, L"ETL | Cliente", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-    CW_USEDEFAULT, CW_USEDEFAULT, 470, 455, nullptr, nullptr, instance, nullptr);
+  HWND window = CreateWindowExW(0, wc.lpszClassName, L"ETL", WS_OVERLAPPEDWINDOW,
+    CW_USEDEFAULT, CW_USEDEFAULT, 540, 760, nullptr, nullptr, instance, nullptr);
   if (!window) { WSACleanup(); return 1; }
-  std::wstring error;
-  if (service.start(config, error)) updateStatus(window);
-  MSG message;
-  while (GetMessageW(&message, nullptr, 0, 0) > 0) { TranslateMessage(&message); DispatchMessageW(&message); }
+  if (!desktop.initialize(window)) {
+    MessageBoxW(window, L"DirectX 11 could not start.", L"ETL", MB_ICONERROR);
+    DestroyWindow(window); WSACleanup(); return 2;
+  }
+  ShowWindow(window, SW_SHOW);
+  MSG message{};
+  bool quit = false;
+  while (!quit) {
+    while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+      if (message.message == WM_QUIT) { quit = true; break; }
+      TranslateMessage(&message); DispatchMessageW(&message);
+    }
+    if (quit) break;
+    if (!IsWindowVisible(window) || IsIconic(window)) { WaitMessage(); continue; }
+    DesktopState state{service.running(), stopping, service.sessions(), 0, 0, 0, uiError};
+    if (desktop.render(form, state)) connectOrStop(window);
+  }
+  desktop.shutdown();
+  SecureZeroMemory(form.token.data(), form.token.size());
+  SecureZeroMemory(form.backupToken.data(), form.backupToken.size());
   if (stopThread.joinable()) stopThread.join();
   service.stop();
   WSACleanup();

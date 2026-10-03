@@ -1,20 +1,20 @@
-# Interface Windows
+# Windows interface
 
-[Esboço no Figma](https://www.figma.com/design/BQNC74KJoWRbj8JC0fIpOl?node-id=5-136).
-As telas Proxy e Settings usam camadas editáveis, auto layout, variáveis de cor
-e um botão da biblioteca Simple Design System. Os valores de tráfego do esboço
-são exemplos; o cliente mostra contadores da sessão atual.
+[Figma sketch](https://www.figma.com/design/BQNC74KJoWRbj8JC0fIpOl?node-id=5-136).
+The Proxy and Settings screens use editable layers, auto layout, color variables
+and a button from Simple Design System. Traffic figures in the sketch are sample
+values; the client displays counters from its current session.
 
-A tela principal reúne estado do proxy local, servidor, token e ação de conexão.
-Portas, reserva, timeout e CA ficam em Opções. Fechar a janela mantém o proxy na
-bandeja; Sair encerra as conexões. “Proxy ativo” significa que o listener local
-está aberto. A conexão remota é verificada quando uma aplicação usa o proxy.
+The main screen contains local proxy status, server, token and connection action.
+Ports, backup, timeout and CA live under Options. Closing the window keeps the
+proxy in the tray; Exit closes its connections. “Proxy active” means the local
+listener is open. The remote connection is verified when an application uses it.
 
-O renderer usa Dear ImGui e DirectX 11. A fonte Inter acompanha o executável,
-sob licença SIL OFL. Cores: fundo `#141716`, campos `#1e2220`, borda `#343b37`,
-texto `#eef1ef`, texto secundário `#a1aaa4` e ação `#b8ecd0`. As transições usam
-interpolação exponencial de 180 ms. Não há animações contínuas quando o proxy
-está parado. O renderer pausa enquanto a janela fica oculta ou minimizada.
+The renderer uses Dear ImGui and DirectX 11. Inter ships inside the executable
+under SIL OFL. Colors: background `#141716`, inputs `#1e2220`, border `#343b37`,
+text `#eef1ef`, secondary text `#a1aaa4` and action `#b8ecd0`. State transitions
+use exponential interpolation with a 180 ms time constant. The renderer pauses
+while the window is hidden or minimized.
 
-ImGui não oferece a mesma integração de acessibilidade dos controles Win32.
-Há navegação por teclado, mas suporte a leitores de tela permanece uma limitação.
+ImGui does not provide the same accessibility integration as Win32 controls.
+Keyboard navigation is enabled; screen reader support remains a limitation.
