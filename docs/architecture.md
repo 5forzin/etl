@@ -14,7 +14,15 @@ also rewrites absolute-form HTTP requests for the destination. Both use the same
 [ETL v1 protocol](protocol.md), verify the server certificate and authenticate
 before requesting a destination.
 
-New connections try the primary host first, then the optional backup. Each attempt
+New connections try the primary host first, then an available backup. A background
+check authenticates each backup over verified TLS before it becomes eligible.
+Unknown or unavailable backups are skipped. Checks repeat 30 seconds after the
+previous check finishes, without opening destinations or relaying payloads. A
+failed backup connection removes it from use until a later check succeeds.
+Availability can change between a check and a request, so every request still
+verifies TLS and authenticates before sending a destination.
+
+Each attempt
 has one deadline covering DNS, TCP, TLS and authentication; the default is one
 second. Once a host accepts authentication, destination setup gets a separate
 deadline. A destination failure does not trigger failover. Existing streams stay
@@ -24,8 +32,8 @@ The Windows renderer lives in `native/windows/desktop_ui.cpp`; networking and
 DPAPI storage remain in `etl_client.cpp`. DirectX 11 falls back to WARP when a
 hardware device cannot be created. Hidden or minimized windows wait for messages
 instead of rendering. The main screen shows listener state and byte counters,
-not a remote health guarantee. No remote connection exists until an application
-uses the proxy.
+not a remote health guarantee. The primary connects when an application uses
+the proxy; a configured backup also receives the background checks.
 
 ## Server
 
@@ -51,6 +59,7 @@ the hostname again.
 | Server authentication through destination setup | 10 seconds total |
 | Client attempt through authentication | 1 second per host |
 | Client destination setup | 10 seconds |
+| Backup check interval after completion | 30 seconds |
 | Relay inactivity | 120 seconds |
 
 Absolute deadlines expire even when a peer drips bytes. The native relay tracks

@@ -9,6 +9,10 @@ portable C++ executable with Dear ImGui, DirectX 11 and Inter. It supports SOCKS
 HTTP CONNECT, ordinary HTTP proxy requests, and a backup server. Windows stores
 tokens with DPAPI for the current user.
 
+The primary server is always tried first. A backup receives traffic only after a
+background check verifies its TLS certificate and ETL token. Unavailable backups
+are skipped and checked again every 30 seconds.
+
 ## Connect
 
 Windows: build the client using the [Windows guide](native/windows/README.md),

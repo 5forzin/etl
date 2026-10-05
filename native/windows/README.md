@@ -32,6 +32,10 @@ is loaded but does not start automatically when the desktop opens.
 
 Each server attempt has a default one-second deadline covering DNS, TCP, verified
 TLS and authentication. New connections may use a backup with its own token.
+The backup is checked in the background at startup and every 30 seconds after
+each check. It receives traffic only after verified TLS and ETL authentication
+succeed. A failed check or connection disables it until a later check succeeds.
+Checks send no destination or application data and do not block primary traffic.
 Active streams never move between servers. TLS verification stays enabled.
 
 ## Build a portable executable
@@ -97,6 +101,7 @@ Headless mode takes `--server`, `--server-port`, `--port`, `--token-file`,
 `--ca`, `--fallback-server`, `--fallback-port`, `--fallback-token-file` and
 `--connect-timeout-ms`. It additionally accepts `--handshake-timeout-ms`
 (1–65535; default 10000) and `--idle-timeout-ms` (1–600000; default 120000).
-Headless mode never renders the desktop.
+`--fallback-check-interval-ms` sets the backup check interval (100–60000;
+default 30000). Headless mode never renders the desktop.
 
 See the [design notes and Figma sketch](../../docs/desktop-design.md).

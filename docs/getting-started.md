@@ -102,7 +102,14 @@ node src/cli.js client --server tunnel.example.com --token-file secrets/token \
 ~~~
 
 Each host gets one setup budget covering DNS through authentication. Failures in
-those phases move the new connection to the backup. Omit the backup token file
+those phases move the new connection to an available backup. The client checks
+the backup at startup and every 30 seconds after a check completes. A successful
+check requires TLS 1.3, a valid certificate and ETL authentication; an open TCP port
+alone does not qualify. Until a check succeeds, the backup is skipped. If a backup
+connection fails, it is skipped again until another check succeeds. Checks send
+no destination or application data and do not delay primary connections.
+
+`--fallback-check-interval-ms` changes the interval (100–60000 ms). Omit the backup token file
 only if both servers share a credential. `--fallback-port` defaults to the
 primary port in Node. On Windows both ports are explicit settings, defaulting to
 443. Increase the timeout for slow networks.

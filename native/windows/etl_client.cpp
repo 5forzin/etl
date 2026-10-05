@@ -52,6 +52,7 @@ struct Config {
   std::wstring fallbackProtectedToken;
   std::wstring fallbackTokenFile;
   int connectTimeoutMs = 1000;
+  int fallbackCheckIntervalMs = 30000;
   int handshakeTimeoutMs = 10000;
   int idleTimeoutMs = 120000;
   int localPort = 1080;
@@ -593,7 +594,10 @@ class Service {
       error = L"Invalid backup token."; return false;
     }
     OPENSSL_cleanse(token.data(), token.size());
-    if (config.connectTimeoutMs < 1 || config.connectTimeoutMs > 60000) { error = L"Timeout: use 1 to 60000 ms."; return false; }
+    if (config.connectTimeoutMs < 1 || config.connectTimeoutMs > 60000 ||
+        config.fallbackCheckIntervalMs < 100 || config.fallbackCheckIntervalMs > 60000) {
+      error = L"Invalid connection or backup check timeout."; return false;
+    }
     if (config.server.empty() || config.serverPort < 1 || config.serverPort > 65535 ||
         config.localPort < 1 || config.localPort > 65535 || config.fallbackPort < 1 || config.fallbackPort > 65535 ||
         config.handshakeTimeoutMs < 1 || config.idleTimeoutMs < 1) { error = L"Invalid settings."; return false; }
@@ -613,22 +617,28 @@ class Service {
       error = L"Local port is busy or unavailable."; closesocket(listener); SSL_CTX_free(ctx_); ctx_ = nullptr; return false;
     }
     config_ = config; listener_ = listener; running_ = true;
+    backupAvailable_ = false;
     sent_ = 0; received_ = 0; failures_ = 0;
-    try { acceptThread_ = std::thread([this] { acceptLoop(); }); }
+    try {
+      if (!config_.fallbackServer.empty()) backupThread_ = std::thread([this] { checkBackup(); });
+      acceptThread_ = std::thread([this] { acceptLoop(); });
+    }
     catch (...) {
-      running_ = false; listener_ = INVALID_SOCKET; closesocket(listener);
-      SSL_CTX_free(ctx_); ctx_ = nullptr; error = L"Worker could not start."; return false;
+      stop(); error = L"Worker could not start."; return false;
     }
     return true;
   }
 
   void stop() {
     if (!running_.exchange(false)) return;
+    backupAvailable_ = false;
+    backupWake_.notify_all();
     SOCKET listener = listener_.exchange(INVALID_SOCKET);
     if (listener != INVALID_SOCKET) closesocket(listener);
     if (acceptThread_.joinable()) acceptThread_.join();
     // Keep handles stable while interrupting workers; a closed handle may be reused.
     { std::lock_guard<std::mutex> lock(mu_); for (SOCKET s : sockets_) shutdown(s, SD_BOTH); }
+    if (backupThread_.joinable()) backupThread_.join();
     std::unique_lock<std::mutex> lock(mu_);
     drained_.wait(lock, [this] { return sessions_ == 0; });
     lock.unlock();
@@ -642,6 +652,88 @@ class Service {
   uint64_t failures() const { return failures_; }
 
  private:
+  void closeTunnel(SOCKET& remote, SSL*& ssl) {
+    if (ssl) SSL_free(ssl);
+    ssl = nullptr;
+    if (remote != INVALID_SOCKET) {
+      { std::lock_guard<std::mutex> lock(mu_); sockets_.erase(remote); }
+      closesocket(remote);
+      remote = INVALID_SOCKET;
+    }
+  }
+
+  bool openTunnel(bool fallback, SOCKET& remote, SSL*& ssl) {
+    const auto& endpoint = fallback ? config_.fallbackServer : config_.server;
+    const int endpointPort = fallback ? config_.fallbackPort : config_.serverPort;
+    const auto deadline = ConnectClock::now() + std::chrono::milliseconds(config_.connectTimeoutMs);
+    remote = connectServer(endpoint, endpointPort, running_, deadline);
+    if (remote == INVALID_SOCKET) return false;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      if (!running_) { closesocket(remote); remote = INVALID_SOCKET; return false; }
+      sockets_.insert(remote);
+    }
+    // Authentication shares the absolute DNS/TCP/TLS budget. A check sends no
+    // destination or application data and never disables certificate verification.
+    std::mutex attemptMutex;
+    std::condition_variable attemptWake;
+    bool attemptDone = false, timedOut = false;
+    const SOCKET attemptedSocket = remote;
+    std::thread guard;
+    try {
+      guard = std::thread([&] {
+        std::unique_lock<std::mutex> lock(attemptMutex);
+        if (!attemptWake.wait_until(lock, deadline, [&] { return attemptDone; })) {
+          timedOut = true;
+          shutdown(attemptedSocket, SD_BOTH);
+        }
+      });
+    } catch (...) { closeTunnel(remote, ssl); return false; }
+    bool ok = false;
+    try {
+      ssl = SSL_new(ctx_);
+      if (ssl) {
+        std::string server = utf8(endpoint);
+        if (SSL_set_fd(ssl, static_cast<int>(remote)) == 1 &&
+            SSL_set_tlsext_host_name(ssl, server.c_str()) == 1 &&
+            SSL_set1_host(ssl, server.c_str()) == 1 &&
+            SSL_connect(ssl) == 1 && SSL_get_verify_result(ssl) == X509_V_OK) {
+          std::string token;
+          if (tokenForConfig(config_, token, fallback)) {
+            std::string auth;
+            auth.reserve(token.size() + 20);
+            auth.assign("{\"v\":1,\"token\":\"");
+            auth.append(token);
+            auth.append("\"}");
+            ok = writeFrame(ssl, auth);
+            OPENSSL_cleanse(auth.data(), auth.size());
+            OPENSSL_cleanse(token.data(), token.size());
+            ok = ok && responseOK(ssl);
+          }
+        }
+      }
+    } catch (...) { ok = false; }
+    { std::lock_guard<std::mutex> lock(attemptMutex); attemptDone = true; }
+    attemptWake.notify_one();
+    guard.join();
+    ok = ok && !timedOut && running_ && ConnectClock::now() < deadline;
+    if (!ok) closeTunnel(remote, ssl);
+    return ok;
+  }
+
+  void checkBackup() {
+    while (running_) {
+      SOCKET remote = INVALID_SOCKET;
+      SSL* ssl = nullptr;
+      const bool available = openTunnel(true, remote, ssl);
+      closeTunnel(remote, ssl);
+      backupAvailable_ = available && running_;
+      std::unique_lock<std::mutex> lock(backupMutex_);
+      backupWake_.wait_for(lock, std::chrono::milliseconds(config_.fallbackCheckIntervalMs),
+                          [this] { return !running_; });
+    }
+  }
+
   void acceptLoop() {
     while (running_) {
       SOCKET listener = listener_.load();
@@ -699,60 +791,10 @@ class Service {
     const int attempts = config_.fallbackServer.empty() ? 1 : 2;
     for (int attempt = 0; attempt < attempts && running_; ++attempt) {
       const bool fallback = attempt != 0;
-      const auto& endpoint = fallback ? config_.fallbackServer : config_.server;
-      const int endpointPort = fallback ? config_.fallbackPort : config_.serverPort;
-      const auto deadline = ConnectClock::now() + std::chrono::milliseconds(config_.connectTimeoutMs);
-      remote = connectServer(endpoint, endpointPort, running_, deadline);
-      if (remote == INVALID_SOCKET) continue;
-      {
-        std::lock_guard<std::mutex> lock(mu_);
-        if (!running_) { closesocket(remote); remote = INVALID_SOCKET; break; }
-        sockets_.insert(remote);
-      }
-      // Interrupt blocking OpenSSL calls at the absolute deadline, including
-      // peers that keep sending partial control frames. Never retry payloads.
-      std::mutex attemptMutex;
-      std::condition_variable attemptWake;
-      bool attemptDone = false, timedOut = false;
-      const SOCKET attemptedSocket = remote;
-      std::thread guard([&] {
-        std::unique_lock<std::mutex> lock(attemptMutex);
-        if (!attemptWake.wait_until(lock, deadline, [&] { return attemptDone; })) {
-          timedOut = true;
-          shutdown(attemptedSocket, SD_BOTH);
-        }
-      });
-      ssl = SSL_new(ctx_);
-      if (ssl) {
-        std::string server = utf8(endpoint);
-        if (SSL_set_fd(ssl, static_cast<int>(remote)) == 1 &&
-            SSL_set_tlsext_host_name(ssl, server.c_str()) == 1 &&
-            SSL_set1_host(ssl, server.c_str()) == 1 &&
-            SSL_connect(ssl) == 1 && SSL_get_verify_result(ssl) == X509_V_OK) {
-          std::string token;
-          if (tokenForConfig(config_, token, fallback)) {
-            std::string auth;
-            auth.reserve(token.size() + 20);
-            auth.assign("{\"v\":1,\"token\":\"");
-            auth.append(token);
-            auth.append("\"}");
-            ok = writeFrame(ssl, auth);
-            OPENSSL_cleanse(auth.data(), auth.size());
-            OPENSSL_cleanse(token.data(), token.size());
-            ok = ok && responseOK(ssl);
-          }
-        }
-      }
-      { std::lock_guard<std::mutex> lock(attemptMutex); attemptDone = true; }
-      attemptWake.notify_one();
-      guard.join();
-      ok = ok && !timedOut && running_ && ConnectClock::now() < deadline;
+      if (fallback && !backupAvailable_) continue;
+      ok = openTunnel(fallback, remote, ssl);
       if (ok) break;
-      if (ssl) SSL_free(ssl);
-      ssl = nullptr;
-      { std::lock_guard<std::mutex> lock(mu_); sockets_.erase(remote); }
-      closesocket(remote);
-      remote = INVALID_SOCKET;
+      if (fallback) backupAvailable_ = false;
     }
     if (!ok) { ++failures_; if (socks) socksReply(client, 1); else httpReply(client, 502); return; }
     SocketBudget destinationBudget(remote, config_.handshakeTimeoutMs);
@@ -815,6 +857,10 @@ class Service {
   std::atomic<int> sessions_{0};
   std::atomic<uint64_t> sent_{0}, received_{0}, failures_{0};
   std::thread acceptThread_;
+  std::thread backupThread_;
+  std::atomic<bool> backupAvailable_{false};
+  std::mutex backupMutex_;
+  std::condition_variable backupWake_;
   std::mutex mu_;
   std::condition_variable drained_;
   std::set<SOCKET> sockets_;
@@ -987,6 +1033,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
       else if (name == L"--server-port") { if (!portValue(value, c.serverPort)) return 20; }
       else if (name == L"--fallback-port") { if (!portValue(value, c.fallbackPort)) return 20; }
       else if (name == L"--connect-timeout-ms") { if (!portValue(value, c.connectTimeoutMs) || c.connectTimeoutMs > 60000) return 20; }
+      else if (name == L"--fallback-check-interval-ms") {
+        if (!portValue(value, c.fallbackCheckIntervalMs) || c.fallbackCheckIntervalMs < 100 || c.fallbackCheckIntervalMs > 60000) return 20;
+      }
       else if (name == L"--handshake-timeout-ms") { if (!portValue(value, c.handshakeTimeoutMs)) return 20; }
       else if (name == L"--idle-timeout-ms") {
         if (value.empty() || value.size() > 6 || !std::all_of(value.begin(), value.end(), [](wchar_t ch) { return ch >= L'0' && ch <= L'9'; })) return 20;

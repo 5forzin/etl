@@ -111,16 +111,19 @@ function reply(socket, code) {
 }
 
 export function createClient({ host, port = 443, servername = host, token, ca,
-  fallbacks = [], connectTimeout = 1000,
+  fallbacks = [], connectTimeout = 1000, fallbackCheckInterval = 30_000,
   maxConnections = 128, handshakeTimeout = HANDSHAKE, idleTimeout = IDLE }) {
   validateLimits(maxConnections, handshakeTimeout, idleTimeout);
   validateToken(token);
   if (!Number.isInteger(connectTimeout) || connectTimeout < 1 || connectTimeout > 60_000) {
     throw new Error('connectTimeout must be between 1 and 60000 milliseconds');
   }
-  const endpoints = [{ host, port, servername, token }, ...fallbacks.map((endpoint) => ({
+  if (!Number.isInteger(fallbackCheckInterval) || fallbackCheckInterval < 100 || fallbackCheckInterval > 60_000) {
+    throw new Error('fallbackCheckInterval must be between 100 and 60000 milliseconds');
+  }
+  const endpoints = [{ host, port, servername, token, available: true }, ...fallbacks.map((endpoint) => ({
     host: endpoint.host, port: endpoint.port ?? port,
-    servername: endpoint.servername ?? endpoint.host, token: endpoint.token ?? token,
+    servername: endpoint.servername ?? endpoint.host, token: endpoint.token ?? token, available: false,
   }))];
   for (const endpoint of endpoints) {
     validateToken(endpoint.token);
@@ -129,6 +132,45 @@ export function createClient({ host, port = 443, servername = host, token, ca,
       throw new Error('Invalid tunnel endpoint');
     }
   }
+  let stopped = false;
+  const probes = new Set();
+  const probeTimers = new Set();
+  const checkFallback = async (endpoint) => {
+    if (stopped) return;
+    let candidate, deadline;
+    let available = false;
+    try {
+      candidate = protect(tls.connect({ host: endpoint.host, port: endpoint.port,
+        servername: endpoint.servername, ca, rejectUnauthorized: true,
+        minVersion: 'TLSv1.3' }), connectTimeout);
+      probes.add(candidate);
+      deadline = setTimeout(() => candidate.destroy(), connectTimeout);
+      await connected(candidate, 'secureConnect');
+      writeFrame(candidate, { v: 1, token: endpoint.token });
+      available = (await readFrame(candidate))?.code === 'OK';
+    } catch { /* Keep unavailable endpoints out of the request path. */ }
+    finally {
+      clearTimeout(deadline);
+      candidate?.destroy();
+      probes.delete(candidate);
+    }
+    if (stopped) return;
+    endpoint.available = available;
+    server.emit('fallbackStatus', { host: endpoint.host, port: endpoint.port, available });
+    const timer = setTimeout(() => {
+      probeTimers.delete(timer);
+      void checkFallback(endpoint);
+    }, fallbackCheckInterval);
+    timer.unref();
+    probeTimers.add(timer);
+  };
+  const stopProbes = () => {
+    stopped = true;
+    for (const timer of probeTimers) clearTimeout(timer);
+    probeTimers.clear();
+    for (const probe of probes) probe.destroy();
+    probes.clear();
+  };
   const server = net.createServer({ allowHalfOpen: true }, (socket) => {
     protect(socket, handshakeTimeout);
     let deadline = setTimeout(() => socket.destroy(), handshakeTimeout);
@@ -147,6 +189,7 @@ export function createClient({ host, port = 443, servername = host, token, ca,
       deadline = setTimeout(() => socket.destroy(), setupTimeout);
       for (const endpoint of endpoints) {
         if (socket.destroyed) return;
+        if (!endpoint.available) continue;
         const candidate = protect(tls.connect({ host: endpoint.host, port: endpoint.port,
           servername: endpoint.servername, ca, rejectUnauthorized: true,
           minVersion: 'TLSv1.3', allowHalfOpen: true }), connectTimeout);
@@ -164,6 +207,7 @@ export function createClient({ host, port = 443, servername = host, token, ca,
         } catch {
           candidate.destroy();
           tunnel = undefined;
+          if (endpoint !== endpoints[0]) endpoint.available = false;
         } finally {
           clearTimeout(attemptDeadline);
         }
@@ -185,5 +229,12 @@ export function createClient({ host, port = 443, servername = host, token, ca,
     });
   });
   server.maxConnections = maxConnections;
-  return track(server);
+  server.once('listening', () => {
+    for (const endpoint of endpoints.slice(1)) void checkFallback(endpoint);
+  });
+  server.once('close', stopProbes);
+  track(server);
+  const shutdown = server.shutdown;
+  server.shutdown = () => { stopProbes(); return shutdown(); };
+  return server;
 }

@@ -20,6 +20,7 @@ Options:
   --fallback-port NUMBER Backup TLS port (default: remote port)
   --fallback-token-file PATH  Backup credential (default: primary token)
   --connect-timeout-ms N Tunnel setup budget per host (default: 1000)
+  --fallback-check-interval-ms N Backup health check interval (default: 30000)
   --listen IP            Server bind address (default: 0.0.0.0)
   --ca PATH              Private CA bundle (replaces Node's trust store)
   --max-connections N    Maximum simultaneous connections (default: 128)
@@ -46,6 +47,7 @@ async function main() {
     ca: { type: 'string' }, 'max-connections': { type: 'string' },
     'fallback-server': { type: 'string' }, 'fallback-port': { type: 'string' },
     'fallback-token-file': { type: 'string' }, 'connect-timeout-ms': { type: 'string' },
+    'fallback-check-interval-ms': { type: 'string' },
     timeout: { type: 'string' }, json: { type: 'boolean' }, version: { type: 'boolean' },
   } });
   const [command] = positionals;
@@ -81,7 +83,7 @@ async function main() {
   } else {
     if (!values.server) throw new Error('--server is required');
     if (values.listen) throw new Error('Client binds only to loopback; omit --listen');
-    if (!values['fallback-server'] && (values['fallback-port'] || values['fallback-token-file'])) {
+    if (!values['fallback-server'] && (values['fallback-port'] || values['fallback-token-file'] || values['fallback-check-interval-ms'])) {
       throw new Error('--fallback-server is required for backup options');
     }
     const remotePort = port(values['server-port'], 443);
@@ -90,6 +92,7 @@ async function main() {
         tokenFile(values['fallback-token-file'])() : getToken() }] : [];
     service = createClient({ host: values.server, port: remotePort, fallbacks,
       connectTimeout: Number(values['connect-timeout-ms'] ?? 1000),
+      fallbackCheckInterval: Number(values['fallback-check-interval-ms'] ?? 30000),
       token: getToken(), ca: values.ca ? readFileSync(values.ca) : undefined, maxConnections });
     bind = '127.0.0.1';
     listenPort = port(values.port, 1080);
