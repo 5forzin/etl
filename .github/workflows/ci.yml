@@ -54,7 +54,7 @@ jobs:
           pwsh -NoProfile -File native/windows/package.ps1 -Portable -RuntimeBin "$(cygpath -w /ucrt64/bin)"
           export ETL_NATIVE_CLIENT="$(cygpath -w "$PWD/dist/windows-portable/etl-client.exe")"
           export ETL_OPENSSL="$(cygpath -w /ucrt64/bin/openssl.exe)"
-          node --test test/native-client.test.js
+          node --test test/native-client.test.js test/fallback.test.js
           node -e 'require("node:child_process").execFileSync(process.env.ETL_NATIVE_CLIENT, ["--self-test-ui", "dist/windows-portable/desktop-preview.bmp"], {windowsHide: true})'
       - uses: actions/upload-artifact@v7
         with:
