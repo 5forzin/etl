@@ -9,7 +9,7 @@ struct DesktopForm {
   std::array<char, 256> server{}, backup{};
   std::array<char, 65> token{}, backupToken{};
   std::array<char, 1024> ca{};
-  int remotePort = 443, backupPort = 443, localPort = 1080, timeout = 1000;
+  int remotePort = 443, backupPort = 443, localPort = 1080, timeout = 5000;
   bool savedToken = false, savedBackupToken = false;
 };
 

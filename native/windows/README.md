@@ -30,7 +30,7 @@ current-user DPAPI. Legacy token-file settings migrate when the file is readable
 Tokens are not included in the executable or release. An existing client profile
 is loaded but does not start automatically when the desktop opens.
 
-Each server attempt has a default one-second deadline covering DNS, TCP, verified
+Each server attempt has a default five-second deadline covering DNS, TCP, verified
 TLS and authentication. New connections may use a backup with its own token.
 The backup is checked in the background at startup and every 30 seconds after
 each check. It receives traffic only after verified TLS and ETL authentication

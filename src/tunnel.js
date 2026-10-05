@@ -111,7 +111,7 @@ function reply(socket, code) {
 }
 
 export function createClient({ host, port = 443, servername = host, token, ca,
-  fallbacks = [], connectTimeout = 1000, fallbackCheckInterval = 30_000,
+  fallbacks = [], connectTimeout = 5000, fallbackCheckInterval = 30_000,
   maxConnections = 128, handshakeTimeout = HANDSHAKE, idleTimeout = IDLE }) {
   validateLimits(maxConnections, handshakeTimeout, idleTimeout);
   validateToken(token);

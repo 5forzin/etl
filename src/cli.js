@@ -19,7 +19,7 @@ Options:
   --fallback-server HOST Backup host for new connections
   --fallback-port NUMBER Backup TLS port (default: remote port)
   --fallback-token-file PATH  Backup credential (default: primary token)
-  --connect-timeout-ms N Tunnel setup budget per host (default: 1000)
+  --connect-timeout-ms N Tunnel setup budget per host (default: 5000)
   --fallback-check-interval-ms N Backup health check interval (default: 30000)
   --listen IP            Server bind address (default: 0.0.0.0)
   --ca PATH              Private CA bundle (replaces Node's trust store)
@@ -91,7 +91,7 @@ async function main() {
       port: port(values['fallback-port'], remotePort), token: values['fallback-token-file'] ?
         tokenFile(values['fallback-token-file'])() : getToken() }] : [];
     service = createClient({ host: values.server, port: remotePort, fallbacks,
-      connectTimeout: Number(values['connect-timeout-ms'] ?? 1000),
+      connectTimeout: Number(values['connect-timeout-ms'] ?? 5000),
       fallbackCheckInterval: Number(values['fallback-check-interval-ms'] ?? 30000),
       token: getToken(), ca: values.ca ? readFileSync(values.ca) : undefined, maxConnections });
     bind = '127.0.0.1';

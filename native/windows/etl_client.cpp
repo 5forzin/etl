@@ -51,7 +51,7 @@ struct Config {
   int fallbackPort = 443;
   std::wstring fallbackProtectedToken;
   std::wstring fallbackTokenFile;
-  int connectTimeoutMs = 1000;
+  int connectTimeoutMs = 5000;
   int fallbackCheckIntervalMs = 30000;
   int handshakeTimeoutMs = 10000;
   int idleTimeoutMs = 120000;
@@ -175,7 +175,7 @@ static Config loadConfig() {
   if (portValue(readSetting(path, L"server_port", L"443"), value)) c.serverPort = value;
   if (portValue(readSetting(path, L"local_port", L"1080"), value)) c.localPort = value;
   if (portValue(readSetting(path, L"fallback_port", L"443"), value)) c.fallbackPort = value;
-  if (portValue(readSetting(path, L"connect_timeout_ms", L"1000"), value) && value <= 60000) c.connectTimeoutMs = value;
+  if (portValue(readSetting(path, L"connect_timeout_ms", L"5000"), value) && value <= 60000) c.connectTimeoutMs = value;
   if (c.protectedToken.empty()) {
     const auto legacyFile = readSetting(path, L"token_file", L"");
     std::string token;

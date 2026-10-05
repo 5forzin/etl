@@ -58,10 +58,11 @@ function backupFixture() {
   return {server, state};
 }
 
-async function startClient(kind, t, primaryPort, backupPort, interval = 10000, backupHost = 'localhost') {
+async function startClient(kind, t, primaryPort, backupPort, interval = 10000,
+  backupHost = 'localhost', connectTimeout = 300) {
   if (kind === 'Node') {
     return listen(createClient({host:'127.0.0.1', port:primaryPort, servername:'localhost', token, ca:cert,
-      connectTimeout:300, fallbackCheckInterval:interval,
+      ...(connectTimeout === null ? {} : {connectTimeout}), fallbackCheckInterval:interval,
       fallbacks:[{host:'127.0.0.1', port:backupPort,
         servername:backupHost === '127.0.0.1' ? 'wrong.example' : backupHost, token:backupToken}]}), t);
   }
@@ -73,7 +74,8 @@ async function startClient(kind, t, primaryPort, backupPort, interval = 10000, b
     ['--headless','--server','localhost','--server-port',String(primaryPort),'--port',String(port),
       '--token-file',tokenPath,'--ca',certPath,'--fallback-server',backupHost,
       '--fallback-port',String(backupPort),'--fallback-token-file',backupTokenPath,
-      '--connect-timeout-ms','300','--fallback-check-interval-ms',String(interval)],
+      ...(connectTimeout === null ? [] : ['--connect-timeout-ms',String(connectTimeout)]),
+      '--fallback-check-interval-ms',String(interval)],
     {stdio:'ignore', windowsHide:true});
   t.after(async () => {
     if (child.exitCode !== null) return;
@@ -174,6 +176,25 @@ for (const kind of ['Node', 'native Windows']) {
     await request(port,1);
     assert.equal(state.replies,0);
     assert.equal(state.destinations,0);
+  });
+
+  test(`${kind} default budget keeps a slow primary instead of switching to a healthy backup`, options, async t => {
+    const primary = track(tls.createServer({key,cert,minVersion:'TLSv1.3'}, socket => {
+      socket.on('error', () => {});
+      void (async () => {
+        assert.equal((await readFrame(socket)).token,token);
+        await new Promise(resolve => setTimeout(resolve,1250));
+        writeFrame(socket,{code:'OK'}); await readFrame(socket);
+        writeFrame(socket,{code:'OK'}); socket.pipe(socket);
+      })().catch(() => socket.destroy());
+    }));
+    const primaryPort = await listen(primary,t);
+    const {server,state} = backupFixture(); state.authenticated = true;
+    const backupPort = await listen(server,t);
+    const port = await startClient(kind,t,primaryPort,backupPort,10000,'localhost',null);
+    await waitFor(() => state.closed > 0);
+    await request(port,0);
+    assert.equal(state.destinations,0,'the default timeout rejected a working primary');
   });
 }
 

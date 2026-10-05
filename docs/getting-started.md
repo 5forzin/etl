@@ -98,7 +98,7 @@ native client adds it to its Windows/OpenSSL roots. Never disable verification.
 ~~~sh
 node src/cli.js client --server tunnel.example.com --token-file secrets/token \
   --fallback-server backup.example.com --fallback-token-file secrets/backup-token \
-  --connect-timeout-ms 1000
+  --connect-timeout-ms 5000
 ~~~
 
 Each host gets one setup budget covering DNS through authentication. Failures in

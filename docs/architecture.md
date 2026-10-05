@@ -23,8 +23,8 @@ Availability can change between a check and a request, so every request still
 verifies TLS and authenticates before sending a destination.
 
 Each attempt
-has one deadline covering DNS, TCP, TLS and authentication; the default is one
-second. Once a host accepts authentication, destination setup gets a separate
+has one deadline covering DNS, TCP, TLS and authentication; the default is five
+seconds. Once a host accepts authentication, destination setup gets a separate
 deadline. A destination failure does not trigger failover. Existing streams stay
 on their original server and close if it fails.
 
@@ -57,7 +57,7 @@ the hostname again.
 | Local HTTP header | 16 KiB |
 | Local negotiation | 10 seconds |
 | Server authentication through destination setup | 10 seconds total |
-| Client attempt through authentication | 1 second per host |
+| Client attempt through authentication | 5 seconds per host |
 | Client destination setup | 10 seconds |
 | Backup check interval after completion | 30 seconds |
 | Relay inactivity | 120 seconds |

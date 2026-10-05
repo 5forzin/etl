@@ -221,7 +221,7 @@ test('connection limit rejects additional sockets', { timeout: 3000 }, async (t)
   await assert.rejects(secure(t, port));
 });
 
-test('client abandons a TLS blackhole after the default second and uses a separate backup token',
+test('client abandons a TLS blackhole after its one-second budget and uses a separate backup token',
   { timeout: 6000 }, async (t) => {
   let stalledSocket;
   const stalled = track(net.createServer((socket) => {
@@ -239,7 +239,7 @@ test('client abandons a TLS blackhole after the default second and uses a separa
   const backupPort = await tunnel(t, { getToken: () => backupToken,
     resolve: async () => [{ address: '127.0.0.1', family: 4 }] });
   const clientPort = await listen(createClient({ host: '127.0.0.1', port: stalledPort,
-    servername: 'localhost', token, ca: cert,
+    servername: 'localhost', token, ca: cert, connectTimeout: 1000,
     fallbacks: [{ host: '127.0.0.1', port: backupPort, servername: 'localhost', token: backupToken }] }), t);
   const started = performance.now();
   const { socket, code } = await socks(t, clientPort, 'remote.example', targetPort);

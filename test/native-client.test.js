@@ -44,7 +44,7 @@ test('native Windows client fails over after a second with independent credentia
       }).catch(() => {});
     }));
     const partialPort = await listen(partial);
-    // Exercise the production one-second budget for both stalled phases. A
+    // Exercise a configured one-second budget for both stalled phases. A
     // 200 ms backup handshake also measured Windows runner scheduling delays.
     for (const [primaryPort, timeout] of [[blackholePort, 1000], [partialPort, 1000]]) {
       const localPort = await freePort();
@@ -52,7 +52,7 @@ test('native Windows client fails over after a second with independent credentia
         '--fallback-server', 'localhost', '--fallback-port', String(backupPort),
         '--fallback-token-file', backupTokenPath, '--port', String(localPort),
         '--token-file', tokenPath, '--ca', certPath];
-      if (timeout !== 1000) args.push('--connect-timeout-ms', String(timeout));
+      args.push('--connect-timeout-ms', String(timeout));
       child = spawn(executable, args, { stdio: 'ignore', windowsHide: true });
       await awaitClient(localPort, child);
       const socket = protect(net.connect({ host: '127.0.0.1', port: localPort }), 5000);
