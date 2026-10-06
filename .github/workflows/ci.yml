@@ -60,3 +60,21 @@ jobs:
         with:
           name: etl-windows-portable
           path: dist/windows-portable/
+      - name: Build the per-user installer
+        shell: pwsh
+        run: ./native/windows/installer/build.ps1
+      - name: Check install, repair and uninstall
+        shell: pwsh
+        run: |
+          $etlSetup = Get-ChildItem dist/windows-installer/ETL-Setup-*-x64.exe | Select-Object -First 1
+          ./native/windows/installer/smoke-test.ps1 -InstallerPath $etlSetup.FullName
+      - uses: actions/upload-artifact@v7
+        with:
+          name: etl-windows-installer
+          path: dist/windows-installer/
+      - name: Save installer test logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: etl-installer-checks
+          path: build/installer-smoke/

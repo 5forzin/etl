@@ -1,5 +1,10 @@
 # ETL
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/brand/etl-logo-white.svg">
+  <img src="assets/brand/etl-logo-black.svg" alt="ETL" width="150">
+</picture>
+
 ETL forwards TCP traffic through a server you control. A local SOCKS5 or HTTP
 proxy opens a TLS 1.3 connection, authenticates with a token, and asks the server
 to connect to the destination. Destination DNS runs on that server.
@@ -15,11 +20,14 @@ are skipped and checked again every 30 seconds.
 
 ## Connect
 
-Windows: build the client using the [Windows guide](native/windows/README.md),
-or check [releases](https://github.com/5forzin/etl/releases) for published builds.
+Windows: download `ETL-Setup-VERSION-x64.exe` from
+[releases](https://github.com/5forzin/etl/releases) and run it. The installer adds
+ETL to the Start menu, offers a Desktop shortcut and installs for the current
+user. Updates and uninstall preserve saved tokens and settings.
+
+For a portable copy, download `etl-client.exe` instead. Both builds include the
+same client. See the [Windows guide](native/windows/README.md) to build either.
 Enter your server and token, set the remote port under Options, then click the power button.
-The new ImGui build is available only after it has been built or released from
-this revision; older downloads may still use the previous interface.
 
 With Node.js 24 or later:
 

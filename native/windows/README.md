@@ -6,6 +6,17 @@ forwards TCP through the same ETL v1 server as the Node client.
 
 ## Use
 
+Download `ETL-Setup-VERSION-x64.exe` from [releases](https://github.com/5forzin/etl/releases).
+It installs under `%LOCALAPPDATA%\Programs\ETL` for the current Windows user,
+adds a Start menu shortcut and offers a Desktop shortcut. No administrator
+account is required. The installer follows the Windows light or dark appearance.
+It can also update an existing copy in that folder. Exit ETL from the tray before
+updating or uninstalling it. Saved settings and DPAPI tokens remain in
+`%APPDATA%\ETL` after uninstall. Remove that folder yourself if you want to reset
+the profile.
+
+The portable `etl-client.exe` remains available as a separate download.
+
 Run `etl-client.exe`, enter the server and token, then click the power button.
 The borderless window is 360 pixels wide, with a draggable header and custom
 minimize and close controls. Options expands ports, backup, timeout and CA below
@@ -85,7 +96,7 @@ If another copy is running, package to a separate folder:
 ~~~powershell
 $env:ETL_NATIVE_CLIENT = (Resolve-Path dist/windows-portable/etl-client.exe).Path
 $env:ETL_OPENSSL = 'C:\Program Files\Git\usr\bin\openssl.exe'
-node --test test/native-client.test.js
+node --test test/native-client.test.js test/fallback.test.js
 ~~~
 
 The suite checks DPAPI, SOCKS/HTTP relaying, failover, certificate rejection,
@@ -105,3 +116,35 @@ Headless mode takes `--server`, `--server-port`, `--port`, `--token-file`,
 default 30000). Headless mode never renders the desktop.
 
 See the [design notes and Figma sketch](../../docs/desktop-design.md).
+
+## Build the installer
+
+Build and package the portable client first. With [Inno Setup](https://jrsoftware.org/isdl.php)
+6.7 or later installed:
+
+~~~powershell
+./native/windows/installer/build.ps1
+~~~
+
+Pass `-CompilerPath PATH` if `ISCC.exe` is outside the usual installation folders.
+`-PackageDirectory` selects a portable package; `-OutputDirectory` defaults to
+`dist/windows-installer`. Paths are resolved from the repository root. The script
+checks the executable version and package checksum before compiling.
+
+The installer is offline and contains only the client, dependency licenses and
+the executable checksum. It includes no user settings or credentials, creates no
+service and changes no system proxy. Windows Settings lists its per-user uninstall
+entry. Silent deployment uses:
+
+~~~powershell
+./ETL-Setup-VERSION-x64.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+~~~
+
+Silent installs do not launch ETL. `/TASKS="desktopicon"` selects the Desktop
+shortcut; `/TASKS=""` omits it. The same App ID is used for upgrades and repairs.
+
+CI builds the installer with the runner's Inno Setup compiler. It tests install,
+repair, shortcuts, rendering, uninstall registration and profile preservation on
+a disposable Windows runner. The installer and portable package are unsigned.
+
+Logo sources and exports live in [assets/brand](../../assets/brand/README.md).

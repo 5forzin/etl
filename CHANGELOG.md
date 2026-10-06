@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.0 (2026-10-06)
+
+- Add a per-user Windows installer with Start menu and Desktop shortcuts, repair
+  and uninstall. Saved settings and tokens survive updates and uninstall.
+- Add a monochrome SVG logo, PNG exports and application icons from 16 to 256
+  pixels. Use the symbol in the desktop header, executable and tray.
+- Follow the Windows light or dark appearance in the installer.
+- Add executable version metadata and handle Windows session-end messages so
+  Restart Manager can close the desktop during an update.
+- Build and test the installer on Windows CI, including profile preservation.
+
 ## 0.2.1 (2026-10-05)
 
 - Use a backup only after a background check verifies its TLS certificate and
