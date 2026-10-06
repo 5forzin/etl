@@ -1,3 +1,7 @@
+#if VER < EncodeVer(6, 7, 0)
+  #error Inno Setup 6.7 or later is required
+#endif
+
 #ifndef AppVersion
   #error AppVersion is required; use build.ps1
 #endif

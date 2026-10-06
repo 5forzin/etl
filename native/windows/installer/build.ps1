@@ -38,13 +38,7 @@ if (-not $CompilerPath) {
 if (-not $CompilerPath -or -not (Test-Path -LiteralPath $CompilerPath)) {
   throw 'Inno Setup 6.7 or later is required. Pass -CompilerPath to its ISCC.exe.'
 }
-# ISCC's launcher file version does not identify the loaded compiler version.
-$etlCompilerBanner = (& $CompilerPath '/?' 2>&1 | Out-String)
-$etlVersionMatch = [regex]::Match($etlCompilerBanner, '\b\d+\.\d+\.\d+(?:\.\d+)?\b')
-if (-not $etlVersionMatch.Success -or [version]$etlVersionMatch.Value -lt [version]'6.7.0') {
-  throw 'Inno Setup 6.7 or later is required'
-}
-Write-Output "Using Inno Setup $($etlVersionMatch.Value)"
+# The script checks ISPP's compiler version; ISCC's launcher reports 0.0.0.0.
 New-Item -ItemType Directory -Path $etlOutput -Force | Out-Null
 & $CompilerPath '/Qp' "/DAppVersion=$etlVersion" "/DPackageDir=$etlPackage" "/DBrandDir=$(Join-Path $etlRoot 'assets/brand')" "/DOutputPath=$etlOutput" (Join-Path $PSScriptRoot 'etl.iss')
 if ($LASTEXITCODE -ne 0) { throw "Installer compiler failed: $LASTEXITCODE" }
