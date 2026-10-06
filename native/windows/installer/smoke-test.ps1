@@ -31,6 +31,7 @@ Install-EtlPackage 'install.log'
 $etlVersion = (Get-Content -LiteralPath (Join-Path $etlRoot 'package.json') -Raw | ConvertFrom-Json).version
 $etlInstalledExe = Join-Path $etlInstallDirectory 'etl-client.exe'
 if ((Get-Item -LiteralPath $etlInstalledExe).VersionInfo.ProductVersion -ne $etlVersion) { throw 'Installed executable version mismatch' }
+$etlInstalledHash = (Get-FileHash -LiteralPath $etlInstalledExe -Algorithm SHA256).Hash
 $etlInstalledInfo = Get-ItemProperty -LiteralPath $etlUninstallKey
 if ($etlInstalledInfo.DisplayVersion -ne $etlVersion -or $etlInstalledInfo.InstallLocation.TrimEnd('\') -ne $etlInstallDirectory) {
   throw 'Per-user uninstall registration is incorrect'
@@ -40,9 +41,18 @@ foreach ($etlShortcutPath in @($etlDesktopShortcut,$etlMenuShortcut)) {
   if (-not (Test-Path -LiteralPath $etlShortcutPath)) { throw "Missing shortcut: $etlShortcutPath" }
   if ($etlShell.CreateShortcut($etlShortcutPath).TargetPath -ne $etlInstalledExe) { throw 'Shortcut target mismatch' }
 }
-& $etlInstalledExe '--self-test-ui' (Join-Path $etlTestRoot 'installed-preview.bmp')
-if ($LASTEXITCODE -ne 0) { throw 'Installed client did not render' }
+$etlPreviewPath = Join-Path $etlTestRoot 'installed-preview.bmp'
+$etlPreviewProcess = Start-Process -FilePath $etlInstalledExe -ArgumentList @(
+  '--self-test-ui', ('"'+$etlPreviewPath+'"')
+) -WindowStyle Hidden -PassThru -Wait
+if ($etlPreviewProcess.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $etlPreviewPath)) {
+  throw "Installed client did not render: $($etlPreviewProcess.ExitCode)"
+}
+[IO.File]::WriteAllText($etlInstalledExe, 'repair-sentinel')
 Install-EtlPackage 'repair.log'
+if ((Get-FileHash -LiteralPath $etlInstalledExe -Algorithm SHA256).Hash -ne $etlInstalledHash) {
+  throw 'Repair did not restore the executable'
+}
 if (@(Get-ChildItem -LiteralPath $etlInstallDirectory -Filter 'unins*.exe').Count -ne 1) { throw 'Repair duplicated the uninstaller' }
 $etlUninstallerPath = Join-Path $etlInstallDirectory 'unins000.exe'
 $etlUninstaller = Start-Process -FilePath $etlUninstallerPath -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',
