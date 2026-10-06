@@ -297,7 +297,9 @@ test('native client expires incomplete negotiations and idle relays',
     socket.write(Buffer.concat([Buffer.from([5,1,0,3,host.length]),host,Buffer.from([targetPort >> 8, targetPort & 255])]));
     assert.equal((await read(socket, 10))[1], 0);
     socket.write('idle-test'); assert.equal((await read(socket, 9)).toString(), 'idle-test');
+    const idleStarted = performance.now();
     const idleClose = new Promise(resolve => socket.once('close', resolve)); socket.resume(); await idleClose;
+    assert.ok(performance.now() - idleStarted < 1500, 'idle relay outlived its deadline');
     assert.equal(socket.destroyed, true);
   } finally {
     child?.kill(); if (server) await server.shutdown(); if (destination) await destination.shutdown();
