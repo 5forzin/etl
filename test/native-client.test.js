@@ -283,7 +283,9 @@ test('native client expires incomplete negotiations and idle relays',
     await awaitClient(localPort, child);
     const incomplete = net.connect({ host: '127.0.0.1', port: localPort });
     await connected(incomplete); incomplete.on('error', () => {}); incomplete.resume();
-    const closed = once(incomplete, 'close');
+    // Windows may reset an expired stream with unread bytes. Wait for the
+    // close itself; events.once would reject on that expected socket error.
+    const closed = new Promise(resolve => incomplete.once('close', resolve));
     const started = performance.now(); incomplete.write('CONNECT ');
     const drip = setInterval(() => incomplete.write('x'), 100);
     try { await closed; } finally { clearInterval(drip); incomplete.destroy(); }
@@ -295,7 +297,7 @@ test('native client expires incomplete negotiations and idle relays',
     socket.write(Buffer.concat([Buffer.from([5,1,0,3,host.length]),host,Buffer.from([targetPort >> 8, targetPort & 255])]));
     assert.equal((await read(socket, 10))[1], 0);
     socket.write('idle-test'); assert.equal((await read(socket, 9)).toString(), 'idle-test');
-    const idleClose = once(socket, 'close'); socket.resume(); await idleClose;
+    const idleClose = new Promise(resolve => socket.once('close', resolve)); socket.resume(); await idleClose;
     assert.equal(socket.destroyed, true);
   } finally {
     child?.kill(); if (server) await server.shutdown(); if (destination) await destination.shutdown();
