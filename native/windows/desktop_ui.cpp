@@ -21,6 +21,23 @@ void centerText(const char* value) {
   ImGui::TextUnformatted(value);
 }
 
+void drawBrand(ImDrawList* draw, ImVec2 origin, float size, ImU32 color) {
+  const float scale = size / 64.f;
+  auto point = [&](float x, float y) { return ImVec2{origin.x + x * scale, origin.y + y * scale}; };
+  const float stroke = 8 * scale;
+  draw->AddLine(point(40, 12), point(22, 12), color, stroke);
+  draw->PathArcTo(point(22, 22), 10 * scale, 3.14159265f, 4.71238898f, 12);
+  draw->PathStroke(color, 0, stroke);
+  draw->AddLine(point(12, 22), point(12, 40), color, stroke);
+  draw->AddLine(point(24, 52), point(42, 52), color, stroke);
+  draw->PathArcTo(point(42, 42), 10 * scale, 0, 1.57079633f, 12);
+  draw->PathStroke(color, 0, stroke);
+  draw->AddLine(point(52, 42), point(52, 24), color, stroke);
+  draw->AddLine(point(24, 32), point(40, 32), color, stroke);
+  for (const ImVec2 endpoint : {point(40, 12), point(12, 40), point(24, 52), point(52, 24), point(24, 32), point(40, 32)})
+    draw->AddCircleFilled(endpoint, stroke / 2, color, 12);
+}
+
 void input(const char* label, const char* hint, char* value, size_t size, bool secret = false) {
   ImGui::PushID(label);
   ImGui::TextColored(muted, "%s", label);
@@ -184,6 +201,9 @@ bool DesktopUi::render(DesktopForm& form, const DesktopState& state, float previ
     }
     return clicked;
   };
+  const auto brandOrigin = ImGui::GetCursorScreenPos();
+  drawBrand(ImGui::GetWindowDrawList(), {brandOrigin.x, brandOrigin.y + 2}, 24, ImGui::GetColorU32(ImGuiCol_Text));
+  ImGui::Dummy({24, 28}); ImGui::SameLine(0, 7);
   ImGui::PushFont(brand); ImGui::TextUnformatted("etl"); ImGui::PopFont();
   ImGui::SameLine(); ImGui::SetCursorPosX(ImGui::GetWindowWidth() - 82);
   if (chromeButton("##minimize", 0)) ShowWindow(window_, SW_MINIMIZE);

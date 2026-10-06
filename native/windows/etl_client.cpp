@@ -22,6 +22,7 @@
 #include <vector>
 #include <algorithm>
 #include "desktop_ui.h"
+#include "resources.h"
 #include <windowsx.h>
 #include <dwmapi.h>
 
@@ -952,7 +953,8 @@ static LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wparam, LPA
     case WM_CREATE:
       tray.cbSize = sizeof(tray); tray.hWnd = window; tray.uID = 1;
       tray.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP; tray.uCallbackMessage = WM_TRAY;
-      tray.hIcon = LoadIconW(nullptr, IDI_INFORMATION);
+      tray.hIcon = static_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_ETL),
+        IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_SHARED));
       wcscpy_s(tray.szTip, L"ETL - off");
       Shell_NotifyIconW(NIM_ADD, &tray);
       SetTimer(window, 1, 1000, nullptr); return 0;
@@ -996,6 +998,10 @@ static LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wparam, LPA
       }
       return 0;
     case WM_CLOSE: ShowWindow(window, SW_HIDE); return 0;
+    case WM_QUERYENDSESSION: return TRUE;
+    case WM_ENDSESSION:
+      if (wparam) beginStop(window, true);
+      return 0;
     case WM_DESTROY:
       KillTimer(window, 1); Shell_NotifyIconW(NIM_DELETE, &tray); PostQuitMessage(0); return 0;
   }
@@ -1053,6 +1059,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   config = previewPath.empty() ? loadConfig() : Config{};
   loadForm();
   WNDCLASSW wc{}; wc.lpfnWndProc = windowProc; wc.hInstance = instance;
+  wc.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_ETL));
   wc.lpszClassName = L"ETLNativeClient"; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
   RegisterClassW(&wc);
   HWND window = CreateWindowExW(WS_EX_APPWINDOW, wc.lpszClassName, L"ETL", WS_POPUP | WS_MINIMIZEBOX | WS_SYSMENU,

@@ -1,0 +1,30 @@
+#include <windows.h>
+#include "resources.h"
+
+IDI_ETL ICON "@ETL_ICON_PATH@"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION @ETL_RESOURCE_VERSION@
+ PRODUCTVERSION @ETL_RESOURCE_VERSION@
+ FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+ FILEFLAGS 0
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904b0"
+    BEGIN
+      VALUE "FileDescription", "ETL Windows client"
+      VALUE "FileVersion", "@ETL_VERSION@"
+      VALUE "InternalName", "etl-client"
+      VALUE "OriginalFilename", "etl-client.exe"
+      VALUE "ProductName", "ETL"
+      VALUE "ProductVersion", "@ETL_VERSION@"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END
