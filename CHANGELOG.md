@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.4.0 (2026-10-14)
+
+- Check for stable GitHub Releases at startup and once an hour in the Windows
+  client. Offer Update and Later in the existing interface, with download progress,
+  retry on failure and a manual check under Options.
+- Verify the download size and SHA-256 digest over HTTPS before stopping the
+  proxy, updating and restarting. Support both per-user installations and portable
+  copies while preserving saved settings and DPAPI tokens.
+- Notify hidden or minimized clients through the tray. Dismissing a version
+  suppresses its prompt for the current session.
+- Test release selection, version ordering, integrity, portable replacement and
+  installer handoff. Cover update confirmation, progress and errors in UI previews.
+
+Install this release manually to enable future updates. The server protocol
+remains ETL v1; no server upgrade is required.
+
 ## 0.3.0 (2026-10-06)
 
 - Add a per-user Windows installer with Start menu and Desktop shortcuts, repair

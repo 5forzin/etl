@@ -13,7 +13,7 @@ $etlPackage = Resolve-EtlBuildPath $PackageDirectory
 $etlOutput = Resolve-EtlBuildPath $OutputDirectory
 $etlVersion = (Get-Content -LiteralPath (Join-Path $etlRoot 'package.json') -Raw | ConvertFrom-Json).version
 if ($etlVersion -notmatch '^\d+\.\d+\.\d+$') { throw 'Installer builds require a numeric three-part version' }
-foreach ($etlFile in @('etl-client.exe','SHA256SUMS','LICENSE-ImGui.txt','LICENSE-Inter.txt','LICENSE-OpenSSL.txt')) {
+foreach ($etlFile in @('etl-client.exe','SHA256SUMS','LICENSE-ImGui.txt','LICENSE-Inter.txt','LICENSE-OpenSSL.txt','LICENSE-JSON.txt')) {
   if (-not (Test-Path -LiteralPath (Join-Path $etlPackage $etlFile) -PathType Leaf)) { throw "Missing package file: $etlFile" }
 }
 $etlExecutable = Join-Path $etlPackage 'etl-client.exe'

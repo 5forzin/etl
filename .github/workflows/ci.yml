@@ -51,6 +51,7 @@ jobs:
         run: |
           cmake -S native/windows -B build/windows-portable -G Ninja -DCMAKE_BUILD_TYPE=Release -DETL_PORTABLE=ON
           cmake --build build/windows-portable
+          ctest --test-dir build/windows-portable --output-on-failure
           pwsh -NoProfile -File native/windows/package.ps1 -Portable -RuntimeBin "$(cygpath -w /ucrt64/bin)"
           export ETL_NATIVE_CLIENT="$(cygpath -w "$PWD/dist/windows-portable/etl-client.exe")"
           export ETL_OPENSSL="$(cygpath -w /ucrt64/bin/openssl.exe)"

@@ -22,7 +22,8 @@ if ($Portable) {
   } else {
     $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
     if (-not (Test-Path -LiteralPath $vswhere)) { throw 'No objdump or Visual Studio dependency inspector' }
-    $vs = & $vswhere -latest -property installationPath
+    $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+    if (-not $vs) { throw 'No Visual Studio C++ toolchain found' }
     $compiler = Get-ChildItem -LiteralPath (Join-Path $vs 'VC/Tools/MSVC') -Directory | Sort-Object Name -Descending | Select-Object -First 1
     $dumpbin = Join-Path $compiler.FullName 'bin/Hostx64/x64/dumpbin.exe'
     $imports = & $dumpbin /DEPENDENTS $exe | Where-Object { $_ -match '^\s+\S+\.dll\s*$' }
@@ -41,7 +42,7 @@ if ($Portable) {
     Copy-Item -LiteralPath $source -Destination $output
   }
 }
-foreach ($license in @('LICENSE-ImGui.txt', 'LICENSE-Inter.txt')) {
+foreach ($license in @('LICENSE-ImGui.txt', 'LICENSE-Inter.txt', 'LICENSE-JSON.txt')) {
   Copy-Item -LiteralPath (Join-Path (Split-Path $built) $license) -Destination $output -Force
 }
 Get-ChildItem -LiteralPath $output | Select-Object Name, Length

@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdint>
 #include <string>
+#include "updater.h"
 
 struct DesktopForm {
   std::array<char, 256> server{}, backup{};
@@ -18,12 +19,15 @@ struct DesktopState {
   int sessions = 0;
   uint64_t sent = 0, received = 0, failures = 0;
   std::string error;
+  UpdateState update;
 };
+
+enum class DesktopAction { None, ToggleProxy, CheckUpdates, InstallUpdate, DismissUpdate };
 
 class DesktopUi {
  public:
   bool initialize(HWND window);
-  bool render(DesktopForm& form, const DesktopState& state, float previewStep = 0);
+  DesktopAction render(DesktopForm& form, const DesktopState& state, float previewStep = 0);
   void resize(unsigned width, unsigned height);
   void shutdown();
   bool capture(const std::wstring& path);

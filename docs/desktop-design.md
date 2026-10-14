@@ -22,6 +22,12 @@ Closing the window keeps the
 proxy in the tray; Exit closes its connections. “Proxy active” means the local
 listener is open. The remote connection is verified when an application uses it.
 
+An available update expands an inline confirmation above Options. It uses the
+same Inter font, mint action color and secondary button treatment as the rest of
+the interface. Later dismisses the offer for the session; Update downloads it,
+shows progress and restarts the client. Wrapped update errors keep Retry and Later
+visible. Options includes the current version and a manual update check.
+
 The renderer uses Dear ImGui and DirectX 11. Inter ships inside the executable
 under SIL OFL. Colors: background `#141716`, inputs `#1e2220`, border `#343b37`,
 text `#eef1ef`, secondary text `#a1aaa4` and action `#b8ecd0`. State transitions

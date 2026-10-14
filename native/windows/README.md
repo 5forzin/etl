@@ -17,6 +17,25 @@ the profile.
 
 The portable `etl-client.exe` remains available as a separate download.
 
+ETL checks the latest stable GitHub Release at startup and once an hour while
+running. When a newer version is available, choose Update or Later in the app.
+Later dismisses that version for the current session. Options includes a manual
+Check for updates action. A minimized or hidden client also shows a tray notification.
+
+Updates download over verified HTTPS and must match the asset's GitHub SHA-256
+digest and size before installation. ETL stops its proxy and restarts after the
+download; active connections close. Installed copies run the per-user installer
+in their existing folder. Portable copies replace only their executable, with
+rollback if the copy fails. Saved settings and DPAPI tokens remain in `%APPDATA%\ETL`.
+Network failures leave the current client usable and can be retried.
+
+To publish an update, increase `package.json`'s version, build the portable client
+and installer, and attach `etl-client.exe` and `ETL-Setup-VERSION-x64.exe` to a
+published stable Release tagged `vVERSION` (or `VERSION`) and marked as Latest.
+GitHub supplies the asset digests on upload. Drafts, prereleases, older versions
+and assets without a valid digest are not installed. The first release containing
+this updater must be installed manually by users of earlier versions.
+
 Run `etl-client.exe`, enter the server and token, then click the power button.
 The borderless window is 360 pixels wide, with a draggable header and custom
 minimize and close controls. Options expands ports, backup, timeout and CA below
@@ -107,6 +126,12 @@ it neither loads a user profile nor opens a proxy. CI also saves this preview.
 captures expanded Options. `--self-test-ui-error OUTPUT.bmp` captures a wrapped
 error. Preview modes use a fixed animation step and check that the native caption
 is absent and header dragging leaves window controls clickable.
+
+`--self-test-ui-update`, `--self-test-ui-downloading` and
+`--self-test-ui-update-error` capture the update confirmation, progress and retry
+states. Pass an output BMP path to each. These previews do not contact GitHub.
+`ctest --test-dir build/windows-portable -C Release --output-on-failure` checks
+release parsing, version ordering, checksums and portable rollback.
 
 Headless mode takes `--server`, `--server-port`, `--port`, `--token-file`,
 `--ca`, `--fallback-server`, `--fallback-port`, `--fallback-token-file` and

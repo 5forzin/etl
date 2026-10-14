@@ -3,6 +3,7 @@
 #include "backends/imgui_impl_dx11.h"
 #include "backends/imgui_impl_win32.h"
 #include "etl_font.h"
+#include "etl_version.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -167,13 +168,13 @@ void DesktopUi::animateHeight(float target, float delta) {
     SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER);
 }
 
-bool DesktopUi::render(DesktopForm& form, const DesktopState& state, float previewStep) {
+DesktopAction DesktopUi::render(DesktopForm& form, const DesktopState& state, float previewStep) {
   if (!initialized_ || !target_) {
     shutdown();
-    if (!initialize(window_)) { Sleep(100); return false; }
+    if (!initialize(window_)) { Sleep(100); return DesktopAction::None; }
   }
   animateHeight(contentHeight_, previewStep > 0 ? previewStep : ImGui::GetIO().DeltaTime);
-  if (!target_) return false;
+  if (!target_) return DesktopAction::None;
   ImGui_ImplDX11_NewFrame();
   ImGui_ImplWin32_NewFrame();
   // Hidden previews advance motion deterministically without sleeping.
@@ -210,12 +211,12 @@ bool DesktopUi::render(DesktopForm& form, const DesktopState& state, float previ
   ImGui::SameLine(0, 6);
   if (chromeButton("##close", 1)) PostMessageW(window_, WM_CLOSE, 0, 0);
   ImGui::Dummy({0, 4});
-  bool toggle = false;
+  DesktopAction action = DesktopAction::None;
   const float width = ImGui::GetContentRegionAvail().x;
   ImGui::SetCursorPosX((ImGui::GetWindowWidth() - 72) / 2);
   const ImVec2 start = ImGui::GetCursorScreenPos();
   ImGui::BeginDisabled(state.stopping);
-  toggle = ImGui::InvisibleButton("##power", {72, 72});
+  if (ImGui::InvisibleButton("##power", {72, 72})) action = DesktopAction::ToggleProxy;
   ImGui::EndDisabled();
   ImVec2 c{start.x + 36, start.y + 36};
   auto* draw = ImGui::GetWindowDrawList();
@@ -254,6 +255,46 @@ bool DesktopUi::render(DesktopForm& form, const DesktopState& state, float previ
   }
   if (state.failures) ImGui::TextColored(muted, "%llu %s", static_cast<unsigned long long>(state.failures),
     state.failures == 1 ? "failure" : "failures");
+  const auto& update = state.update;
+  const bool downloading = update.phase == UpdatePhase::Downloading || update.phase == UpdatePhase::Ready;
+  if (update.offered) {
+    ImGui::Dummy({0, 4});
+    ImGui::Separator();
+    ImGui::Dummy({0, 4});
+    ImGui::TextColored(accent, "%s", downloading ? "Updating ETL" : "Update available");
+    ImGui::TextColored(muted, "%s → %s", etlVersion, update.version.c_str());
+    if (downloading) {
+      ImGui::PushStyleColor(ImGuiCol_PlotHistogram, accent);
+      ImGui::PushStyleColor(ImGuiCol_FrameBg, surface);
+      char progress[32];
+      std::snprintf(progress, sizeof(progress), "%d%%", static_cast<int>(update.progress * 100));
+      ImGui::ProgressBar(update.progress, {-1, 8}, "");
+      ImGui::PopStyleColor(2);
+      ImGui::TextColored(muted, "%s", update.phase == UpdatePhase::Ready ? "Restarting…" : progress);
+    } else {
+      ImGui::PushStyleColor(ImGuiCol_Text, muted);
+      ImGui::TextWrapped("%s", state.running ? "ETL will restart and close active connections." : "ETL will restart after updating.");
+      ImGui::PopStyleColor();
+      if (!update.error.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{1, .65f, .60f, 1});
+        ImGui::TextWrapped("%s", update.error.c_str());
+        ImGui::PopStyleColor();
+      }
+      ImGui::BeginDisabled(state.stopping);
+      const float buttonWidth = (width - ImGui::GetStyle().ItemSpacing.x) / 2;
+      if (ImGui::Button("Later", {buttonWidth, 34})) action = DesktopAction::DismissUpdate;
+      ImGui::SameLine();
+      ImGui::PushStyleColor(ImGuiCol_Button, accent);
+      ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4{.80f, .97f, .88f, 1});
+      ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4{.64f, .84f, .73f, 1});
+      ImGui::PushStyleColor(ImGuiCol_Text, background);
+      if (ImGui::Button(update.phase == UpdatePhase::Failed ? "Retry" : "Update", {buttonWidth, 34}))
+        action = DesktopAction::InstallUpdate;
+      ImGui::PopStyleColor(4);
+      ImGui::EndDisabled();
+    }
+    ImGui::Dummy({0, 4});
+  }
   ImGui::PushStyleColor(ImGuiCol_Button, ImVec4{0, 0, 0, 0});
   ImGui::PushStyleColor(ImGuiCol_Text, muted);
   ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0);
@@ -284,8 +325,22 @@ bool DesktopUi::render(DesktopForm& form, const DesktopState& state, float previ
     ImGui::SetNextItemWidth(110); ImGui::InputInt("Backup port", &form.backupPort, 0);
     input("Backup token", form.savedBackupToken ? "Saved" : "Primary token", form.backupToken.data(), form.backupToken.size(), true);
     input("CA", "", form.ca.data(), form.ca.size());
-    if (options_) contentBottom = ImGui::GetItemRectMax().y;
     ImGui::EndDisabled();
+    ImGui::Dummy({0, 6});
+    ImGui::Separator();
+    ImGui::TextColored(muted, "ETL %s", etlVersion);
+    const bool busy = update.phase == UpdatePhase::Checking || downloading;
+    ImGui::BeginDisabled(busy || state.stopping || !options_);
+    if (ImGui::Button(update.phase == UpdatePhase::Checking ? "Checking…" : "Check for updates", {-1, 32}))
+      action = DesktopAction::CheckUpdates;
+    ImGui::EndDisabled();
+    if (update.phase == UpdatePhase::Current) ImGui::TextColored(muted, "You're up to date.");
+    if (!update.offered && !update.error.empty()) {
+      ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{1, .65f, .60f, 1});
+      ImGui::TextWrapped("%s", update.error.c_str());
+      ImGui::PopStyleColor();
+    }
+    if (options_) contentBottom = ImGui::GetItemRectMax().y;
     ImGui::PopStyleVar();
   }
   contentHeight_ = contentBottom - ImGui::GetWindowPos().y + ImGui::GetStyle().WindowPadding.y;
@@ -302,7 +357,7 @@ bool DesktopUi::render(DesktopForm& form, const DesktopState& state, float previ
     shutdown();
     initialize(window_);
   } else if (result == DXGI_STATUS_OCCLUDED && previewStep <= 0) Sleep(100);
-  return toggle;
+  return action;
 }
 
 void DesktopUi::shutdown() {

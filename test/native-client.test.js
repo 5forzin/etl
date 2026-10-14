@@ -313,10 +313,11 @@ test('native client rejects a trailing headless option',
 });
 
 test('native desktop renders compact frames and animates expansion and collapse without starting a proxy',
-  { skip: !executable || process.platform !== 'win32', timeout: 10000 }, () => {
+  { skip: !executable || process.platform !== 'win32', timeout: 20000 }, () => {
   const dir = mkdtempSync(join(tmpdir(), 'etl-ui-'));
   try {
-    const heights = ['--self-test-ui', '--self-test-ui-options', '--self-test-ui-error'].map((flag, index) => {
+    const heights = ['--self-test-ui', '--self-test-ui-options', '--self-test-ui-error',
+      '--self-test-ui-update', '--self-test-ui-downloading', '--self-test-ui-update-error'].map((flag, index) => {
       const path = join(dir, `preview-${index}.bmp`);
       execFileSync(executable, [flag, path], { windowsHide: true, timeout: 8000 });
       const bitmap = readFileSync(path);
@@ -328,5 +329,8 @@ test('native desktop renders compact frames and animates expansion and collapse 
     assert.ok(heights[0] >= 350 && heights[0] <= 400, 'collapsed desktop should remain compact');
     assert.ok(heights[1] > heights[0] + 250, 'Options should expand the native window');
     assert.ok(heights[2] > heights[0], 'wrapped errors should expand the native window');
+    assert.ok(heights[3] > heights[0], 'update confirmation should expand the native window');
+    assert.ok(heights[4] > heights[0], 'download progress should fit in the native window');
+    assert.ok(heights[5] > heights[3], 'update errors should wrap without clipping the actions');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

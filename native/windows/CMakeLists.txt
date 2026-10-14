@@ -2,12 +2,16 @@ cmake_minimum_required(VERSION 3.20)
 project(etl_windows_client LANGUAGES CXX)
 enable_language(RC)
 include(FetchContent)
+if(POLICY CMP0135)
+  cmake_policy(SET CMP0135 NEW)
+endif()
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/../../package.json" ETL_PACKAGE)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../../package.json")
 string(JSON ETL_VERSION GET "${ETL_PACKAGE}" version)
 string(REPLACE "." "," ETL_RESOURCE_VERSION "${ETL_VERSION}.0")
 get_filename_component(ETL_ICON_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../assets/brand/etl.ico" ABSOLUTE)
 configure_file(etl-client.rc.in "${CMAKE_CURRENT_BINARY_DIR}/etl-client.rc" @ONLY)
+configure_file(etl_version.h.in "${CMAKE_CURRENT_BINARY_DIR}/etl_version.h" @ONLY)
 
 option(ETL_PORTABLE "Build a single EXE without MSYS2 runtime DLLs" OFF)
 if(ETL_PORTABLE)
@@ -23,6 +27,16 @@ FetchContent_Declare(imgui
   GIT_REPOSITORY https://github.com/ocornut/imgui.git
   GIT_TAG 6d910d5487d11ca567b61c7824b0c78c569d62f0)
 FetchContent_MakeAvailable(imgui)
+# JSON for Modern C++ 3.12.0, pinned by archive checksum.
+FetchContent_Declare(json
+  URL https://github.com/nlohmann/json/releases/download/v3.12.0/json.tar.xz
+  URL_HASH SHA256=42f6e95cad6ec532fd372391373363b62a14af6d771056dbfc86160e6dfff7aa)
+FetchContent_MakeAvailable(json)
+add_library(etl-updater STATIC updater.cpp)
+target_include_directories(etl-updater PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}")
+target_compile_features(etl-updater PUBLIC cxx_std_17)
+target_compile_definitions(etl-updater PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0602)
+target_link_libraries(etl-updater PUBLIC nlohmann_json::nlohmann_json OpenSSL::Crypto winhttp advapi32 ole32 ws2_32 crypt32)
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/assets/InterVariable.ttf" ETL_FONT_HEX HEX)
 string(REGEX REPLACE "(..)" "0x\\1," ETL_FONT_BYTES "${ETL_FONT_HEX}")
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/etl_font.h"
@@ -40,14 +54,23 @@ add_executable(etl-client WIN32 etl_client.cpp "${CMAKE_CURRENT_BINARY_DIR}/etl-
 target_include_directories(etl-client PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_features(etl-client PRIVATE cxx_std_17)
 target_compile_definitions(etl-client PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0602)
-target_link_libraries(etl-client PRIVATE etl-ui OpenSSL::SSL OpenSSL::Crypto ws2_32 crypt32 shell32 ole32)
+target_link_libraries(etl-client PRIVATE etl-ui etl-updater OpenSSL::SSL OpenSSL::Crypto ws2_32 crypt32 shell32 ole32)
 if(MSVC)
   target_compile_options(etl-client PRIVATE /utf-8 /W4)
   target_compile_options(etl-ui PRIVATE /utf-8)
+  target_compile_options(etl-updater PRIVATE /utf-8 /W4)
 endif()
 add_custom_command(TARGET etl-client POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy "${imgui_SOURCE_DIR}/LICENSE.txt" "$<TARGET_FILE_DIR:etl-client>/LICENSE-ImGui.txt"
   COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/assets/LICENSE-Inter.txt" "$<TARGET_FILE_DIR:etl-client>/LICENSE-Inter.txt")
+add_custom_command(TARGET etl-client POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy "${json_SOURCE_DIR}/LICENSE.MIT" "$<TARGET_FILE_DIR:etl-client>/LICENSE-JSON.txt")
+enable_testing()
+add_executable(etl-update-tests test_update.cpp)
+target_compile_definitions(etl-update-tests PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(etl-update-tests PRIVATE etl-updater)
+add_test(NAME updater COMMAND etl-update-tests)
+set_tests_properties(updater PROPERTIES TIMEOUT 45)
 if(MINGW)
   target_link_options(etl-client PRIVATE -municode -static-libgcc -static-libstdc++)
   if(ETL_PORTABLE)

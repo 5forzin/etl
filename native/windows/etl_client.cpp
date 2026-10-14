@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <memory>
 #include <set>
 #include <string>
 #include <thread>
@@ -877,6 +878,9 @@ static bool exitAfterStop = false;
 static DesktopUi desktop;
 static DesktopForm form;
 static std::string uiError;
+static std::unique_ptr<UpdateClient> updater;
+static bool updateLaunched = false;
+static std::string notifiedUpdate;
 
 static std::wstring wide(const char* value) {
   int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value, -1, nullptr, 0);
@@ -981,9 +985,27 @@ static LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wparam, LPA
       if (exitAfterStop) DestroyWindow(window);
       else updateStatus(window);
       return 0;
-    case WM_TIMER: updateStatus(window); return 0;
+    case WM_TIMER:
+      updateStatus(window);
+      if (updater && !updateLaunched) {
+        updater->check();
+        const auto update = updater->snapshot();
+        if (update.offered && update.phase == UpdatePhase::Available && update.version != notifiedUpdate) {
+          notifiedUpdate = update.version;
+          if (!IsWindowVisible(window) || IsIconic(window)) {
+            tray.uFlags = NIF_INFO;
+            wcscpy_s(tray.szInfoTitle, L"ETL update available");
+            const auto info = L"Version " + wide(update.version.c_str()) + L" is available. Open ETL to update.";
+            wcsncpy_s(tray.szInfo, info.c_str(), _TRUNCATE);
+            tray.dwInfoFlags = NIIF_INFO | NIIF_NOSOUND;
+            Shell_NotifyIconW(NIM_MODIFY, &tray);
+            tray.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+          }
+        }
+      }
+      return 0;
     case WM_TRAY:
-      if (LOWORD(lparam) == WM_LBUTTONDBLCLK) showWindow(window);
+      if (LOWORD(lparam) == WM_LBUTTONDBLCLK || LOWORD(lparam) == NIN_BALLOONUSERCLICK) showWindow(window);
       else if (LOWORD(lparam) == WM_RBUTTONUP) {
         POINT point; GetCursorPos(&point);
         HMENU menu = CreatePopupMenu();
@@ -1014,9 +1036,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   int argc = 0;
   LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
   if (!argv) { WSACleanup(); return 1; }
+  if (argc > 1 && std::wstring(argv[1]) == L"--apply-update") {
+    const int result = applyUpdate(argc, argv);
+    LocalFree(argv); WSACleanup(); return result;
+  }
+  if (argc == 3 && std::wstring(argv[1]) == L"--cleanup-update") cleanupUpdate(argv[2]);
   const bool previewOptions = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-options";
   const bool previewError = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-error";
-  const std::wstring previewPath = argc == 3 && (std::wstring(argv[1]) == L"--self-test-ui" || previewOptions || previewError) ? argv[2] : L"";
+  const bool previewUpdate = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-update";
+  const bool previewDownloading = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-downloading";
+  const bool previewUpdateError = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-update-error";
+  const std::wstring previewPath = argc == 3 && (std::wstring(argv[1]) == L"--self-test-ui" || previewOptions ||
+    previewError || previewUpdate || previewDownloading || previewUpdateError) ? argv[2] : L"";
   if (argc == 2 && std::wstring(argv[1]) == L"--self-test-token-storage") {
     std::string original(64, 'a'), restored;
     std::wstring protectedValue;
@@ -1100,6 +1131,17 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
       renderPreview(state);
       motion = height() > collapsed;
     }
+    if (previewUpdate || previewDownloading || previewUpdateError) {
+      DesktopState state{};
+      state.update = {UpdatePhase::Available, "0.5.0", "", 0, true};
+      if (previewDownloading) { state.update.phase = UpdatePhase::Downloading; state.update.progress = .42f; }
+      if (previewUpdateError) {
+        state.update.phase = UpdatePhase::Failed;
+        state.update.error = "The download could not be verified. Try again.";
+      }
+      renderPreview(state);
+      motion = height() > collapsed;
+    }
     POINT drag{100, 20}, control{320, 20};
     ClientToScreen(window, &drag); ClientToScreen(window, &control);
     const bool chrome = !(GetWindowLongPtrW(window, GWL_STYLE) & WS_CAPTION) &&
@@ -1109,6 +1151,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     desktop.shutdown(); DestroyWindow(window); WSACleanup(); return ok ? 0 : 24;
   }
   ShowWindow(window, SW_SHOW);
+  try { updater = std::make_unique<UpdateClient>(); updater->check(); }
+  catch (const std::exception&) { uiError = "Updates are unavailable. Restart ETL to try again."; }
   MSG message{};
   bool quit = false;
   while (!quit) {
@@ -1117,15 +1161,28 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
       TranslateMessage(&message); DispatchMessageW(&message);
     }
     if (quit) break;
+    if (updater && !updateLaunched && updater->snapshot().phase == UpdatePhase::Ready && updater->launch()) {
+      updateLaunched = true;
+      beginStop(window, true);
+      continue;
+    }
     if (!IsWindowVisible(window) || IsIconic(window)) { WaitMessage(); continue; }
     DesktopState state{service.running(), stopping, service.sessions(), service.sent(), service.received(), service.failures(), uiError};
-    if (desktop.render(form, state)) connectOrStop(window);
+    if (updater) state.update = updater->snapshot();
+    switch (desktop.render(form, state)) {
+      case DesktopAction::ToggleProxy: connectOrStop(window); break;
+      case DesktopAction::CheckUpdates: if (updater) updater->check(true); break;
+      case DesktopAction::InstallUpdate: if (updater) updater->download(); break;
+      case DesktopAction::DismissUpdate: if (updater) updater->dismiss(); break;
+      case DesktopAction::None: break;
+    }
   }
   desktop.shutdown();
   SecureZeroMemory(form.token.data(), form.token.size());
   SecureZeroMemory(form.backupToken.data(), form.backupToken.size());
   if (stopThread.joinable()) stopThread.join();
   service.stop();
+  updater.reset();
   WSACleanup();
   return 0;
 }

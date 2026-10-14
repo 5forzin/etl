@@ -80,6 +80,7 @@ Source: "{#PackageDir}\etl-client.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PackageDir}\LICENSE-ImGui.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PackageDir}\LICENSE-Inter.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PackageDir}\LICENSE-OpenSSL.txt"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PackageDir}\LICENSE-JSON.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PackageDir}\SHA256SUMS"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
