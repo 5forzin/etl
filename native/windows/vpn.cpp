@@ -32,7 +32,7 @@ static const int kComponentIds[] = {IDR_HEV_EXE, IDR_MSYS_DLL, IDR_WINTUN_DLL};
 static const wchar_t kAdapterName[] = L"ETL";
 static const wchar_t kTunAddress[] = L"198.18.0.1";
 static const wchar_t kTunDns[] = L"198.18.0.2";
-static const wchar_t kGuardTask[] = L"ETL VPNGuard";
+static const wchar_t kGuardTask[] = L"ETL-VPNGuard";
 
 static std::wstring widen(const std::string& value) {
   if (value.empty()) return {};
@@ -124,7 +124,10 @@ static bool runCommand(const std::wstring& command) {
   STARTUPINFOW startup{};
   startup.cb = sizeof(startup);
   PROCESS_INFORMATION process{};
-  const BOOL ok = CreateProcessW(nullptr, const_cast<LPWSTR>(command.c_str()),
+  // CreateProcessW may write into lpCommandLine, so it gets a private copy.
+  std::vector<wchar_t> mutableCommand(command.begin(), command.end());
+  mutableCommand.push_back(L'\0');
+  const BOOL ok = CreateProcessW(nullptr, mutableCommand.data(),
     nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process);
   if (!ok) return false;
   WaitForSingleObject(process.hProcess, 15000);
@@ -133,6 +136,18 @@ static bool runCommand(const std::wstring& command) {
   CloseHandle(process.hThread);
   CloseHandle(process.hProcess);
   return code == 0;
+}
+
+// Startup checkpoint log: the VPN path runs elevated and windowless, so a
+// crash leaves nothing behind unless each step writes here first.
+static void checkpoint(const char* step) {
+  std::ofstream out(runtimeDirectory() / L"error.log", std::ios::app);
+  if (out) out << step << "\n";
+}
+
+static void checkpoint(const char* step, const std::string& detail) {
+  std::ofstream out(runtimeDirectory() / L"error.log", std::ios::app);
+  if (out) out << step << ": " << detail << "\n";
 }
 
 static bool writeConfig(const std::filesystem::path& path, int localPort) {
@@ -163,14 +178,16 @@ static DWORD waitForAdapter(const std::wstring& name, int seconds) {
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
   while (std::chrono::steady_clock::now() < deadline) {
     ULONG size = 0;
-    if (GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_ALL_INTERFACES, nullptr,
-        nullptr, &size) != ERROR_BUFFER_OVERFLOW || !size) continue;
-    std::vector<unsigned char> buffer(size);
-    PIP_ADAPTER_ADDRESSES adapters = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data());
-    if (GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_ALL_INTERFACES, nullptr,
-        adapters, &size) != NO_ERROR) continue;
-    for (auto adapter = adapters; adapter; adapter = adapter->Next) {
-      if (adapter->FriendlyName && name == adapter->FriendlyName) return adapter->IfIndex;
+    const ULONG flags = GAA_FLAG_INCLUDE_ALL_INTERFACES;
+    if (GetAdaptersAddresses(AF_INET, flags, nullptr, nullptr, &size) ==
+          ERROR_BUFFER_OVERFLOW && size) {
+      std::vector<unsigned char> buffer(size);
+      PIP_ADAPTER_ADDRESSES adapters = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data());
+      if (GetAdaptersAddresses(AF_INET, flags, nullptr, adapters, &size) == NO_ERROR) {
+        for (auto adapter = adapters; adapter; adapter = adapter->Next) {
+          if (adapter->FriendlyName && name == adapter->FriendlyName) return adapter->IfIndex;
+        }
+      }
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
   }
@@ -218,17 +235,26 @@ static RoutePlan planRoutes(const std::wstring& server) {
 
 static bool armGuard(const std::wstring& server) {
   const std::time_t fireAt = std::time(nullptr) + 240;
-  std::tm local{};
-  localtime_s(&local, &fireAt);
-  wchar_t moment[16]{}, day[16]{};
-  wcsftime(moment, 16, L"%H:%M", &local);
-  wcsftime(day, 16, L"%Y/%m/%d", &local);
+  const std::tm* local = std::localtime(&fireAt);
+  if (!local) return false;
+  SYSTEMTIME when{};
+  when.wYear = local->tm_year + 1900;
+  when.wMonth = static_cast<WORD>(local->tm_mon + 1);
+  when.wDay = static_cast<WORD>(local->tm_mday);
+  when.wHour = static_cast<WORD>(local->tm_hour);
+  when.wMinute = static_cast<WORD>(local->tm_min);
+  wchar_t day[32]{}, moment[16]{};
+  // schtasks parses /sd in the user's short-date format, so ask the system
+  // for exactly that instead of assuming an ISO ordering.
+  if (!GetDateFormatW(LOCALE_USER_DEFAULT, DATE_SHORTDATE, &when, nullptr, day, 32) ||
+      !GetTimeFormatW(LOCALE_USER_DEFAULT, 0, &when, L"HH:mm", moment, 16)) return false;
   // If this process dies without cleanup, the guard removes the only route
-  // that outlives the adapter and then removes itself.
+  // that outlives the adapter and then removes itself. The dash-only task
+  // name keeps the /tr value free of nested quotes.
   const std::wstring restore = L"cmd.exe /c route delete " + server +
-    L" >nul 2>&1 & schtasks /delete /tn \"" + kGuardTask + L"\" /f >nul 2>&1";
-  const std::wstring command = std::wstring(L"schtasks /create /tn \"") + kGuardTask +
-    L"\" /sc once /sd " + day + L" /st " + moment + L" /tr \"" + restore + L"\" /f";
+    L" >nul 2>&1 & schtasks /delete /tn " + kGuardTask + L" /f >nul 2>&1";
+  const std::wstring command = std::wstring(L"schtasks /create /tn ") + kGuardTask +
+    L" /sc once /sd " + day + L" /st " + moment + L" /tr \"" + restore + L"\" /f";
   return runCommand(command);
 }
 
@@ -238,79 +264,107 @@ static bool disarmGuard() {
 
 bool Vpn::start(int localPort, const std::wstring& server, int serverPort,
                 const std::wstring& scope, std::wstring& error) {
-  if (job_) { error = L"VPN mode is already running."; return false; }
-  if (!isElevated()) { error = L"VPN mode requires elevation."; return false; }
-  const std::filesystem::path directory = runtimeDirectory();
-  if (!extractRuntime(directory, error)) return false;
-  const std::filesystem::path config = directory / L"main.yml";
-  if (!writeConfig(config, localPort)) {
-    error = L"Engine configuration could not be written."; return false;
-  }
-  const RoutePlan plan = planRoutes(server);
-  if (!plan.ok) { error = L"Server address or default route unavailable."; return false; }
-  const std::wstring serverIp = widen(plan.server);
-  const std::wstring gateway = widen(plan.gateway);
-  if (!armGuard(serverIp)) {
-    error = L"Restoration guard could not be armed."; return false;
-  }
-  // The engine must reach the ETL server outside the tunnel, so the host
-  // route goes in before anything points at the adapter.
-  std::wstring hostRoute = L"route add " + serverIp + L" mask 255.255.255.255 ";
-  hostRoute += gateway.empty() ? std::to_wstring(plan.interfaceIndex) : gateway + L" if " + std::to_wstring(plan.interfaceIndex);
-  if (!runCommand(hostRoute)) {
-    disarmGuard();
-    error = L"Server host route could not be installed."; return false;
-  }
-  serverRoute_ = serverIp;
-  HANDLE job = CreateJobObjectW(nullptr, nullptr);
-  if (!job) {
-    runCommand(L"route delete " + serverIp);
-    disarmGuard();
-    error = L"Job object failed.";
-    return false;
-  }
-  JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
-  limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-  SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits));
-  STARTUPINFOW startup{};
-  startup.cb = sizeof(startup);
-  const std::wstring command = L"\"" + (directory / L"hev-socks5-tunnel.exe").wstring() +
-    L"\" \"" + config.wstring() + L"\"";
-  PROCESS_INFORMATION process{};
-  if (!CreateProcessW(nullptr, const_cast<LPWSTR>(command.data()), nullptr, nullptr,
-      FALSE, CREATE_NO_WINDOW, nullptr, directory.c_str(), &startup, &process)) {
-    CloseHandle(job);
-    runCommand(L"route delete " + serverIp);
-    disarmGuard();
-    error = L"TUN engine could not start.";
-    return false;
-  }
-  AssignProcessToJobObject(job, process.hProcess);
-  CloseHandle(process.hThread);
-  const DWORD adapter = waitForAdapter(kAdapterName, 12);
-  if (!adapter) {
-    TerminateJobObject(job, 1);
-    CloseHandle(process.hProcess);
-    CloseHandle(job);
-    runCommand(L"route delete " + serverIp);
-    disarmGuard();
-    error = L"TUN adapter did not come up.";
-    return false;
-  }
-  runCommand(L"netsh interface ip set dns name=\"" + std::wstring(kAdapterName) +
-    L"\" static " + kTunDns + L" validate=no");
-  if (!scope.empty()) {
-    if (!runCommand(L"route add " + scope + L" mask 255.255.255.255 " + kTunAddress +
-        L" metric 1 if " + std::to_wstring(adapter))) {
-      stop();
-      error = L"Scoped route could not be installed.";
+  try {
+    checkpoint("start");
+    if (job_) { error = L"VPN mode is already running."; return false; }
+    if (!isElevated()) { error = L"VPN mode requires elevation."; return false; }
+    const std::filesystem::path directory = runtimeDirectory();
+    checkpoint("extract");
+    if (!extractRuntime(directory, error)) return false;
+    const std::filesystem::path config = directory / L"main.yml";
+    checkpoint("config");
+    if (!writeConfig(config, localPort)) {
+      error = L"Engine configuration could not be written."; return false;
+    }
+    checkpoint("plan");
+    const RoutePlan plan = planRoutes(server);
+    if (!plan.ok) { error = L"Server address or default route unavailable."; return false; }
+    checkpoint("plan-ok", plan.server + " via " + (plan.gateway.empty() ? std::string("if") : plan.gateway));
+    const std::wstring serverIp = widen(plan.server);
+    const std::wstring gateway = widen(plan.gateway);
+    checkpoint("guard");
+    if (!armGuard(serverIp)) {
+      error = L"Restoration guard could not be armed."; return false;
+    }
+    // The engine must reach the ETL server outside the tunnel, so the host
+    // route goes in before anything points at the adapter.
+    std::wstring hostRoute(L"route add ");
+    hostRoute.append(serverIp);
+    hostRoute.append(L" mask 255.255.255.255 ");
+    if (gateway.empty()) hostRoute.append(std::to_wstring(plan.interfaceIndex));
+    else {
+      hostRoute.append(gateway);
+      hostRoute.append(L" if ");
+      hostRoute.append(std::to_wstring(plan.interfaceIndex));
+    }
+    checkpoint("host-route");
+    if (!runCommand(hostRoute)) {
+      disarmGuard();
+      error = L"Server host route could not be installed."; return false;
+    }
+    serverRoute_ = serverIp;
+    checkpoint("job");
+    HANDLE job = CreateJobObjectW(nullptr, nullptr);
+    if (!job) {
+      runCommand(L"route delete " + serverIp);
+      disarmGuard();
+      error = L"Job object failed.";
       return false;
     }
-    scopeRoute_ = scope;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits));
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    const std::wstring command = L"\"" + (directory / L"hev-socks5-tunnel.exe").wstring() +
+      L"\" \"" + config.wstring() + L"\"";
+    std::vector<wchar_t> mutableCommand(command.begin(), command.end());
+    mutableCommand.push_back(L'\0');
+    checkpoint("spawn");
+    PROCESS_INFORMATION process{};
+    if (!CreateProcessW(nullptr, mutableCommand.data(), nullptr, nullptr,
+        FALSE, CREATE_NO_WINDOW, nullptr, directory.c_str(), &startup, &process)) {
+      CloseHandle(job);
+      runCommand(L"route delete " + serverIp);
+      disarmGuard();
+      error = L"TUN engine could not start.";
+      return false;
+    }
+    AssignProcessToJobObject(job, process.hProcess);
+    CloseHandle(process.hThread);
+    checkpoint("adapter-wait");
+    const DWORD adapter = waitForAdapter(kAdapterName, 12);
+    if (!adapter) {
+      checkpoint("adapter-timeout");
+      TerminateJobObject(job, 1);
+      CloseHandle(process.hProcess);
+      CloseHandle(job);
+      runCommand(L"route delete " + serverIp);
+      disarmGuard();
+      error = L"TUN adapter did not come up.";
+      return false;
+    }
+    checkpoint("dns", std::to_string(adapter));
+    runCommand(L"netsh interface ip set dns name=\"" + std::wstring(kAdapterName) +
+      L"\" static " + kTunDns + L" validate=no");
+    if (!scope.empty()) {
+      checkpoint("scoped-route");
+      if (!runCommand(L"route add " + scope + L" mask 255.255.255.255 " + kTunAddress +
+          L" metric 1 if " + std::to_wstring(adapter))) {
+        stop();
+        error = L"Scoped route could not be installed.";
+        return false;
+      }
+      scopeRoute_ = scope;
+    }
+    job_ = job;
+    process_ = process.hProcess;
+    checkpoint("started");
+    return true;
+  } catch (...) {
+    error = L"VPN mode failed unexpectedly.";
+    return false;
   }
-  job_ = job;
-  process_ = process.hProcess;
-  return true;
 }
 
 void Vpn::stop() {

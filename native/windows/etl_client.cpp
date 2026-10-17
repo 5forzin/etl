@@ -1336,9 +1336,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     if (!result && c.vpn) {
       if (!vpn.start(c.localPort, c.server, c.serverPort, c.vpnScope, error)) result = 4;
     }
-    if (!result) while (true) Sleep(1000);
-    vpn.stop();
-    LocalFree(argv); WSACleanup(); return result;
+    // The global Service destructor must never see joinable threads.
+    if (result) {
+      vpn.stop();
+      service.stop();
+      LocalFree(argv); WSACleanup(); return result;
+    }
+    while (true) Sleep(1000);
   }
   LocalFree(argv);
   config = previewPath.empty() ? loadConfig() : Config{};
