@@ -1290,7 +1290,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     OPENSSL_cleanse(restored.data(), restored.size());
     LocalFree(argv); WSACleanup(); return ok ? 0 : 23;
   }
-  if (argc == 5 && std::wstring(argv[1]) == L"--vpn-guard") {
+  if (argc == 4 && std::wstring(argv[1]) == L"--vpn-guard") {
     // Dead-man switch: a separate process, outside the engine job, that
     // waits for the parent ETL client to die and then removes the host
     // route the VPN start installed outside the tunnel.
@@ -1299,6 +1299,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     if (watched) {
       WaitForSingleObject(watched, INFINITE);
       CloseHandle(watched);
+    }
+    {
+      std::ofstream out(etlvpn::runtimeDirectory() / L"guard.log", std::ios::app);
+      if (out) out << "awake parent=" << utf8(argv[3]) << "\n";
     }
     std::wstring command(L"route delete ");
     command.append(argv[2]);
@@ -1309,12 +1313,17 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     PROCESS_INFORMATION process{};
     if (CreateProcessW(nullptr, mutableCommand.data(), nullptr, nullptr, FALSE,
         CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) {
-      WaitForSingleObject(process.hProcess, 15000);
+      WaitForSingleObject(process.hProcess, 5000);
       CloseHandle(process.hThread);
       CloseHandle(process.hProcess);
     }
-    LocalFree(argv);
-    return 0;
+    {
+      std::ofstream out(etlvpn::runtimeDirectory() / L"guard.log", std::ios::app);
+      if (out) out << "exiting\n";
+    }
+    // A watchdog exits hard once its work is flushed: ExitProcess can
+    // deadlock in DLL detach under loader locks.
+    TerminateProcess(GetCurrentProcess(), 0);
   }
   if (argc > 1 && std::wstring(argv[1]) == L"--headless") {
     if (argc % 2 != 0) { LocalFree(argv); WSACleanup(); return 22; }
