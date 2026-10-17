@@ -10,6 +10,6 @@
   "scripts": {
     "start": "node src/cli.js",
     "test": "node --test",
-    "check": "node --check src/cli.js && node --check src/tunnel.js && node --check src/io.js && node --check src/policy.js && node --check src/doctor.js && node --check src/http-proxy.js"
+    "check": "node --check src/cli.js && node --check src/tunnel.js && node --check src/io.js && node --check src/policy.js && node --check src/doctor.js && node --check src/http-proxy.js && node --check src/udp.js"
   }
 }

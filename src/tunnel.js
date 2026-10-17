@@ -1,10 +1,13 @@
 import net from 'node:net';
 import tls from 'node:tls';
+import dgram from 'node:dgram';
+import { once } from 'node:events';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { read, readFrame, writeFrame, protect, connected, relay, track } from './io.js';
 import { resolveDestination, validateDestination } from './policy.js';
 import { httpDestination, httpReply } from './http-proxy.js';
+import { MAX_DATAGRAM, buildUdpPacket, createUdpRelay, openUdpSession, parseUdpPacket } from './udp.js';
 
 const HANDSHAKE = 10_000;
 const IDLE = 120_000;
@@ -34,9 +37,11 @@ export function tokenFile(path) {
 
 export function createTunnelServer({ key, cert, getToken, maxConnections = 128,
   handshakeTimeout = HANDSHAKE, idleTimeout = IDLE,
-  resolve = resolveDestination }) {
+  resolve = resolveDestination, maxDestinations = 64,
+  maxDatagram = MAX_DATAGRAM }) {
   validateLimits(maxConnections, handshakeTimeout, idleTimeout);
   validateToken(getToken());
+  const udpRelay = createUdpRelay({ resolve, idleTimeout, maxDestinations, maxDatagram });
   const server = tls.createServer({ key, cert, minVersion: 'TLSv1.3',
     handshakeTimeout, allowHalfOpen: true }, (socket) => {
     protect(socket, handshakeTimeout);
@@ -45,13 +50,21 @@ export function createTunnelServer({ key, cert, getToken, maxConnections = 128,
     socket.once('close', () => { clearTimeout(deadline); target?.destroy(); });
     void (async () => {
       const hello = await readFrame(socket);
-      if (hello?.v !== 1 || typeof hello.token !== 'string' ||
-          !timingSafeEqual(hash(hello.token), hash(getToken()))) {
+      const authorized = typeof hello?.token === 'string' &&
+        timingSafeEqual(hash(hello.token), hash(getToken()));
+      if (!authorized || (hello.v !== 1 && hello.v !== 2) ||
+          (hello.v === 2 && hello.mode !== 'udp')) {
         writeFrame(socket, { code: 'AUTH' });
         socket.end();
         return;
       }
       writeFrame(socket, { code: 'OK' });
+      if (hello.v === 2) {
+        clearTimeout(deadline);
+        socket.setTimeout(idleTimeout, () => socket.destroy());
+        await udpRelay(socket);
+        return;
+      }
       const request = await readFrame(socket);
       const addresses = await resolve(request?.host, request?.port);
       if (socket.destroyed) return;
@@ -92,7 +105,8 @@ async function socksDestination(socket, firstByte) {
   socket.write(Buffer.from([5, 0]));
   const header = await read(socket, 4);
   if (header[0] !== 5 || header[2] !== 0) throw new Error('Invalid SOCKS request');
-  if (header[1] !== 1) { reply(socket, 7); socket.end(); return null; }
+  const command = header[1];
+  if (command !== 1 && command !== 3) { reply(socket, 7); socket.end(); return null; }
   let host;
   if (header[3] === 1) host = [...await read(socket, 4)].join('.');
   else if (header[3] === 3) {
@@ -104,12 +118,13 @@ async function socksDestination(socket, firstByte) {
     host = Array.from({ length: 8 }, (_, i) => bytes.readUInt16BE(i * 2).toString(16)).join(':');
   } else { reply(socket, 8); socket.end(); return null; }
   const port = (await read(socket, 2)).readUInt16BE();
+  if (command === 3) return { command: 3 };
   validateDestination(host, port);
   return { host, port };
 }
 
-function reply(socket, code) {
-  socket.write(Buffer.from([5, code, 0, 1, 0, 0, 0, 0, 0, 0]));
+function reply(socket, code, port = 0) {
+  socket.write(Buffer.from([5, code, 0, 1, 0, 0, 0, 0, port >> 8, port & 0xff]));
 }
 
 export function createClient({ host, port = 443, servername = host, token, ca,
@@ -173,6 +188,56 @@ export function createClient({ host, port = 443, servername = host, token, ca,
     for (const probe of probes) probe.destroy();
     probes.clear();
   };
+  // One UDP ASSOCIATE gets one v2 TLS session; its lifetime is the local TCP
+  // control connection. Datagrams only ever cross 127.0.0.1.
+  const udpAssociate = async (socket) => {
+    const relaySocket = dgram.createSocket('udp4');
+    relaySocket.on('error', () => {});
+    relaySocket.bind(0, '127.0.0.1');
+    await once(relaySocket, 'listening');
+    let session;
+    for (const endpoint of endpoints) {
+      if (!endpoint.available) continue;
+      try {
+        session = await openUdpSession({ host: endpoint.host, port: endpoint.port,
+          servername: endpoint.servername, token: endpoint.token, ca,
+          connectTimeout, idleTimeout });
+        break;
+      } catch { if (endpoint !== endpoints[0]) endpoint.available = false; }
+    }
+    if (!session) {
+      relaySocket.close();
+      reply(socket, 1);
+      socket.end();
+      return;
+    }
+    let peer;
+    let closed = false;
+    const finish = () => {
+      if (closed) return;
+      closed = true;
+      relaySocket.close();
+      session.destroy();
+    };
+    relaySocket.on('message', (message, rinfo) => {
+      if (rinfo.address !== '127.0.0.1') return;
+      peer = { address: rinfo.address, port: rinfo.port };
+      const packet = parseUdpPacket(message);
+      if (packet) session.send(packet.host, packet.port, packet.payload);
+    });
+    session.on('datagram', ({ host, port, payload }) => {
+      if (!peer || closed) return;
+      const packet = buildUdpPacket(host, port, payload);
+      if (packet) relaySocket.send(packet, peer.port, peer.address, () => {});
+    });
+    // The listener is half-open capable, so a peer FIN emits 'end' without
+    // 'close'; both must tear the association down.
+    socket.once('end', finish);
+    socket.once('close', finish);
+    session.once('close', () => socket.destroy());
+    reply(socket, 0, relaySocket.address().port);
+  };
+
   const server = net.createServer({ allowHalfOpen: true }, (socket) => {
     protect(socket, handshakeTimeout);
     let deadline = setTimeout(() => socket.destroy(), handshakeTimeout);
@@ -185,6 +250,13 @@ export function createClient({ host, port = 443, servername = host, token, ca,
       const destination = isHttp ? await httpDestination(socket, firstByte) :
         await socksDestination(socket, firstByte);
       if (!destination || socket.destroyed) return;
+      if (destination.command === 3) {
+        clearTimeout(deadline);
+        // The control connection stays silent while datagrams flow; its
+        // lifetime is bounded by the v2 session's own idle timeout instead.
+        await udpAssociate(socket);
+        return;
+      }
       clearTimeout(deadline);
       const setupTimeout = handshakeTimeout + endpoints.length * connectTimeout;
       socket.setTimeout(setupTimeout);

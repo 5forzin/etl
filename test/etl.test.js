@@ -168,12 +168,13 @@ test('full SOCKS → TLS → destination relay preserves pipelined bytes and hal
   assert.deepEqual(domains, Array(4).fill('remote-only.example'));
 });
 
-test('SOCKS rejects UDP ASSOCIATE and failed tunnel authentication', async (t) => {
+test('SOCKS rejects unsupported commands and failed tunnel authentication', async (t) => {
   const port = await tunnel(t);
   const clientPort = await listen(createClient({ host: '127.0.0.1', servername: 'localhost',
     port, token: 'b'.repeat(64), ca: cert }), t);
-  assert.equal((await socks(t, clientPort, 'example.com', 443, Buffer.alloc(0), 3)).code, 7);
+  assert.equal((await socks(t, clientPort, 'example.com', 443, Buffer.alloc(0), 2)).code, 7);
   assert.equal((await socks(t, clientPort, 'example.com', 443)).code, 1);
+  assert.equal((await socks(t, clientPort, 'example.com', 443, Buffer.alloc(0), 3)).code, 1);
 });
 
 test('absolute handshake deadline closes incomplete requests', async (t) => {
