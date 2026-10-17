@@ -2,6 +2,7 @@
   "name": "encrypted-transport-lab",
   "version": "0.4.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "description": "Self-hosted TLS tunnel with SOCKS5 and HTTP proxy support.",
   "bin": { "etl": "src/cli.js" },
