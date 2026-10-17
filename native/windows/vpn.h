@@ -14,8 +14,8 @@ struct VpnStatus {
 
 class Vpn {
  public:
-  // scopeEmpty keeps every route change off the table: only the engine and
-  // adapter come up (used by the scoped-route tests before touching defaults).
+  // A scope installs only its /32 and leaves DNS alone. Empty scope pairs
+  // mapdns with its fake-IP route; default-route takeover is not implemented.
   bool start(int localPort, const std::wstring& server, int serverPort,
              const std::wstring& scope, std::wstring& error);
   void stop();
@@ -28,12 +28,14 @@ class Vpn {
   void* guard_ = nullptr;       // HANDLE of the --vpn-guard watchdog copy
   std::wstring serverRoute_;    // host route to remove on stop
   std::wstring scopeRoute_;     // scoped test route to remove on stop
-  bool routed_ = false;
+  bool mapDnsRoute_ = false;
 };
 
 bool extractRuntime(const std::filesystem::path& directory, std::wstring& error);
 bool isElevated();
 std::filesystem::path runtimeDirectory();
+int runGuard(const std::wstring& server, unsigned long parentPid,
+             const std::wstring& readyEvent = L"");
 
 // Offline checks: extraction with hash verification and the routing plan.
 bool selfTestExtract(std::wstring& error);

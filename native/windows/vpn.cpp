@@ -119,7 +119,7 @@ bool extractRuntime(const std::filesystem::path& directory, std::wstring& error)
   return true;
 }
 
-static bool runCommand(const std::wstring& command) {
+static bool runCommand(const std::wstring& command, std::string* error = nullptr) {
   STARTUPINFOW startup{};
   startup.cb = sizeof(startup);
   PROCESS_INFORMATION process{};
@@ -128,13 +128,29 @@ static bool runCommand(const std::wstring& command) {
   mutableCommand.push_back(L'\0');
   const BOOL ok = CreateProcessW(nullptr, mutableCommand.data(),
     nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process);
-  if (!ok) return false;
-  WaitForSingleObject(process.hProcess, 15000);
-  DWORD code = 0;
-  GetExitCodeProcess(process.hProcess, &code);
+  if (!ok) {
+    if (error) *error = "CreateProcess failed: " + std::to_string(GetLastError());
+    return false;
+  }
+  const DWORD wait = WaitForSingleObject(process.hProcess, 15000);
+  DWORD code = 1;
+  bool success = false;
+  if (wait == WAIT_OBJECT_0) {
+    if (!GetExitCodeProcess(process.hProcess, &code)) {
+      if (error) *error = "GetExitCodeProcess failed: " + std::to_string(GetLastError());
+    } else {
+      success = code == 0;
+      if (!success && error) *error = "exit code " + std::to_string(code);
+    }
+  } else {
+    if (error) *error = wait == WAIT_TIMEOUT ? "command timed out" :
+      "WaitForSingleObject failed: " + std::to_string(GetLastError());
+    TerminateProcess(process.hProcess, 1);
+    WaitForSingleObject(process.hProcess, 5000);
+  }
   CloseHandle(process.hThread);
   CloseHandle(process.hProcess);
-  return code == 0;
+  return success;
 }
 
 // Startup checkpoint log: the VPN path runs elevated and windowless, so a
@@ -160,6 +176,7 @@ static bool writeConfig(const std::filesystem::path& path, int localPort) {
       << "socks5:\n"
       << "  port: " << localPort << "\n"
       << "  address: 127.0.0.1\n"
+      << "  udp-address: '127.0.0.1'\n"
       << "  udp: 'udp'\n"
       << "mapdns:\n"
       << "  address: 198.18.0.2\n"
@@ -248,19 +265,118 @@ static RoutePlan planRoutes(const std::wstring& server) {
 // crash of the main client still leaves a cleaner behind.
 static bool spawnGuard(const std::wstring& server, HANDLE& guard) {
   wchar_t path[MAX_PATH]{};
-  if (!GetModuleFileNameW(nullptr, path, MAX_PATH)) return false;
+  const DWORD length = GetModuleFileNameW(nullptr, path, MAX_PATH);
+  if (!length || length >= MAX_PATH) {
+    checkpoint("guard-error", "Executable path unavailable or too long.");
+    return false;
+  }
+  const std::wstring eventName = L"Local\\ETL-VpnGuard-" +
+    std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64());
+  HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, eventName.c_str());
+  if (!ready) {
+    checkpoint("guard-error", "CreateEvent failed: " + std::to_string(GetLastError()));
+    return false;
+  }
   std::wstring command(std::wstring(L"\"") + path + L"\" --vpn-guard " + server +
-    L" " + std::to_wstring(GetCurrentProcessId()));
+    L" " + std::to_wstring(GetCurrentProcessId()) + L" " + eventName);
   std::vector<wchar_t> mutableCommand(command.begin(), command.end());
   mutableCommand.push_back(L'\0');
   STARTUPINFOW startup{};
   startup.cb = sizeof(startup);
   PROCESS_INFORMATION process{};
-  if (!CreateProcessW(nullptr, mutableCommand.data(), nullptr, nullptr, FALSE,
-      CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) return false;
+  // Fail closed if an enclosing job forbids breakaway. Only the engine is
+  // assigned to our kill-on-close job; the guard must survive every job exit.
+  if (!CreateProcessW(path, mutableCommand.data(), nullptr, nullptr, FALSE,
+      CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB | CREATE_SUSPENDED,
+      nullptr, nullptr, &startup, &process)) {
+    checkpoint("guard-error", "CreateProcess failed: " + std::to_string(GetLastError()));
+    CloseHandle(ready);
+    return false;
+  }
+  BOOL inJob = TRUE;
+  bool ok = IsProcessInJob(process.hProcess, nullptr, &inJob);
+  if (!ok) checkpoint("guard-error", "IsProcessInJob failed: " + std::to_string(GetLastError()));
+  else if (inJob) {
+    checkpoint("guard-error", "Guard inherited an enclosing job.");
+    ok = false;
+  }
+  if (ok && ResumeThread(process.hThread) == static_cast<DWORD>(-1)) {
+    checkpoint("guard-error", "ResumeThread failed: " + std::to_string(GetLastError()));
+    ok = false;
+  }
   CloseHandle(process.hThread);
+  if (ok) {
+    HANDLE handles[]{ready, process.hProcess};
+    const DWORD wait = WaitForMultipleObjects(2, handles, FALSE, 10000);
+    if (wait == WAIT_FAILED)
+      checkpoint("guard-error", "Readiness wait failed: " + std::to_string(GetLastError()));
+    else if (wait == WAIT_TIMEOUT) checkpoint("guard-error", "Readiness wait timed out.");
+    ok = wait == WAIT_OBJECT_0 && WaitForSingleObject(process.hProcess, 0) == WAIT_TIMEOUT;
+    if (!ok && (wait == WAIT_OBJECT_0 || wait == WAIT_OBJECT_0 + 1)) {
+      DWORD code = 0;
+      if (GetExitCodeProcess(process.hProcess, &code))
+        checkpoint("guard-error", "Guard exited during startup: " + std::to_string(code));
+      else checkpoint("guard-error", "GetExitCodeProcess failed: " + std::to_string(GetLastError()));
+    }
+  }
+  CloseHandle(ready);
+  if (!ok) {
+    TerminateProcess(process.hProcess, 1);
+    CloseHandle(process.hProcess);
+    return false;
+  }
   guard = process.hProcess;
   return true;
+}
+
+static void guardLog(const std::string& message) {
+  std::ofstream out(runtimeDirectory() / L"guard.log", std::ios::app);
+  if (out) out << message << "\n";
+}
+
+int runGuard(const std::wstring& server, unsigned long parentPid,
+             const std::wstring& readyEvent) {
+  guardLog("starting parent=" + std::to_string(parentPid));
+  auto finish = [](int code) {
+    guardLog("exiting code=" + std::to_string(code));
+    // Avoid DLL-detach deadlocks in the watchdog's cleanup path.
+    TerminateProcess(GetCurrentProcess(), code);
+    return code;
+  };
+  HANDLE watched = OpenProcess(SYNCHRONIZE, FALSE, parentPid);
+  if (!watched) {
+    guardLog("OpenProcess failed: " + std::to_string(GetLastError()));
+    if (!readyEvent.empty()) return finish(1);
+  }
+  if (!readyEvent.empty()) {
+    HANDLE ready = OpenEventW(EVENT_MODIFY_STATE, FALSE, readyEvent.c_str());
+    if (!ready) {
+      guardLog("OpenEvent failed: " + std::to_string(GetLastError()));
+      CloseHandle(watched);
+      return finish(1);
+    }
+    guardLog("armed parent=" + std::to_string(parentPid));
+    const BOOL signaled = SetEvent(ready);
+    if (!signaled) guardLog("SetEvent failed: " + std::to_string(GetLastError()));
+    CloseHandle(ready);
+    if (!signaled) { CloseHandle(watched); return finish(1); }
+  }
+  if (watched) {
+    if (WaitForSingleObject(watched, INFINITE) != WAIT_OBJECT_0)
+      guardLog("Parent wait failed: " + std::to_string(GetLastError()));
+    CloseHandle(watched);
+  }
+  guardLog("awake parent=" + std::to_string(parentPid));
+  bool removed = false;
+  for (int attempt = 1; attempt <= 2; ++attempt) {
+    std::string error;
+    if (runCommand(L"route delete " + server, &error)) { removed = true; break; }
+    guardLog("Route delete attempt " + std::to_string(attempt) + ": " + error);
+    if (attempt == 1) Sleep(250);
+  }
+  std::string error;
+  if (!runCommand(L"ipconfig /flushdns", &error)) guardLog("DNS flush: " + error);
+  return finish(removed ? 0 : 1);
 }
 
 bool Vpn::start(int localPort, const std::wstring& server, int serverPort,
@@ -284,11 +400,11 @@ bool Vpn::start(int localPort, const std::wstring& server, int serverPort,
     const std::wstring serverIp = widen(plan.server);
     const std::wstring gateway = widen(plan.gateway);
     HANDLE guard = nullptr;
-    checkpoint("guard");
     if (!spawnGuard(serverIp, guard)) {
       error = L"Restoration guard could not be armed."; return false;
     }
     guard_ = guard;
+    checkpoint("guard");
     // The engine must reach the ETL server outside the tunnel, so the host
     // route goes in before anything points at the adapter.
     std::wstring hostRoute(L"route add ");
@@ -302,19 +418,25 @@ bool Vpn::start(int localPort, const std::wstring& server, int serverPort,
     }
     checkpoint("host-route");
     if (!runCommand(hostRoute)) {
+      stop();
       error = L"Server host route could not be installed."; return false;
     }
     serverRoute_ = serverIp;
     checkpoint("job");
     HANDLE job = CreateJobObjectW(nullptr, nullptr);
     if (!job) {
-      runCommand(L"route delete " + serverIp);
+      stop();
       error = L"Job object failed.";
       return false;
     }
+    job_ = job;
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits));
+    if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) {
+      stop();
+      error = L"Job object limits could not be set.";
+      return false;
+    }
     STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
     const std::wstring command = L"\"" + (directory / L"hev-socks5-tunnel.exe").wstring() +
@@ -324,29 +446,31 @@ bool Vpn::start(int localPort, const std::wstring& server, int serverPort,
     checkpoint("spawn");
     PROCESS_INFORMATION process{};
     if (!CreateProcessW(nullptr, mutableCommand.data(), nullptr, nullptr,
-        FALSE, CREATE_NO_WINDOW, nullptr, directory.c_str(), &startup, &process)) {
-      CloseHandle(job);
-      runCommand(L"route delete " + serverIp);
+        FALSE, CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr, directory.c_str(), &startup, &process)) {
+      stop();
       error = L"TUN engine could not start.";
       return false;
     }
-    AssignProcessToJobObject(job, process.hProcess);
+    process_ = process.hProcess;
+    if (!AssignProcessToJobObject(job, process.hProcess) ||
+        ResumeThread(process.hThread) == static_cast<DWORD>(-1)) {
+      TerminateProcess(process.hProcess, 1);
+      CloseHandle(process.hThread);
+      stop();
+      error = L"TUN engine could not be assigned to its job or resumed.";
+      return false;
+    }
     CloseHandle(process.hThread);
     checkpoint("adapter-wait");
     const DWORD adapter = waitForAdapter(kAdapterName, "198.18.0.1", 20);
     if (!adapter) {
       checkpoint("adapter-timeout");
-      TerminateJobObject(job, 1);
-      CloseHandle(process.hProcess);
-      CloseHandle(job);
-      runCommand(L"route delete " + serverIp);
+      stop();
       error = L"TUN adapter did not come up.";
       return false;
     }
-    checkpoint("dns", std::to_string(adapter));
-    runCommand(L"netsh interface ip set dns name=\"" + std::wstring(kAdapterName) +
-      L"\" static " + kTunDns + L" validate=no");
     if (!scope.empty()) {
+      // Scoped traffic must keep the physical adapter's real DNS answers.
       checkpoint("scoped-route");
       if (!runCommand(L"route add " + scope + L" mask 255.255.255.255 " + kTunAddress +
           L" metric 1 if " + std::to_wstring(adapter))) {
@@ -355,12 +479,28 @@ bool Vpn::start(int localPort, const std::wstring& server, int serverPort,
         return false;
       }
       scopeRoute_ = scope;
+    } else {
+      // Full mode must route fake-IP answers before advertising mapdns.
+      checkpoint("mapdns-route");
+      if (!runCommand(L"route add 100.64.0.0 mask 255.192.0.0 " +
+          std::wstring(kTunAddress) + L" metric 1 if " + std::to_wstring(adapter))) {
+        stop();
+        error = L"Mapdns route could not be installed.";
+        return false;
+      }
+      mapDnsRoute_ = true;
+      checkpoint("dns", std::to_string(adapter));
+      if (!runCommand(L"netsh interface ip set dns name=\"" + std::wstring(kAdapterName) +
+          L"\" static " + kTunDns + L" validate=no")) {
+        stop();
+        error = L"TUN DNS could not be configured.";
+        return false;
+      }
     }
-    job_ = job;
-    process_ = process.hProcess;
     checkpoint("started");
     return true;
   } catch (...) {
+    stop();
     error = L"VPN mode failed unexpectedly.";
     return false;
   }
@@ -377,7 +517,8 @@ static void stopGuard(void*& guard) {
 }
 
 void Vpn::stop() {
-  if (!job_) { stopGuard(guard_); return; }
+  if (!job_ && !process_ && !guard_ && serverRoute_.empty() &&
+      scopeRoute_.empty() && !mapDnsRoute_) return;
   HANDLE job = static_cast<HANDLE>(job_);
   HANDLE process = static_cast<HANDLE>(process_);
   job_ = nullptr;
@@ -386,14 +527,23 @@ void Vpn::stop() {
     runCommand(L"route delete " + scopeRoute_);
     scopeRoute_.clear();
   }
+  if (mapDnsRoute_) {
+    runCommand(L"route delete 100.64.0.0 mask 255.192.0.0");
+    mapDnsRoute_ = false;
+  }
   // Killing the job removes the adapter, and Windows drops its routes with it.
-  TerminateJobObject(job, 1);
-  if (process) CloseHandle(process);
-  CloseHandle(job);
+  if (job) TerminateJobObject(job, 1);
+  if (process) {
+    WaitForSingleObject(process, 5000);
+    CloseHandle(process);
+  }
+  if (job) CloseHandle(job);
   if (!serverRoute_.empty()) {
-    runCommand(L"route delete " + serverRoute_);
+    if (!runCommand(L"route delete " + serverRoute_))
+      runCommand(L"route delete " + serverRoute_);
     serverRoute_.clear();
   }
+  runCommand(L"ipconfig /flushdns");
   stopGuard(guard_);
 }
 
