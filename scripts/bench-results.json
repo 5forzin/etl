@@ -1,0 +1,1 @@
+{"date":"2026-10-17T00:06:59.597Z","node":"v24.20.0","params":{"mebibytes":128,"flows":120,"lanes":16},"throughput":{"mebibytes":128,"seconds":0.897,"mbps":142.7},"flowsSequential":{"flows":120,"seconds":0.424,"perSecond":282.9,"meanMs":3.53},"flowsParallel":{"lanes":16,"flows":128,"seconds":0.343,"perSecond":373.2},"memory":{"rssMiB":70.4,"heapMiB":12.5}}
