@@ -284,8 +284,8 @@ static bool spawnGuard(const std::wstring& server, HANDLE& guard) {
   STARTUPINFOW startup{};
   startup.cb = sizeof(startup);
   PROCESS_INFORMATION process{};
-  // Fail closed if an enclosing job forbids breakaway. Only the engine is
-  // assigned to our kill-on-close job; the guard must survive every job exit.
+  // Only the engine is assigned to our kill-on-close job. The guard checks
+  // any remaining enclosing job's limits before signaling readiness.
   if (!CreateProcessW(path, mutableCommand.data(), nullptr, nullptr, FALSE,
       CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB | CREATE_SUSPENDED,
       nullptr, nullptr, &startup, &process)) {
@@ -294,13 +294,11 @@ static bool spawnGuard(const std::wstring& server, HANDLE& guard) {
     return false;
   }
   BOOL inJob = TRUE;
-  bool ok = IsProcessInJob(process.hProcess, nullptr, &inJob);
-  if (!ok) checkpoint("guard-error", "IsProcessInJob failed: " + std::to_string(GetLastError()));
-  else if (inJob) {
-    checkpoint("guard-error", "Guard inherited an enclosing job.");
-    ok = false;
-  }
-  if (ok && ResumeThread(process.hThread) == static_cast<DWORD>(-1)) {
+  if (!IsProcessInJob(process.hProcess, nullptr, &inJob))
+    checkpoint("guard-note", "IsProcessInJob failed: " + std::to_string(GetLastError()));
+  else if (inJob) checkpoint("guard-in-job", "Guard will check enclosing job limits.");
+  bool ok = true;
+  if (ResumeThread(process.hThread) == static_cast<DWORD>(-1)) {
     checkpoint("guard-error", "ResumeThread failed: " + std::to_string(GetLastError()));
     ok = false;
   }
@@ -343,6 +341,24 @@ int runGuard(const std::wstring& server, unsigned long parentPid,
     TerminateProcess(GetCurrentProcess(), code);
     return code;
   };
+  BOOL inJob = FALSE;
+  if (!IsProcessInJob(GetCurrentProcess(), nullptr, &inJob)) {
+    guardLog("IsProcessInJob failed: " + std::to_string(GetLastError()));
+    return finish(1);
+  }
+  if (inJob) {
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+    if (!QueryInformationJobObject(nullptr, JobObjectExtendedLimitInformation,
+        &limits, sizeof(limits), nullptr)) {
+      guardLog("QueryInformationJobObject failed: " + std::to_string(GetLastError()));
+      return finish(1);
+    }
+    if (limits.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE) {
+      guardLog("guard-in-job: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE is unsafe.");
+      return finish(1);
+    }
+    guardLog("guard-in-job: enclosing job has no KILL_ON_JOB_CLOSE limit.");
+  }
   HANDLE watched = OpenProcess(SYNCHRONIZE, FALSE, parentPid);
   if (!watched) {
     guardLog("OpenProcess failed: " + std::to_string(GetLastError()));
