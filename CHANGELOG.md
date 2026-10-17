@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.5.0 (2026-10-17)
+
+- Add the ETL v2 protocol: a UDP session mode framed inside the same TLS 1.3
+  connection on TCP 443. Clients authenticate with `{"v":2,"mode":"udp"}` and
+  exchange datagrams as a JSON destination frame plus a length-prefixed payload
+  of up to 1500 bytes. The server reuses the v1 destination policy per packet,
+  keeps one outbound socket per destination with least-recently-used eviction
+  and rejects blocked destinations without tearing the session down.
+- Accept SOCKS5 UDP ASSOCIATE on the local fronts. The Node client and the
+  Windows native client relay association datagrams through one v2 session, so
+  UDP applications can use the same loopback proxy as TCP connections.
+- Add an experimental system-wide VPN mode to the Windows client behind the
+  `--headless --vpn 1 --vpn-scope IP` flags. Traffic to the scoped address is
+  routed through a wintun adapter and the bundled hev-socks5-tunnel build into
+  the existing SOCKS5 front, so every flow keeps its own TLS 1.3 connection.
+  The server host route is pinned to the physical gateway, a watchdog process
+  restores routes if the client dies, and scoped /32 routing was validated on
+  networks with TLS interception. Full default-route takeover and the desktop
+  toggle are not part of this release.
+- Add a full-path benchmark (`scripts/bench.js`) recording single-flow
+  throughput and setup latency for comparisons across releases.
+
+Servers must upgrade to this release to accept v2 UDP sessions; v1 TCP flows
+are unchanged, so older clients keep working during the upgrade.
+
 ## 0.4.0 (2026-10-14)
 
 - Check for stable GitHub Releases at startup and once an hour in the Windows
