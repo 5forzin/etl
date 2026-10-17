@@ -12,13 +12,25 @@ struct VpnStatus {
   std::wstring detail;
 };
 
+struct RoutePlan {
+  std::string server;
+  std::string gateway;
+  unsigned long interfaceIndex = 0;
+  bool ok = false;
+};
+
+RoutePlan planRoutes(const std::wstring& server);
+void checkpoint(const char* step);
+
 class Vpn {
  public:
-  // A scope installs only its /32 and leaves DNS alone. Empty scope pairs
-  // mapdns with its fake-IP route; default-route takeover is not implemented.
-  bool start(int localPort, const std::wstring& server, int serverPort,
+  // A scope installs only its /32 and leaves DNS alone. Empty scope routes
+  // IPv4 and IPv6 through the TUN and pairs mapdns with its fake-IP route.
+  bool start(int localPort, const RoutePlan& plan,
              const std::wstring& scope, std::wstring& error);
   void stop();
+  // Returns true on engine exit or wait failure; logs the reason for teardown.
+  bool waitEngine(unsigned long timeoutMs) const;
   VpnStatus status() const;
   ~Vpn() { stop(); }
 
@@ -29,6 +41,9 @@ class Vpn {
   std::wstring serverRoute_;    // host route to remove on stop
   std::wstring scopeRoute_;     // scoped test route to remove on stop
   bool mapDnsRoute_ = false;
+  unsigned long fullAdapter_ = 0;
+  bool defaultRoutes_[2]{};
+  bool ipv6Routes_[2]{};
 };
 
 bool extractRuntime(const std::filesystem::path& directory, std::wstring& error);

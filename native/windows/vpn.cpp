@@ -32,6 +32,8 @@ static const int kComponentIds[] = {IDR_HEV_EXE, IDR_MSYS_DLL, IDR_WINTUN_DLL};
 static const wchar_t kAdapterName[] = L"ETL";
 static const wchar_t kTunAddress[] = L"198.18.0.1";
 static const wchar_t kTunDns[] = L"198.18.0.2";
+static const wchar_t* const kHalfDefaults[] = {L"0.0.0.0", L"128.0.0.0"};
+static const wchar_t* const kIpv6HalfDefaults[] = {L"::/1", L"8000::/1"};
 
 static std::wstring widen(const std::string& value) {
   if (value.empty()) return {};
@@ -155,7 +157,7 @@ static bool runCommand(const std::wstring& command, std::string* error = nullptr
 
 // Startup checkpoint log: the VPN path runs elevated and windowless, so a
 // crash leaves nothing behind unless each step writes here first.
-static void checkpoint(const char* step) {
+void checkpoint(const char* step) {
   std::ofstream out(runtimeDirectory() / L"error.log", std::ios::app);
   if (out) out << step << "\n";
 }
@@ -221,14 +223,7 @@ static DWORD waitForAdapter(const std::wstring& name, const char* address, int s
   return 0;
 }
 
-struct RoutePlan {
-  std::string server;
-  std::string gateway;
-  DWORD interfaceIndex = 0;
-  bool ok = false;
-};
-
-static RoutePlan planRoutes(const std::wstring& server) {
+RoutePlan planRoutes(const std::wstring& server) {
   RoutePlan plan;
   ADDRINFOW hints{};
   hints.ai_family = AF_INET;
@@ -395,7 +390,7 @@ int runGuard(const std::wstring& server, unsigned long parentPid,
   return finish(removed ? 0 : 1);
 }
 
-bool Vpn::start(int localPort, const std::wstring& server, int serverPort,
+bool Vpn::start(int localPort, const RoutePlan& plan,
                 const std::wstring& scope, std::wstring& error) {
   try {
     checkpoint("start");
@@ -410,7 +405,6 @@ bool Vpn::start(int localPort, const std::wstring& server, int serverPort,
       error = L"Engine configuration could not be written."; return false;
     }
     checkpoint("plan");
-    const RoutePlan plan = planRoutes(server);
     if (!plan.ok) { error = L"Server address or default route unavailable."; return false; }
     checkpoint("plan-ok", plan.server + " via " + (plan.gateway.empty() ? std::string("if") : plan.gateway));
     const std::wstring serverIp = widen(plan.server);
@@ -505,6 +499,29 @@ bool Vpn::start(int localPort, const std::wstring& server, int serverPort,
         return false;
       }
       mapDnsRoute_ = true;
+      fullAdapter_ = adapter;
+      // More-specific routes preserve the physical default and the server /32.
+      checkpoint("default-routes");
+      for (size_t i = 0; i < 2; ++i) {
+        if (!runCommand(L"route add " + std::wstring(kHalfDefaults[i]) +
+            L" mask 128.0.0.0 " + kTunAddress + L" metric 1 if " + std::to_wstring(adapter))) {
+          stop();
+          error = L"IPv4 default route could not be installed.";
+          return false;
+        }
+        defaultRoutes_[i] = true;
+      }
+      checkpoint("ipv6-routes");
+      for (size_t i = 0; i < 2; ++i) {
+        if (!runCommand(L"netsh interface ipv6 add route prefix=" +
+            std::wstring(kIpv6HalfDefaults[i]) + L" interface=\"" + kAdapterName +
+            L"\" nexthop=:: metric=1 store=active")) {
+          stop();
+          error = L"IPv6 default route could not be installed.";
+          return false;
+        }
+        ipv6Routes_[i] = true;
+      }
       checkpoint("dns", std::to_string(adapter));
       if (!runCommand(L"netsh interface ip set dns name=\"" + std::wstring(kAdapterName) +
           L"\" static " + kTunDns + L" validate=no")) {
@@ -534,11 +551,25 @@ static void stopGuard(void*& guard) {
 
 void Vpn::stop() {
   if (!job_ && !process_ && !guard_ && serverRoute_.empty() &&
-      scopeRoute_.empty() && !mapDnsRoute_) return;
+      scopeRoute_.empty() && !mapDnsRoute_ && !fullAdapter_) return;
   HANDLE job = static_cast<HANDLE>(job_);
   HANDLE process = static_cast<HANDLE>(process_);
   job_ = nullptr;
   process_ = nullptr;
+  for (size_t i = 0; i < 2; ++i) {
+    if (!defaultRoutes_[i]) continue;
+    runCommand(L"route delete " + std::wstring(kHalfDefaults[i]) +
+      L" mask 128.0.0.0 " + kTunAddress + L" if " + std::to_wstring(fullAdapter_));
+    defaultRoutes_[i] = false;
+  }
+  for (size_t i = 0; i < 2; ++i) {
+    if (!ipv6Routes_[i]) continue;
+    runCommand(L"netsh interface ipv6 delete route prefix=" +
+      std::wstring(kIpv6HalfDefaults[i]) + L" interface=\"" + kAdapterName +
+      L"\" nexthop=:: store=active");
+    ipv6Routes_[i] = false;
+  }
+  fullAdapter_ = 0;
   if (!scopeRoute_.empty()) {
     runCommand(L"route delete " + scopeRoute_);
     scopeRoute_.clear();
@@ -561,6 +592,15 @@ void Vpn::stop() {
   }
   runCommand(L"ipconfig /flushdns");
   stopGuard(guard_);
+}
+
+bool Vpn::waitEngine(unsigned long timeoutMs) const {
+  if (!process_) return true;
+  const DWORD wait = WaitForSingleObject(static_cast<HANDLE>(process_), timeoutMs);
+  if (wait == WAIT_TIMEOUT) return false;
+  if (wait == WAIT_OBJECT_0) checkpoint("engine-died");
+  else checkpoint("engine-wait-error", std::to_string(GetLastError()));
+  return true;
 }
 
 VpnStatus Vpn::status() const {

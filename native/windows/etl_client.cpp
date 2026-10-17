@@ -61,10 +61,10 @@ struct Config {
   int idleTimeoutMs = 120000;
   int localPort = 1080;
   std::wstring caFile;
-  // VPN mode: engine + TUN adapter, optionally restricted to one scoped /32
-  // route for validation before any default-route takeover.
+  // VPN mode: engine + TUN adapter, optionally restricted to one scoped /32.
   bool vpn = false;
   std::wstring vpnScope;
+  std::string vpnServerIp;
 };
 
 static std::string utf8(const std::wstring& value) {
@@ -567,6 +567,9 @@ static void httpReply(SOCKET s, int status) {
 
 using ConnectClock = std::chrono::steady_clock;
 
+static SOCKET connectAddresses(ADDRINFOEXW* addresses, const std::atomic<bool>& running,
+                               ConnectClock::time_point deadline);
+
 static SOCKET connectServer(const std::wstring& host, int port, const std::atomic<bool>& running,
                             ConnectClock::time_point deadline) {
   if (!running) return INVALID_SOCKET;
@@ -609,6 +612,13 @@ static SOCKET connectServer(const std::wstring& host, int port, const std::atomi
     if (addresses) FreeAddrInfoExW(addresses);
     return INVALID_SOCKET;
   }
+  const SOCKET result = connectAddresses(addresses, running, deadline);
+  FreeAddrInfoExW(addresses);
+  return result;
+}
+
+static SOCKET connectAddresses(ADDRINFOEXW* addresses, const std::atomic<bool>& running,
+                               ConnectClock::time_point deadline) {
   // Keep the OS-preferred family first, but give the other family a prompt try.
   std::vector<ADDRINFOEXW*> preferred, alternate, order;
   int preferredFamily = AF_UNSPEC;
@@ -683,7 +693,6 @@ static SOCKET connectServer(const std::wstring& host, int port, const std::atomi
     if (pending.empty()) nextAttempt = Clock::now();
   }
   for (SOCKET s : pending) closesocket(s);
-  FreeAddrInfoExW(addresses);
   if (result != INVALID_SOCKET) {
     u_long nonblocking = 0;
     if (ioctlsocket(result, FIONBIO, &nonblocking) != 0 || !running) {
@@ -696,6 +705,21 @@ static SOCKET connectServer(const std::wstring& host, int port, const std::atomi
     setsockopt(result, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<char*>(&timeout), sizeof(timeout));
   }
   return result;
+}
+
+static SOCKET connectPinned(const std::string& ip, int port, const std::atomic<bool>& running,
+                             ConnectClock::time_point deadline) {
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_port = htons(static_cast<u_short>(port));
+  if (InetPtonA(AF_INET, ip.c_str(), &address.sin_addr) != 1) return INVALID_SOCKET;
+  ADDRINFOEXW target{};
+  target.ai_family = AF_INET;
+  target.ai_socktype = SOCK_STREAM;
+  target.ai_protocol = IPPROTO_TCP;
+  target.ai_addr = reinterpret_cast<sockaddr*>(&address);
+  target.ai_addrlen = sizeof(address);
+  return connectAddresses(&target, running, deadline);
 }
 
 static void addWindowsTrust(SSL_CTX* ctx) {
@@ -794,7 +818,9 @@ class Service {
     const auto& endpoint = fallback ? config_.fallbackServer : config_.server;
     const int endpointPort = fallback ? config_.fallbackPort : config_.serverPort;
     const auto deadline = ConnectClock::now() + std::chrono::milliseconds(config_.connectTimeoutMs);
-    remote = connectServer(endpoint, endpointPort, running_, deadline);
+    remote = !fallback && !config_.vpnServerIp.empty() ?
+      connectPinned(config_.vpnServerIp, endpointPort, running_, deadline) :
+      connectServer(endpoint, endpointPort, running_, deadline);
     if (remote == INVALID_SOCKET) return false;
     {
       std::lock_guard<std::mutex> lock(mu_);
@@ -1337,15 +1363,30 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
       LocalFree(argv); WSACleanup(); return 0;
     }
     std::wstring error;
+    etlvpn::RoutePlan plan;
+    const bool fallbackDisabled = c.vpn && !c.fallbackServer.empty();
+    if (c.vpn) {
+      plan = etlvpn::planRoutes(c.server);
+      if (!plan.ok) {
+        fwprintf(stderr, L"Server address or default route unavailable.\n");
+        LocalFree(argv); WSACleanup(); return 4;
+      }
+      c.vpnServerIp = plan.server;
+      c.fallbackServer.clear();
+    }
     int result = service.start(c, error) ? 0 : 3;
     if (!result && c.vpn) {
-      if (!vpn.start(c.localPort, c.server, c.serverPort, c.vpnScope, error)) result = 4;
+      if (!vpn.start(c.localPort, plan, c.vpnScope, error)) result = 4;
+      if (!result && fallbackDisabled) etlvpn::checkpoint("vpn-fallback-disabled");
     }
     // The global Service destructor must never see joinable threads.
     if (result) {
       vpn.stop();
       service.stop();
       LocalFree(argv); WSACleanup(); return result;
+    }
+    while (vpn.status().active) {
+      if (vpn.waitEngine(1000)) vpn.stop();
     }
     while (true) Sleep(1000);
   }
