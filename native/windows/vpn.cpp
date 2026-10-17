@@ -32,7 +32,6 @@ static const int kComponentIds[] = {IDR_HEV_EXE, IDR_MSYS_DLL, IDR_WINTUN_DLL};
 static const wchar_t kAdapterName[] = L"ETL";
 static const wchar_t kTunAddress[] = L"198.18.0.1";
 static const wchar_t kTunDns[] = L"198.18.0.2";
-static const wchar_t kGuardTask[] = L"ETL-VPNGuard";
 
 static std::wstring widen(const std::string& value) {
   if (value.empty()) return {};
@@ -174,7 +173,11 @@ static bool writeConfig(const std::filesystem::path& path, int localPort) {
   return static_cast<bool>(out);
 }
 
-static DWORD waitForAdapter(const std::wstring& name, int seconds) {
+// Wait until the engine has fully configured the adapter: routes added
+// before the address assignment can be flushed by the configuration change.
+static DWORD waitForAdapter(const std::wstring& name, const char* address, int seconds) {
+  in_addr wanted{};
+  inet_pton(AF_INET, address, &wanted);
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
   while (std::chrono::steady_clock::now() < deadline) {
     ULONG size = 0;
@@ -185,7 +188,14 @@ static DWORD waitForAdapter(const std::wstring& name, int seconds) {
       PIP_ADAPTER_ADDRESSES adapters = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data());
       if (GetAdaptersAddresses(AF_INET, flags, nullptr, adapters, &size) == NO_ERROR) {
         for (auto adapter = adapters; adapter; adapter = adapter->Next) {
-          if (adapter->FriendlyName && name == adapter->FriendlyName) return adapter->IfIndex;
+          if (!adapter->FriendlyName || name != adapter->FriendlyName) continue;
+          for (auto unicast = adapter->FirstUnicastAddress; unicast; unicast = unicast->Next) {
+            const sockaddr_in* ipv4 = reinterpret_cast<const sockaddr_in*>(unicast->Address.lpSockaddr);
+            if (ipv4->sin_family == AF_INET && ipv4->sin_addr.s_addr == wanted.s_addr &&
+                adapter->OperStatus == IfOperStatusUp) {
+              return adapter->IfIndex;
+            }
+          }
         }
       }
     }
@@ -233,33 +243,24 @@ static RoutePlan planRoutes(const std::wstring& server) {
   return plan;
 }
 
-static bool armGuard(const std::wstring& server) {
-  const std::time_t fireAt = std::time(nullptr) + 240;
-  const std::tm* local = std::localtime(&fireAt);
-  if (!local) return false;
-  SYSTEMTIME when{};
-  when.wYear = local->tm_year + 1900;
-  when.wMonth = static_cast<WORD>(local->tm_mon + 1);
-  when.wDay = static_cast<WORD>(local->tm_mday);
-  when.wHour = static_cast<WORD>(local->tm_hour);
-  when.wMinute = static_cast<WORD>(local->tm_min);
-  wchar_t day[32]{}, moment[16]{};
-  // schtasks parses /sd in the user's short-date format, so ask the system
-  // for exactly that instead of assuming an ISO ordering.
-  if (!GetDateFormatW(LOCALE_USER_DEFAULT, DATE_SHORTDATE, &when, nullptr, day, 32) ||
-      !GetTimeFormatW(LOCALE_USER_DEFAULT, 0, &when, L"HH:mm", moment, 16)) return false;
-  // If this process dies without cleanup, the guard removes the only route
-  // that outlives the adapter and then removes itself. The dash-only task
-  // name keeps the /tr value free of nested quotes.
-  const std::wstring restore = L"cmd.exe /c route delete " + server +
-    L" >nul 2>&1 & schtasks /delete /tn " + kGuardTask + L" /f >nul 2>&1";
-  const std::wstring command = std::wstring(L"schtasks /create /tn ") + kGuardTask +
-    L" /sc once /sd " + day + L" /st " + moment + L" /tr \"" + restore + L"\" /f";
-  return runCommand(command);
-}
-
-static bool disarmGuard() {
-  return runCommand(L"schtasks /delete /tn \"" + std::wstring(kGuardTask) + L"\" /f");
+// The dead-man switch is a second copy of this executable watching the
+// parent process; it is deliberately NOT assigned to the engine job so a
+// crash of the main client still leaves a cleaner behind.
+static bool spawnGuard(const std::wstring& server, HANDLE& guard) {
+  wchar_t path[MAX_PATH]{};
+  if (!GetModuleFileNameW(nullptr, path, MAX_PATH)) return false;
+  std::wstring command(std::wstring(L"\"") + path + L"\" --vpn-guard " + server +
+    L" " + std::to_wstring(GetCurrentProcessId()));
+  std::vector<wchar_t> mutableCommand(command.begin(), command.end());
+  mutableCommand.push_back(L'\0');
+  STARTUPINFOW startup{};
+  startup.cb = sizeof(startup);
+  PROCESS_INFORMATION process{};
+  if (!CreateProcessW(nullptr, mutableCommand.data(), nullptr, nullptr, FALSE,
+      CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) return false;
+  CloseHandle(process.hThread);
+  guard = process.hProcess;
+  return true;
 }
 
 bool Vpn::start(int localPort, const std::wstring& server, int serverPort,
@@ -282,10 +283,12 @@ bool Vpn::start(int localPort, const std::wstring& server, int serverPort,
     checkpoint("plan-ok", plan.server + " via " + (plan.gateway.empty() ? std::string("if") : plan.gateway));
     const std::wstring serverIp = widen(plan.server);
     const std::wstring gateway = widen(plan.gateway);
+    HANDLE guard = nullptr;
     checkpoint("guard");
-    if (!armGuard(serverIp)) {
+    if (!spawnGuard(serverIp, guard)) {
       error = L"Restoration guard could not be armed."; return false;
     }
+    guard_ = guard;
     // The engine must reach the ETL server outside the tunnel, so the host
     // route goes in before anything points at the adapter.
     std::wstring hostRoute(L"route add ");
@@ -299,7 +302,6 @@ bool Vpn::start(int localPort, const std::wstring& server, int serverPort,
     }
     checkpoint("host-route");
     if (!runCommand(hostRoute)) {
-      disarmGuard();
       error = L"Server host route could not be installed."; return false;
     }
     serverRoute_ = serverIp;
@@ -307,7 +309,6 @@ bool Vpn::start(int localPort, const std::wstring& server, int serverPort,
     HANDLE job = CreateJobObjectW(nullptr, nullptr);
     if (!job) {
       runCommand(L"route delete " + serverIp);
-      disarmGuard();
       error = L"Job object failed.";
       return false;
     }
@@ -326,21 +327,19 @@ bool Vpn::start(int localPort, const std::wstring& server, int serverPort,
         FALSE, CREATE_NO_WINDOW, nullptr, directory.c_str(), &startup, &process)) {
       CloseHandle(job);
       runCommand(L"route delete " + serverIp);
-      disarmGuard();
       error = L"TUN engine could not start.";
       return false;
     }
     AssignProcessToJobObject(job, process.hProcess);
     CloseHandle(process.hThread);
     checkpoint("adapter-wait");
-    const DWORD adapter = waitForAdapter(kAdapterName, 12);
+    const DWORD adapter = waitForAdapter(kAdapterName, "198.18.0.1", 20);
     if (!adapter) {
       checkpoint("adapter-timeout");
       TerminateJobObject(job, 1);
       CloseHandle(process.hProcess);
       CloseHandle(job);
       runCommand(L"route delete " + serverIp);
-      disarmGuard();
       error = L"TUN adapter did not come up.";
       return false;
     }
@@ -367,8 +366,18 @@ bool Vpn::start(int localPort, const std::wstring& server, int serverPort,
   }
 }
 
+static void stopGuard(void*& guard) {
+  if (!guard) return;
+  HANDLE handle = static_cast<HANDLE>(guard);
+  guard = nullptr;
+  // On a clean stop the watchdog is unnecessary; after a crash it has
+  // already seen the parent die and cleaned up on its own.
+  TerminateProcess(handle, 0);
+  CloseHandle(handle);
+}
+
 void Vpn::stop() {
-  if (!job_) return;
+  if (!job_) { stopGuard(guard_); return; }
   HANDLE job = static_cast<HANDLE>(job_);
   HANDLE process = static_cast<HANDLE>(process_);
   job_ = nullptr;
@@ -385,7 +394,7 @@ void Vpn::stop() {
     runCommand(L"route delete " + serverRoute_);
     serverRoute_.clear();
   }
-  disarmGuard();
+  stopGuard(guard_);
 }
 
 VpnStatus Vpn::status() const {

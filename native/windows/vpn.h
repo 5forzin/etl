@@ -25,6 +25,7 @@ class Vpn {
  private:
   void* job_ = nullptr;         // HANDLE, kills the engine with this process
   void* process_ = nullptr;     // HANDLE of hev-socks5-tunnel.exe
+  void* guard_ = nullptr;       // HANDLE of the --vpn-guard watchdog copy
   std::wstring serverRoute_;    // host route to remove on stop
   std::wstring scopeRoute_;     // scoped test route to remove on stop
   bool routed_ = false;
