@@ -75,7 +75,9 @@ export function createTunnelServer({ key, cert, getToken, maxConnections = 128,
     });
   });
   server.maxConnections = maxConnections;
-  server.on('tlsClientError', () => {});
+  // A custom TLS error listener must close failed handshakes, including peers
+  // that disconnect before secureConnection installs the protocol deadlines.
+  server.on('tlsClientError', (_error, socket) => socket.destroy());
   return track(server);
 }
 

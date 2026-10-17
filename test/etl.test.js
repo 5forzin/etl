@@ -221,6 +221,45 @@ test('connection limit rejects additional sockets', { timeout: 3000 }, async (t)
   await assert.rejects(secure(t, port));
 });
 
+test('aborted TLS handshakes release the connection limit', { timeout: 5000 }, async (t) => {
+  const server = createTunnelServer({ key, cert, getToken: () => token,
+    maxConnections: 1, handshakeTimeout: 200 });
+  const port = await listen(server, t);
+  for (const bytes of [Buffer.alloc(0), Buffer.from([0x16, 0x03, 0x01, 0x00])]) {
+    const accepted = once(server, 'connection');
+    const peer = protect(net.connect({ host: '127.0.0.1', port }), 2000);
+    const peerConnected = connected(peer);
+    t.after(() => peer.destroy());
+    const [socket] = await accepted;
+    const closed = once(socket, 'close', { signal: AbortSignal.timeout(1000) });
+    await peerConnected;
+    peer.end(bytes);
+    peer.resume();
+    await closed;
+    assert.equal(await new Promise((resolve, reject) => server.getConnections(
+      (error, count) => error ? reject(error) : resolve(count))), 0);
+  }
+  const socket = await secure(t, port);
+  writeFrame(socket, { v: 1, token });
+  assert.equal((await readFrame(socket)).code, 'OK');
+});
+
+test('stalled TLS handshakes release the connection limit', { timeout: 3000 }, async (t) => {
+  const server = createTunnelServer({ key, cert, getToken: () => token,
+    maxConnections: 1, handshakeTimeout: 100 });
+  const port = await listen(server, t);
+  const accepted = once(server, 'connection');
+  const peer = protect(net.connect({ host: '127.0.0.1', port }), 2000);
+  t.after(() => peer.destroy());
+  const [socket] = await accepted;
+  const closed = once(socket, 'close', { signal: AbortSignal.timeout(1000) });
+  peer.resume();
+  await closed;
+  const secureSocket = await secure(t, port);
+  writeFrame(secureSocket, { v: 1, token });
+  assert.equal((await readFrame(secureSocket)).code, 'OK');
+});
+
 test('client abandons a TLS blackhole after its one-second budget and uses a separate backup token',
   { timeout: 6000 }, async (t) => {
   let stalledSocket;
