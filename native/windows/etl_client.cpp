@@ -12,6 +12,7 @@
 #include <condition_variable>
 #include <cctype>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -24,6 +25,7 @@
 #include <algorithm>
 #include "desktop_ui.h"
 #include "resources.h"
+#include "vpn.h"
 #include <windowsx.h>
 #include <dwmapi.h>
 
@@ -59,6 +61,10 @@ struct Config {
   int idleTimeoutMs = 120000;
   int localPort = 1080;
   std::wstring caFile;
+  // VPN mode: engine + TUN adapter, optionally restricted to one scoped /32
+  // route for validation before any default-route takeover.
+  bool vpn = false;
+  std::wstring vpnScope;
 };
 
 static std::string utf8(const std::wstring& value) {
@@ -266,6 +272,127 @@ static bool responseOK(SSL* ssl) {
   return sslRead(ssl, body.data(), n) && body == "{\"code\":\"OK\"}";
 }
 
+static std::string jsonEscape(const std::string& value) {
+  std::string out;
+  for (unsigned char c : value) {
+    if (c == '"' || c == '\\') { out += '\\'; out += char(c); }
+    else if (c >= 0x20 && c < 0x7f) out += char(c);
+    else return {};
+  }
+  return out;
+}
+
+// SOCKS5 UDP datagram header (RFC 1928 section 7): RSV, FRAG, ATYP, address,
+// port, then the raw payload. Fragmented datagrams are dropped, not relayed.
+struct UdpDatagram {
+  std::string host;
+  int port = 0;
+  std::vector<unsigned char> payload;
+};
+
+static bool parseUdpDatagram(const unsigned char* data, size_t size, UdpDatagram& out) {
+  if (size < 4 || data[0] || data[1] || data[2]) return false;
+  size_t offset = 3;
+  char address[INET6_ADDRSTRLEN]{};
+  if (data[offset] == 1) {
+    if (size < offset + 7) return false;
+    InetNtopA(AF_INET, data + offset + 1, address, sizeof(address));
+    offset += 5;
+  } else if (data[offset] == 3) {
+    const size_t length = data[offset + 1];
+    if (!length || size < offset + 4 + length) return false;
+    out.host.assign(reinterpret_cast<const char*>(data) + offset + 2, length);
+    offset += 2 + length;
+  } else if (data[offset] == 4) {
+    if (size < offset + 19) return false;
+    InetNtopA(AF_INET6, data + offset + 1, address, sizeof(address));
+    offset += 17;
+  } else return false;
+  if (address[0]) out.host = address;
+  if (size < offset + 2) return false;
+  out.port = (int(data[offset]) << 8) | data[offset + 1];
+  out.payload.assign(data + offset + 2, data + size);
+  return out.port > 0 && !out.host.empty() && !jsonEscape(out.host).empty();
+}
+
+static std::vector<unsigned char> buildUdpDatagram(const std::string& host, int port,
+                                                   const unsigned char* payload, size_t size) {
+  std::vector<unsigned char> out;
+  in_addr ipv4{};
+  in6_addr ipv6{};
+  unsigned char type = 3;
+  size_t addressSize = host.size();
+  if (InetPtonA(AF_INET, host.c_str(), &ipv4) == 1) {
+    type = 1; addressSize = 4;
+  } else if (InetPtonA(AF_INET6, host.c_str(), &ipv6) == 1) {
+    type = 4; addressSize = 16;
+  } else if (host.empty() || host.size() > 255) return out;
+  out.reserve(4 + addressSize + 2 + size);
+  out.push_back(0); out.push_back(0); out.push_back(0); out.push_back(type);
+  if (type == 1) out.insert(out.end(), reinterpret_cast<unsigned char*>(&ipv4),
+    reinterpret_cast<unsigned char*>(&ipv4) + 4);
+  else if (type == 4) out.insert(out.end(), reinterpret_cast<unsigned char*>(&ipv6),
+    reinterpret_cast<unsigned char*>(&ipv6) + 16);
+  else {
+    out.push_back(static_cast<unsigned char>(host.size()));
+    out.insert(out.end(), host.begin(), host.end());
+  }
+  out.push_back(static_cast<unsigned char>(port >> 8));
+  out.push_back(static_cast<unsigned char>(port & 0xff));
+  out.insert(out.end(), payload, payload + size);
+  return out;
+}
+
+// ETL v2 datagram framing over the TLS session: a {host, port} frame, a
+// 16-bit payload length and the payload. Control frames ({code}) share the
+// framing so the server can drop one datagram without killing the session.
+static bool writeDatagram(SSL* ssl, const std::string& host, int port,
+                          const unsigned char* payload, size_t size) {
+  if (!size || size > 1500) return true;  // Mirrors the server-side cap.
+  const std::string header = "{\"host\":\"" + jsonEscape(host) + "\",\"port\":" + std::to_string(port) + "}";
+  if (header.size() < 2 || header.size() > 1024) return true;
+  const unsigned char prefix[2] = {static_cast<unsigned char>(header.size() >> 8),
+    static_cast<unsigned char>(header.size())};
+  const unsigned char length[2] = {static_cast<unsigned char>(size >> 8),
+    static_cast<unsigned char>(size)};
+  return sslWrite(ssl, prefix, 2) && sslWrite(ssl, header.data(), header.size()) &&
+         sslWrite(ssl, length, 2) && sslWrite(ssl, payload, size);
+}
+
+class DatagramReader {
+ public:
+  // 1 = datagram ready, 0 = need more bytes, -1 = framing violation.
+  int next(UdpDatagram& datagram, bool& dropped) {
+    dropped = false;
+    if (buffer_.size() < 2) return 0;
+    const size_t headerSize = (size_t(static_cast<unsigned char>(buffer_[0])) << 8) |
+      static_cast<unsigned char>(buffer_[1]);
+    if (headerSize < 2 || headerSize > 1024) return -1;
+    if (buffer_.size() < 2 + headerSize + 2) return 0;
+    const std::string header(buffer_.data() + 2, headerSize);
+    const size_t length = (size_t(static_cast<unsigned char>(buffer_[2 + headerSize])) << 8) |
+      static_cast<unsigned char>(buffer_[3 + headerSize]);
+    if (!length || length > 1500) return -1;
+    if (buffer_.size() < 4 + headerSize + length) return 0;
+    datagram.payload.assign(buffer_.begin() + 4 + headerSize,
+      buffer_.begin() + 4 + headerSize + length);
+    buffer_.erase(0, 4 + headerSize + length);
+    if (header.rfind("{\"code\":", 0) == 0) { dropped = true; return 1; }
+    const std::string needle = "\"host\":\"";
+    const size_t hostAt = header.find(needle);
+    const size_t portAt = header.find("\",\"port\":");
+    if (hostAt == std::string::npos || portAt == std::string::npos) return -1;
+    datagram.host = header.substr(hostAt + needle.size(), portAt - hostAt - needle.size());
+    datagram.port = std::atoi(header.c_str() + portAt + 9);
+    if (datagram.port < 1 || datagram.port > 65535 || jsonEscape(datagram.host).empty()) return -1;
+    return 1;
+  }
+  void feed(const char* data, size_t size) { buffer_.append(data, size); }
+
+ private:
+  std::string buffer_;
+};
+
 // A socket timeout resets whenever bytes arrive; a protocol deadline must not.
 class SocketBudget {
  public:
@@ -288,22 +415,19 @@ class SocketBudget {
   std::thread guard_;
 };
 
-static std::string jsonEscape(const std::string& value) {
-  std::string out;
-  for (unsigned char c : value) {
-    if (c == '"' || c == '\\') { out += '\\'; out += char(c); }
-    else if (c >= 0x20 && c < 0x7f) out += char(c);
-    else return {};
-  }
-  return out;
-}
-
 static void socksReply(SOCKET s, unsigned char code) {
   const unsigned char reply[]{5, code, 0, 1, 0, 0, 0, 0, 0, 0};
   socketWrite(s, reply, sizeof(reply));
 }
 
-static bool socksRequest(SOCKET s, std::string& host, int& port, const std::atomic<bool>& running) {
+static void socksReplyBind(SOCKET s, unsigned char code, unsigned short port) {
+  const unsigned char reply[]{5, code, 0, 1, 127, 0, 0, 0,
+    static_cast<unsigned char>(port >> 8), static_cast<unsigned char>(port & 0xff)};
+  socketWrite(s, reply, sizeof(reply));
+}
+
+static bool socksRequest(SOCKET s, std::string& host, int& port,
+                         const std::atomic<bool>& running, int& command) {
   unsigned char header[4]{5};
   if (!socketRead(s, header + 1, 1, running) || header[1] == 0) return false;
   std::vector<unsigned char> methods(header[1]);
@@ -313,7 +437,8 @@ static bool socksRequest(SOCKET s, std::string& host, int& port, const std::atom
   }
   const unsigned char accepted[]{5, 0};
   if (!socketWrite(s, accepted, 2) || !socketRead(s, header, 4, running) || header[0] != 5 || header[2] != 0) return false;
-  if (header[1] != 1) { socksReply(s, 7); return false; }
+  if (header[1] != 1 && header[1] != 3) { socksReply(s, 7); return false; }
+  command = header[1];
   char address[INET6_ADDRSTRLEN]{};
   if (header[3] == 1 || header[3] == 4) {
     unsigned char bytes[16];
@@ -330,6 +455,7 @@ static bool socksRequest(SOCKET s, std::string& host, int& port, const std::atom
   unsigned char bytes[2];
   if (!socketRead(s, bytes, 2, running)) return false;
   port = (int(bytes[0]) << 8) | bytes[1];
+  if (command == 3) return true;  // The associate destination is advisory.
   return port > 0 && !jsonEscape(host).empty();
 }
 
@@ -664,7 +790,7 @@ class Service {
     }
   }
 
-  bool openTunnel(bool fallback, SOCKET& remote, SSL*& ssl) {
+  bool openTunnel(bool fallback, SOCKET& remote, SSL*& ssl, bool udpSession = false) {
     const auto& endpoint = fallback ? config_.fallbackServer : config_.server;
     const int endpointPort = fallback ? config_.fallbackPort : config_.serverPort;
     const auto deadline = ConnectClock::now() + std::chrono::milliseconds(config_.connectTimeoutMs);
@@ -703,8 +829,8 @@ class Service {
           std::string token;
           if (tokenForConfig(config_, token, fallback)) {
             std::string auth;
-            auth.reserve(token.size() + 20);
-            auth.assign("{\"v\":1,\"token\":\"");
+            auth.reserve(token.size() + 32);
+            auth.assign(udpSession ? "{\"v\":2,\"mode\":\"udp\",\"token\":\"" : "{\"v\":1,\"token\":\"");
             auth.append(token);
             auth.append("\"}");
             ok = writeFrame(ssl, auth);
@@ -773,12 +899,13 @@ class Service {
     SocketBudget negotiation(client, config_.handshakeTimeoutMs);
     std::string host;
     int port = 0;
+    int command = 1;
     unsigned char first;
     if (!socketRead(client, &first, 1, running_) || !running_) return;
     bool socks = first == 5;
     HttpRequest http;
     if (socks) {
-      if (!socksRequest(client, host, port, running_)) return;
+      if (!socksRequest(client, host, port, running_, command)) return;
     } else {
       if (!httpRequest(client, static_cast<char>(first), http, running_)) {
         httpReply(client, 400); return;
@@ -787,6 +914,10 @@ class Service {
     }
     negotiation.cancel();
     if (!running_) return;
+    if (socks && command == 3) {
+      udpAssociate(client);
+      return;
+    }
     SOCKET remote = INVALID_SOCKET;
     SSL* ssl = nullptr;
     bool ok = false;
@@ -820,6 +951,95 @@ class Service {
     if (ssl) SSL_free(ssl);
     { std::lock_guard<std::mutex> lock(mu_); sockets_.erase(remote); }
     closesocket(remote);
+  }
+
+  // One UDP ASSOCIATE gets one v2 TLS session; the association lives as long
+  // as the local control connection. Datagrams only ever cross 127.0.0.1.
+  void udpAssociate(SOCKET client) {
+    SOCKET relaySocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (relaySocket == INVALID_SOCKET) { socksReply(client, 1); return; }
+    sockaddr_in relayAddress{};
+    relayAddress.sin_family = AF_INET;
+    relayAddress.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(relaySocket, reinterpret_cast<sockaddr*>(&relayAddress), sizeof(relayAddress))) {
+      closesocket(relaySocket); socksReply(client, 1); return;
+    }
+    sockaddr_in bound{};
+    int boundSize = sizeof(bound);
+    getsockname(relaySocket, reinterpret_cast<sockaddr*>(&bound), &boundSize);
+    SOCKET remote = INVALID_SOCKET;
+    SSL* ssl = nullptr;
+    bool ok = false;
+    const int attempts = config_.fallbackServer.empty() ? 1 : 2;
+    for (int attempt = 0; attempt < attempts && running_; ++attempt) {
+      const bool fallback = attempt != 0;
+      if (fallback && !backupAvailable_) continue;
+      ok = openTunnel(fallback, remote, ssl, true);
+      if (ok) break;
+      if (fallback) backupAvailable_ = false;
+    }
+    if (!ok) { ++failures_; closesocket(relaySocket); socksReply(client, 1); return; }
+    socksReplyBind(client, 0, ntohs(bound.sin_port));
+    sockaddr_in peer{};
+    bool havePeer = false;
+    DatagramReader reader;
+    auto lastActivity = ConnectClock::now();
+    std::vector<unsigned char> incoming(65536);
+    while (running_) {
+      if (ConnectClock::now() - lastActivity >= std::chrono::milliseconds(config_.idleTimeoutMs)) break;
+      fd_set readable; FD_ZERO(&readable);
+      FD_SET(client, &readable); FD_SET(relaySocket, &readable); FD_SET(remote, &readable);
+      timeval timeout{0, 100000};
+      if (select(0, &readable, nullptr, nullptr, &timeout) == SOCKET_ERROR) break;
+      if (FD_ISSET(client, &readable)) {
+        char probe[256];
+        if (recv(client, probe, sizeof(probe), 0) <= 0) break;
+      }
+      if (FD_ISSET(relaySocket, &readable)) {
+        sockaddr_in from{};
+        int fromSize = sizeof(from);
+        const int size = recvfrom(relaySocket, reinterpret_cast<char*>(incoming.data()),
+          static_cast<int>(incoming.size()), 0, reinterpret_cast<sockaddr*>(&from), &fromSize);
+        if (size > 0 && from.sin_addr.s_addr == htonl(INADDR_LOOPBACK)) {
+          peer = from;
+          havePeer = true;
+          lastActivity = ConnectClock::now();
+          UdpDatagram datagram;
+          if (parseUdpDatagram(incoming.data(), static_cast<size_t>(size), datagram)) {
+            if (writeDatagram(ssl, datagram.host, datagram.port,
+                  datagram.payload.data(), datagram.payload.size())) {
+              sent_ += static_cast<uint64_t>(datagram.payload.size());
+            }
+          }
+        }
+      }
+      if (FD_ISSET(remote, &readable) || SSL_pending(ssl) > 0) {
+        char buffer[16384];
+        const int size = SSL_read(ssl, buffer, sizeof(buffer));
+        if (size <= 0) break;
+        received_ += static_cast<uint64_t>(size);
+        lastActivity = ConnectClock::now();
+        reader.feed(buffer, static_cast<size_t>(size));
+        UdpDatagram datagram;
+        bool dropped = false;
+        int state = reader.next(datagram, dropped);
+        while (state == 1) {
+          if (havePeer && !dropped) {
+            const std::vector<unsigned char> outgoing = buildUdpDatagram(datagram.host,
+              datagram.port, datagram.payload.data(), datagram.payload.size());
+            if (!outgoing.empty()) {
+              sendto(relaySocket, reinterpret_cast<const char*>(outgoing.data()),
+                static_cast<int>(outgoing.size()), 0,
+                reinterpret_cast<const sockaddr*>(&peer), sizeof(peer));
+            }
+          }
+          state = reader.next(datagram, dropped);
+        }
+        if (state < 0) break;
+      }
+    }
+    closeTunnel(remote, ssl);
+    closesocket(relaySocket);
   }
 
   void relay(SOCKET local, SOCKET remote, SSL* ssl) {
@@ -869,6 +1089,7 @@ class Service {
 };
 
 static Service service;
+static etlvpn::Vpn vpn;
 static NOTIFYICONDATAW tray{};
 static Config config;
 static std::thread stopThread;
@@ -1041,6 +1262,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     LocalFree(argv); WSACleanup(); return result;
   }
   if (argc == 3 && std::wstring(argv[1]) == L"--cleanup-update") cleanupUpdate(argv[2]);
+  if (argc == 2 && std::wstring(argv[1]) == L"--self-test-vpn-extract") {
+    std::wstring error;
+    const bool ok = etlvpn::selfTestExtract(error);
+    if (!ok) fwprintf(stderr, L"%ls\n", error.c_str());
+    LocalFree(argv); WSACleanup(); return ok ? 0 : 25;
+  }
+  if (argc == 4 && std::wstring(argv[1]) == L"--self-test-vpn-plan") {
+    int port = 0;
+    if (!portValue(argv[3], port)) { LocalFree(argv); WSACleanup(); return 20; }
+    printf("%s\n", etlvpn::selfTestPlan(argv[2], port).c_str());
+    LocalFree(argv); WSACleanup(); return 0;
+  }
   const bool previewOptions = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-options";
   const bool previewError = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-error";
   const bool previewUpdate = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-update";
@@ -1079,11 +1312,32 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         c.idleTimeoutMs = std::stoi(value); if (c.idleTimeoutMs < 1 || c.idleTimeoutMs > 600000) return 20;
       }
       else if (name == L"--port") { if (!portValue(value, c.localPort)) return 21; }
+      else if (name == L"--vpn") { c.vpn = value == L"1"; }
+      else if (name == L"--vpn-scope") {
+        c.vpnScope = value;
+        if (value.empty() || value.size() > 15 ||
+            !std::all_of(value.begin(), value.end(), [](wchar_t ch) {
+              return (ch >= L'0' && ch <= L'9') || ch == L'.'; })) return 20;
+      }
       else return 22;
+    }
+    if (c.vpn && !etlvpn::isElevated()) {
+      // The UAC consent copies the whole headless command line verbatim.
+      std::wstring arguments;
+      for (int i = 1; i < argc; ++i) {
+        if (!arguments.empty()) arguments += L' ';
+        arguments += argv[i];
+      }
+      ShellExecuteW(nullptr, L"runas", argv[0], arguments.c_str(), nullptr, SW_SHOWNORMAL);
+      LocalFree(argv); WSACleanup(); return 0;
     }
     std::wstring error;
     int result = service.start(c, error) ? 0 : 3;
+    if (!result && c.vpn) {
+      if (!vpn.start(c.localPort, c.server, c.serverPort, c.vpnScope, error)) result = 4;
+    }
     if (!result) while (true) Sleep(1000);
+    vpn.stop();
     LocalFree(argv); WSACleanup(); return result;
   }
   LocalFree(argv);

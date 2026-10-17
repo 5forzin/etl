@@ -10,6 +10,28 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_
 string(JSON ETL_VERSION GET "${ETL_PACKAGE}" version)
 string(REPLACE "." "," ETL_RESOURCE_VERSION "${ETL_VERSION}.0")
 get_filename_component(ETL_ICON_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../assets/brand/etl.ico" ABSOLUTE)
+
+# hev-socks5-tunnel 2.19.0 win64 (TUN engine for VPN mode), pinned by checksum:
+# the zip hash anchors the download and per-component hashes anchor extraction.
+set(ETL_HEV_URL https://github.com/heiher/hev-socks5-tunnel/releases/download/2.19.0/hev-socks5-tunnel-win64.zip)
+set(ETL_HEV_ZIP_SHA256 3affbcdd00d699430768bcfa8b79b854a951e30bbb11b011ebb3f7f01aa09928)
+file(DOWNLOAD ${ETL_HEV_URL} "${CMAKE_CURRENT_BINARY_DIR}/hev-win64.zip"
+  EXPECTED_HASH SHA256=${ETL_HEV_ZIP_SHA256} SHOW_PROGRESS)
+file(ARCHIVE_EXTRACT INPUT "${CMAKE_CURRENT_BINARY_DIR}/hev-win64.zip"
+  DESTINATION "${CMAKE_CURRENT_BINARY_DIR}/hev-runtime" PATTERNS "hev-socks5-tunnel/*")
+set(ETL_HEV_DIR "${CMAKE_CURRENT_BINARY_DIR}/hev-runtime/hev-socks5-tunnel")
+set(ETL_HEV_COMPONENTS
+  "hev-socks5-tunnel.exe=0e4274ee9e1b30e180d7df10bf244586234e0cf196650d3fcb51320b6e2bf5f9"
+  "msys-2.0.dll=1410599ee2efcede0869abec8910398d688755952e59cf7983b15cac6de78201"
+  "wintun.dll=e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce")
+foreach(component ${ETL_HEV_COMPONENTS})
+  string(REGEX MATCH "^([^=]+)=(.+)$" matched "${component}")
+  file(SHA256 "${ETL_HEV_DIR}/${CMAKE_MATCH_1}" component_hash)
+  if(NOT component_hash STREQUAL CMAKE_MATCH_2)
+    message(FATAL_ERROR "Runtime component ${CMAKE_MATCH_1} hash mismatch")
+  endif()
+endforeach()
+
 configure_file(etl-client.rc.in "${CMAKE_CURRENT_BINARY_DIR}/etl-client.rc" @ONLY)
 configure_file(etl_version.h.in "${CMAKE_CURRENT_BINARY_DIR}/etl_version.h" @ONLY)
 
@@ -50,11 +72,11 @@ target_include_directories(etl-ui PUBLIC ${imgui_SOURCE_DIR} PRIVATE ${CMAKE_CUR
 target_compile_features(etl-ui PUBLIC cxx_std_17)
 target_compile_definitions(etl-ui PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(etl-ui PUBLIC d3d11 dxgi d3dcompiler dwmapi)
-add_executable(etl-client WIN32 etl_client.cpp "${CMAKE_CURRENT_BINARY_DIR}/etl-client.rc")
+add_executable(etl-client WIN32 etl_client.cpp vpn.cpp "${CMAKE_CURRENT_BINARY_DIR}/etl-client.rc")
 target_include_directories(etl-client PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_features(etl-client PRIVATE cxx_std_17)
 target_compile_definitions(etl-client PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0602)
-target_link_libraries(etl-client PRIVATE etl-ui etl-updater OpenSSL::SSL OpenSSL::Crypto ws2_32 crypt32 shell32 ole32)
+target_link_libraries(etl-client PRIVATE etl-ui etl-updater OpenSSL::SSL OpenSSL::Crypto ws2_32 crypt32 shell32 ole32 iphlpapi)
 if(MSVC)
   target_compile_options(etl-client PRIVATE /utf-8 /W4)
   target_compile_options(etl-ui PRIVATE /utf-8)

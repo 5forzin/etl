@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
 import tls from 'node:tls';
+import dgram from 'node:dgram';
 import { lookup } from 'node:dns/promises';
 import { once } from 'node:events';
 import { spawn, execFileSync } from 'node:child_process';
@@ -333,4 +334,76 @@ test('native desktop renders compact frames and animates expansion and collapse 
     assert.ok(heights[4] > heights[0], 'download progress should fit in the native window');
     assert.ok(heights[5] > heights[3], 'update errors should wrap without clipping the actions');
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('native Windows client relays SOCKS5 UDP ASSOCIATE through a v2 session',
+  { skip: !executable || process.platform !== 'win32', timeout: 20000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'etl-native-udp-'));
+  const openssl = process.env.ETL_OPENSSL ?? 'openssl';
+  const certPath = join(dir, 'cert.pem');
+  const keyPath = join(dir, 'key.pem');
+  const tokenPath = join(dir, 'token');
+  let server, child, echo;
+  try {
+    execFileSync(openssl, ['req', '-x509', '-newkey', 'rsa:2048', '-nodes',
+      '-keyout', keyPath, '-out', certPath, '-days', '1', '-subj', '/CN=localhost',
+      '-addext', 'subjectAltName=DNS:localhost'], { stdio: 'pipe' });
+    const token = 'a'.repeat(64);
+    writeFileSync(tokenPath, token);
+    echo = dgram.createSocket('udp4');
+    echo.on('message', (message, rinfo) => echo.send(message, rinfo.port, rinfo.address));
+    echo.on('error', () => {});
+    echo.bind(0, '127.0.0.1');
+    await once(echo, 'listening');
+    const echoPort = echo.address().port;
+    server = createTunnelServer({ key: readFileSync(keyPath), cert: readFileSync(certPath),
+      getToken: () => token, resolve: async () => [{ address: '127.0.0.1', family: 4 }] });
+    const serverPort = await listen(server);
+    const localPort = await freePort();
+    child = spawn(executable, ['--headless', '--server', 'localhost', '--server-port', String(serverPort),
+      '--port', String(localPort), '--token-file', tokenPath, '--ca', certPath],
+    { stdio: 'ignore', windowsHide: true });
+    await awaitClient(localPort, child);
+
+    const control = protect(net.connect({ host: '127.0.0.1', port: localPort }), 5000);
+    await connected(control);
+    control.write(Buffer.from([5, 1, 0]));
+    assert.deepEqual(await readStage(control, 2, 'SOCKS greeting'), Buffer.from([5, 0]));
+    control.write(Buffer.from([5, 3, 0, 1, 0, 0, 0, 0, 0, 0]));
+    const reply = await readStage(control, 10, 'UDP associate reply');
+    assert.equal(reply[1], 0);
+    const relayPort = reply.readUInt16BE(8);
+
+    const app = dgram.createSocket('udp4');
+    app.on('error', () => {});
+    app.bind(0, '127.0.0.1');
+    await once(app, 'listening');
+    const header = Buffer.from([0, 0, 0, 1, 127, 0, 0, 1,
+      echoPort >> 8, echoPort & 255]);
+    const payload = Buffer.from('native-udp-over-etl-v2');
+    const replyWait = once(app, 'message', { signal: AbortSignal.timeout(8000) });
+    app.send(Buffer.concat([header, payload]), relayPort, '127.0.0.1');
+    const [message] = await replyWait;
+    assert.deepEqual(message.subarray(10), payload);
+    const replyHeader = message.subarray(0, 10);
+    assert.equal(replyHeader[3], 1);
+    assert.equal(replyHeader.readUInt16BE(8), echoPort);
+
+    control.destroy();
+    const drained = new Promise((resolve, reject) => {
+      const check = () => server.getConnections((error, count) => {
+        if (error || count === 0) resolve();
+        else setTimeout(check, 100);
+      });
+      check();
+      setTimeout(() => reject(new Error('v2 session leaked')), 8000);
+    });
+    await drained;
+    app.close();
+  } finally {
+    child?.kill();
+    if (server) await server.shutdown();
+    echo?.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
