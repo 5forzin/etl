@@ -15,13 +15,15 @@ jobs:
           node-version: '24'
       - run: npm run check
       - run: npm test
-      - name: Check Azure enrollment script
+      - name: Check PowerShell scripts
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $etlErrors = $null
-          [System.Management.Automation.Language.Parser]::ParseFile("$PWD/deploy/enroll-azure.ps1", [ref]$null, [ref]$etlErrors) | Out-Null
-          if ($etlErrors.Count) { $etlErrors; exit 1 }
+          foreach ($etlScript in @('deploy/enroll-azure.ps1', 'native/windows/test_vpn_recovery.ps1')) {
+            [System.Management.Automation.Language.Parser]::ParseFile("$PWD/$etlScript", [ref]$null, [ref]$etlErrors) | Out-Null
+            if ($etlErrors.Count) { $etlErrors; exit 1 }
+          }
   container:
     runs-on: ubuntu-latest
     steps:

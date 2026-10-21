@@ -35,6 +35,55 @@ static const wchar_t kTunDns[] = L"198.18.0.2";
 static const wchar_t* const kHalfDefaults[] = {L"0.0.0.0", L"128.0.0.0"};
 static const wchar_t* const kIpv6HalfDefaults[] = {L"::/1", L"8000::/1"};
 
+using ProbeClock = std::chrono::steady_clock;
+
+static std::vector<unsigned char> dnsQuery() {
+  const unsigned short id = static_cast<unsigned short>(GetTickCount64());
+  return {static_cast<unsigned char>(id >> 8), static_cast<unsigned char>(id),
+    1, 0, 0, 1, 0, 0, 0, 0, 0, 0,
+    7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0, 0, 1, 0, 1};
+}
+
+static bool waitSocket(SOCKET socket, bool write, ProbeClock::time_point deadline) {
+  const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
+    deadline - ProbeClock::now()).count();
+  if (remaining <= 0) return false;
+  fd_set ready;
+  FD_ZERO(&ready); FD_SET(socket, &ready);
+  timeval timeout{static_cast<long>(remaining / 1000000),
+    static_cast<long>(remaining % 1000000)};
+  return select(0, write ? nullptr : &ready, write ? &ready : nullptr,
+    nullptr, &timeout) > 0;
+}
+
+static bool validDnsResponse(const unsigned char* bytes, size_t size,
+                             const std::vector<unsigned char>& query) {
+  return size >= 12 && bytes[0] == query[0] && bytes[1] == query[1] &&
+    (bytes[2] & 0xf8) == 0x80 && (bytes[3] & 0x0f) == 0 &&
+    (bytes[6] != 0 || bytes[7] != 0);
+}
+
+static bool probeMappedDns() {
+  SOCKET socket = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (socket == INVALID_SOCKET) return false;
+  sockaddr_in destination{};
+  destination.sin_family = AF_INET;
+  destination.sin_port = htons(53);
+  InetPtonA(AF_INET, "198.18.0.2", &destination.sin_addr);
+  const auto query = dnsQuery();
+  const auto deadline = ProbeClock::now() + std::chrono::seconds(1);
+  bool ok = connect(socket, reinterpret_cast<sockaddr*>(&destination), sizeof(destination)) == 0 &&
+    send(socket, reinterpret_cast<const char*>(query.data()), static_cast<int>(query.size()), 0) ==
+      static_cast<int>(query.size()) && waitSocket(socket, false, deadline);
+  if (ok) {
+    unsigned char response[512];
+    const int received = recv(socket, reinterpret_cast<char*>(response), sizeof(response), 0);
+    ok = received > 0 && validDnsResponse(response, static_cast<size_t>(received), query);
+  }
+  closesocket(socket);
+  return ok;
+}
+
 static std::wstring widen(const std::string& value) {
   if (value.empty()) return {};
   int n = MultiByteToWideChar(CP_UTF8, 0, value.c_str(), -1, nullptr, 0);
@@ -63,6 +112,52 @@ static std::string sha256(const void* data, size_t size) {
 }
 
 namespace etlvpn {
+
+bool probeDnsTcp(const char* address, unsigned short port, unsigned long timeoutMs) {
+  SOCKET socket = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (socket == INVALID_SOCKET) return false;
+  const auto deadline = ProbeClock::now() + std::chrono::milliseconds(timeoutMs);
+  sockaddr_in destination{};
+  destination.sin_family = AF_INET;
+  destination.sin_port = htons(port);
+  u_long nonblocking = 1;
+  bool ok = InetPtonA(AF_INET, address, &destination.sin_addr) == 1 &&
+    ioctlsocket(socket, FIONBIO, &nonblocking) == 0;
+  if (ok && connect(socket, reinterpret_cast<sockaddr*>(&destination), sizeof(destination)) != 0)
+    ok = WSAGetLastError() == WSAEWOULDBLOCK && waitSocket(socket, true, deadline);
+  int error = 1, size = sizeof(error);
+  ok = ok && getsockopt(socket, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&error), &size) == 0 && error == 0;
+  const auto query = dnsQuery();
+  std::vector<unsigned char> request{0, static_cast<unsigned char>(query.size())};
+  request.insert(request.end(), query.begin(), query.end());
+  size_t offset = 0;
+  while (ok && offset < request.size()) {
+    ok = waitSocket(socket, true, deadline);
+    if (!ok) break;
+    const int sent = send(socket, reinterpret_cast<const char*>(request.data() + offset),
+      static_cast<int>(request.size() - offset), 0);
+    if (sent == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK) continue;
+    if (sent <= 0) { ok = false; break; }
+    offset += static_cast<size_t>(sent);
+  }
+  // The length prefix and DNS header prove that payload crossed the TUN,
+  // local SOCKS bridge and authenticated ETL session in both directions.
+  unsigned char response[14]{};
+  offset = 0;
+  while (ok && offset < sizeof(response)) {
+    ok = waitSocket(socket, false, deadline);
+    if (!ok) break;
+    const int received = recv(socket, reinterpret_cast<char*>(response + offset),
+      static_cast<int>(sizeof(response) - offset), 0);
+    if (received == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK) continue;
+    if (received <= 0) { ok = false; break; }
+    offset += static_cast<size_t>(received);
+  }
+  const unsigned int length = (static_cast<unsigned int>(response[0]) << 8) | response[1];
+  ok = ok && length >= 12 && length <= 4096 && validDnsResponse(response + 2, 12, query);
+  closesocket(socket);
+  return ok;
+}
 
 std::filesystem::path runtimeDirectory() {
   PWSTR root = nullptr;
@@ -601,6 +696,26 @@ bool Vpn::waitEngine(unsigned long timeoutMs) const {
   if (wait == WAIT_OBJECT_0) checkpoint("engine-died");
   else checkpoint("engine-wait-error", std::to_string(GetLastError()));
   return true;
+}
+
+bool Vpn::healthy() const {
+  if (!fullAdapter_) return false;
+  for (const char* address : {"1.1.1.1", "142.250.0.1", "100.64.0.1"}) {
+    in_addr destination{};
+    InetPtonA(AF_INET, address, &destination);
+    MIB_IPFORWARDROW route{};
+    if (GetBestRoute(destination.s_addr, 0, &route) != NO_ERROR ||
+        route.dwForwardIfIndex != fullAdapter_) {
+      checkpoint("health-route-failed");
+      return false;
+    }
+  }
+  if (!probeMappedDns()) { checkpoint("health-dns-failed"); return false; }
+  // Independent resolvers avoid disconnecting because one probe provider is
+  // unavailable. These sockets follow the full-mode routes, never a proxy override.
+  if (probeDnsTcp("1.1.1.1", 53, 2000) || probeDnsTcp("8.8.8.8", 53, 2000)) return true;
+  checkpoint("health-relay-failed");
+  return false;
 }
 
 VpnStatus Vpn::status() const {

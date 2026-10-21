@@ -140,6 +140,27 @@ Headless mode takes `--server`, `--server-port`, `--port`, `--token-file`,
 `--fallback-check-interval-ms` sets the backup check interval (100–60000;
 default 30000). Headless mode never renders the desktop.
 
+Add `--vpn 1` to headless mode from an elevated terminal to route traffic
+through the TUN adapter. ETL authenticates before changing routes. Full mode
+checks the adapter's DNS and relays DNS over TCP through the tunnel, trying
+Cloudflare and Google independently. Two consecutive failed checks restore the
+normal connection; an engine exit restores it immediately. The client then
+exits with code 5. Physical default routes and DNS settings remain unchanged,
+and restoration removes the TUN routes and flushes cached synthetic DNS answers.
+
+`ctest` also checks fragmented, invalid and stalled connectivity probe replies.
+To test real network restoration, stop any active ETL VPN and run the following
+from an elevated PowerShell terminal with a private token file:
+
+~~~powershell
+./native/windows/test_vpn_recovery.ps1 -ExecutablePath ./build/windows-vpn/etl-client.exe `
+  -Server etl.example.com -TokenPath C:/private/etl.token -OutputPath ./build/vpn-recovery/results.json
+~~~
+
+The integration test checks authentication failure, a temporary firewall rule
+that blocks only the test client's server connection, engine exit and parent
+crash. It verifies normal HTTPS access and unchanged physical DNS after each.
+
 See the [design notes and Figma sketch](../../docs/desktop-design.md).
 
 ## Build the installer

@@ -31,6 +31,7 @@ class Vpn {
   void stop();
   // Returns true on engine exit or wait failure; logs the reason for teardown.
   bool waitEngine(unsigned long timeoutMs) const;
+  bool healthy() const;
   VpnStatus status() const;
   ~Vpn() { stop(); }
 
@@ -55,5 +56,8 @@ int runGuard(const std::wstring& server, unsigned long parentPid,
 // Offline checks: extraction with hash verification and the routing plan.
 bool selfTestExtract(std::wstring& error);
 std::string selfTestPlan(const std::wstring& server, int serverPort);
+
+// Checks a bounded DNS exchange over TCP, including the returned message ID.
+bool probeDnsTcp(const char* address, unsigned short port, unsigned long timeoutMs);
 
 }  // namespace etlvpn

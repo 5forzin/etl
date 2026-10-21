@@ -803,6 +803,14 @@ class Service {
   uint64_t received() const { return received_; }
   uint64_t failures() const { return failures_; }
 
+  bool checkTunnel() {
+    SOCKET remote = INVALID_SOCKET;
+    SSL* ssl = nullptr;
+    const bool ok = openTunnel(false, remote, ssl, false, 3000);
+    closeTunnel(remote, ssl);
+    return ok;
+  }
+
  private:
   void closeTunnel(SOCKET& remote, SSL*& ssl) {
     if (ssl) SSL_free(ssl);
@@ -814,10 +822,12 @@ class Service {
     }
   }
 
-  bool openTunnel(bool fallback, SOCKET& remote, SSL*& ssl, bool udpSession = false) {
+  bool openTunnel(bool fallback, SOCKET& remote, SSL*& ssl, bool udpSession = false,
+                   int timeoutMs = 0) {
     const auto& endpoint = fallback ? config_.fallbackServer : config_.server;
     const int endpointPort = fallback ? config_.fallbackPort : config_.serverPort;
-    const auto deadline = ConnectClock::now() + std::chrono::milliseconds(config_.connectTimeoutMs);
+    const auto deadline = ConnectClock::now() + std::chrono::milliseconds(
+      timeoutMs ? std::min(timeoutMs, config_.connectTimeoutMs) : config_.connectTimeoutMs);
     remote = !fallback && !config_.vpnServerIp.empty() ?
       connectPinned(config_.vpnServerIp, endpointPort, running_, deadline) :
       connectServer(endpoint, endpointPort, running_, deadline);
@@ -1375,6 +1385,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
       c.fallbackServer.clear();
     }
     int result = service.start(c, error) ? 0 : 3;
+    if (!result && c.vpn && !service.checkTunnel()) {
+      etlvpn::checkpoint("preflight-failed");
+      error = L"Tunnel unavailable; normal connection preserved.";
+      result = 4;
+    }
     if (!result && c.vpn) {
       if (!vpn.start(c.localPort, plan, c.vpnScope, error)) result = 4;
       if (!result && fallbackDisabled) etlvpn::checkpoint("vpn-fallback-disabled");
@@ -1383,10 +1398,26 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     if (result) {
       vpn.stop();
       service.stop();
+      fwprintf(stderr, L"%ls\n", error.c_str());
       LocalFree(argv); WSACleanup(); return result;
     }
-    while (vpn.status().active) {
-      if (vpn.waitEngine(1000)) vpn.stop();
+    if (c.vpn) {
+      unsigned int failedChecks = 0;
+      while (vpn.status().active) {
+        const bool engineFailed = vpn.waitEngine(0);
+        const bool healthy = !engineFailed &&
+          (c.vpnScope.empty() ? vpn.healthy() : service.checkTunnel());
+        failedChecks = healthy ? 0 : failedChecks + 1;
+        if (engineFailed || failedChecks >= 2) {
+          etlvpn::checkpoint("restoring-network");
+          vpn.stop();
+          etlvpn::checkpoint("network-restored");
+          fwprintf(stderr, L"VPN connection lost; normal connection restored.\n");
+          service.stop();
+          LocalFree(argv); WSACleanup(); return 5;
+        }
+        if (vpn.waitEngine(2000)) continue;
+      }
     }
     while (true) Sleep(1000);
   }
