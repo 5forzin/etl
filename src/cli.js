@@ -2,6 +2,9 @@
 import { parseArgs } from 'node:util';
 import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { AgentRegistry } from './agents.js';
 import { createClient, createTunnelServer, tokenFile } from './tunnel.js';
 import { diagnoseEndpoint, formatDiagnosis } from './doctor.js';
 import metadata from '../package.json' with { type: 'json' };
@@ -24,6 +27,7 @@ Options:
   --listen IP            Server bind address (default: 0.0.0.0)
   --ca PATH              Private CA bundle (replaces Node's trust store)
   --max-connections N    Maximum simultaneous connections (default: 128)
+  --agent-state PATH     Persistent agent registry (server only)
   --timeout MS           Doctor timeout per check (default: 10000)
   --json                 Doctor machine-readable output
   --version              Print version
@@ -45,6 +49,7 @@ async function main() {
     server: { type: 'string' }, port: { type: 'string' },
     'server-port': { type: 'string' }, listen: { type: 'string' },
     ca: { type: 'string' }, 'max-connections': { type: 'string' },
+    'agent-state': { type: 'string' },
     'fallback-server': { type: 'string' }, 'fallback-port': { type: 'string' },
     'fallback-token-file': { type: 'string' }, 'connect-timeout-ms': { type: 'string' },
     'fallback-check-interval-ms': { type: 'string' },
@@ -77,12 +82,14 @@ async function main() {
   if (command === 'server') {
     if (!values.cert || !values.key) throw new Error('--cert and --key are required');
     service = createTunnelServer({ cert: readFileSync(values.cert),
-      key: readFileSync(values.key), getToken, maxConnections });
+      key: readFileSync(values.key), getToken, maxConnections,
+      agents: new AgentRegistry({ path: values['agent-state'] ?? join(homedir(), '.local', 'share', 'etl', 'agents.json') }) });
     bind = values.listen ?? '0.0.0.0';
     listenPort = port(values.port, 443);
   } else {
     if (!values.server) throw new Error('--server is required');
     if (values.listen) throw new Error('Client binds only to loopback; omit --listen');
+    if (values['agent-state']) throw new Error('--agent-state is only available for the server');
     if (!values['fallback-server'] && (values['fallback-port'] || values['fallback-token-file'] || values['fallback-check-interval-ms'])) {
       throw new Error('--fallback-server is required for backup options');
     }

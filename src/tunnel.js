@@ -38,7 +38,7 @@ export function tokenFile(path) {
 export function createTunnelServer({ key, cert, getToken, maxConnections = 128,
   handshakeTimeout = HANDSHAKE, idleTimeout = IDLE,
   resolve = resolveDestination, maxDestinations = 64,
-  maxDatagram = MAX_DATAGRAM }) {
+  maxDatagram = MAX_DATAGRAM, agents }) {
   validateLimits(maxConnections, handshakeTimeout, idleTimeout);
   validateToken(getToken());
   const udpRelay = createUdpRelay({ resolve, idleTimeout, maxDestinations, maxDatagram });
@@ -52,6 +52,10 @@ export function createTunnelServer({ key, cert, getToken, maxConnections = 128,
       const hello = await readFrame(socket);
       const authorized = typeof hello?.token === 'string' &&
         timingSafeEqual(hash(hello.token), hash(getToken()));
+      if (hello.v === 3 && agents) {
+        await agents.handle(socket, hello, authorized);
+        return;
+      }
       if (!authorized || (hello.v !== 1 && hello.v !== 2) ||
           (hello.v === 2 && hello.mode !== 'udp')) {
         writeFrame(socket, { code: 'AUTH' });

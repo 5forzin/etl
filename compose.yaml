@@ -5,6 +5,7 @@ services:
       - "${ETL_PORT:-443}:8443"
     volumes:
       - ./secrets:/run/etl:ro
+      - agent-state:/home/node/.local/share/etl
     read_only: true
     cap_drop: [ALL]
     security_opt:
@@ -12,3 +13,6 @@ services:
     pids_limit: 64
     mem_limit: 256m
     restart: unless-stopped
+
+volumes:
+  agent-state:

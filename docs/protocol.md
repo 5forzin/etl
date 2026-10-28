@@ -27,8 +27,12 @@ details. Successful relays preserve half-close behavior.
 ## Local protocols
 
 SOCKS5 uses no local authentication and supports CONNECT with IPv4, IPv6 or a
-hostname. BIND and UDP ASSOCIATE return command-not-supported. SOCKS5 clients
-must select proxy-side DNS if they want the server to resolve destinations.
+hostname. BIND returns command-not-supported. UDP ASSOCIATE opens a v2 TLS
+session authenticated with `v: 2`, `mode: "udp"` and the proxy token. Datagrams
+contain a framed `{host, port}` header followed by a 16-bit payload length and
+at most 1500 payload bytes. A `{code: "FAILED"}` control frame has no payload
+and drops one rejected destination. SOCKS5 clients must select proxy-side DNS
+if they want the server to resolve destinations.
 
 HTTP CONNECT uses an authority such as `example.com:443` or
 `[2606:4700:4700::1111]:443`. On success the local proxy returns
@@ -47,3 +51,31 @@ migrate. New connections always try the primary first.
 
 Each server rereads its shared token file at authentication. Replacing it revokes
 new sessions; restarting terminates existing ones. There are no per-user quotas.
+
+## Agent control (v3)
+
+Control requests use the same verified TLS 1.3 connection and 16-bit frame length.
+The first frame is limited to 1024 bytes. After authentication, frames may contain
+up to 16384 bytes. The complete exchange shares the server's handshake deadline.
+
+| Mode | Initial frame fields | Request actions |
+| --- | --- | --- |
+| `manage` | `v: 3`, `mode`, controller `token` | `create`, `list`, `remove` |
+| `enroll` | `v: 3`, `mode`, agent `id`, pairing `code` | `enroll` |
+| `agent` | `v: 3`, `mode`, agent `id`, device `token` | `heartbeat` |
+
+The server replies `{"code":"OK"}` before accepting an action, or `AUTH` and
+closes. `create` takes a name and port and returns `id`, `pairingCode`, `port`,
+`expires` and `servername`. The one-use code expires after 24 hours. `list`
+returns an OK frame with `count`, followed by that many agent records. These
+records include the proxy credential and public CA and require controller authentication.
+`remove` takes an `id` and revokes both pending and registered identities.
+
+`enroll` supplies a public numeric `host`, separate `proxyToken` and `deviceToken`
+values, and a self-signed CA certificate for `ID.etl-agent`. The controller probes
+the pinned TLS listener on the grant's port before consuming the grant. A heartbeat
+supplies the current public host; changed addresses are probed again. Actions reply
+OK or FAILED. Invalid actions reply INVALID. All control connections then close.
+
+Agent proxy traffic continues to use v1 TCP and v2 UDP, with the agent's proxy
+token and certificate. The device token cannot authenticate proxy traffic.

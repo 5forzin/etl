@@ -30,9 +30,9 @@ export async function read(socket, n) {
   return Buffer.concat(chunks, n);
 }
 
-export async function readFrame(socket) {
+export async function readFrame(socket, maximum = 1024) {
   const length = (await read(socket, 2)).readUInt16BE();
-  if (length < 2 || length > 1024) throw new Error('Invalid frame size');
+  if (length < 2 || length > maximum) throw new Error('Invalid frame size');
   const message = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(await read(socket, length)));
   if (!message || typeof message !== 'object' || Array.isArray(message)) {
     throw new Error('Expected a JSON object');
@@ -40,9 +40,9 @@ export async function readFrame(socket) {
   return message;
 }
 
-export function writeFrame(socket, message) {
+export function writeFrame(socket, message, maximum = 1024) {
   const payload = Buffer.from(JSON.stringify(message));
-  if (payload.length > 1024) throw new Error('Frame too large');
+  if (payload.length > maximum || payload.length > 65535) throw new Error('Frame too large');
   const length = Buffer.alloc(2);
   length.writeUInt16BE(payload.length);
   socket.write(Buffer.concat([length, payload]));
