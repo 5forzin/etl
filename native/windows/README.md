@@ -19,7 +19,7 @@ The portable `etl-client.exe` remains available as a separate download.
 
 ETL checks the latest stable GitHub Release at startup and once an hour while
 running. When a newer version is available, choose Update or Later in the app.
-Later dismisses that version for the current session. Options includes a manual
+Later dismisses that version for the current session. Settings includes a manual
 Check for updates action. A minimized or hidden client also shows a tray notification.
 
 Updates download over verified HTTPS and must match the asset's GitHub SHA-256
@@ -36,15 +36,26 @@ GitHub supplies the asset digests on upload. Drafts, prereleases, older versions
 and assets without a valid digest are not installed. The first release containing
 this updater must be installed manually by users of earlier versions.
 
-Run `etl-client.exe`, enter the server and token, then click the power button.
-The borderless window is 360 pixels wide, with a draggable header and custom
-minimize and close controls. Options expands ports, backup, timeout and CA below
-the main controls. The window grows and shrinks smoothly to fit, without scrollbars.
-Open browser starts or reuses the configured local proxy and opens Edge or Chrome
-with a separate ETL profile and remote hostname resolution. It prefers the default
-browser when that is Edge or Chrome. Profiles live under `%LOCALAPPDATA%\ETL\Browser`,
-separately for each browser and proxy port. The system proxy and normal browser
-profile remain unchanged.
+Run `etl-client.exe`, enter the server and token in Settings, then choose a mode.
+**Proxy only** opens the local listener. **Full mode** starts a separate elevated
+worker and routes the PC through the TUN adapter. The desktop and browser keep
+normal user permissions. Full mode uses the primary server; the backup remains
+saved for Proxy mode. It authenticates before changing routes and restores the
+normal connection after a tunnel failure, Disconnect, Exit or a desktop crash.
+Closing the window hides it in the tray and keeps the selected mode running.
+
+The borderless window is 400 pixels wide, with a draggable header and custom
+minimize and close controls. Settings contains server credentials, ports, backup,
+timeout and CA. Save settings persists edits without starting a connection. The
+mode selector, hover states, page transitions and window height animate smoothly,
+respecting Windows' reduced-animation preference.
+
+Open browser opens a separate Edge or Chrome session with
+`--proxy-server=socks5://127.0.0.1:<local port>` and remote hostname resolution.
+It prefers the default browser when that is Edge or Chrome. Profiles live under
+`%LOCALAPPDATA%\ETL\Browser`, separately for each browser and proxy port.
+If disconnected, this action starts Proxy only or reuses an existing local SOCKS5
+listener. It does not change the system proxy or normal browser profile.
 
 The token input is masked. A saved token remains
 in use when the field is blank; entering a new token replaces it. Leaving the
@@ -129,7 +140,7 @@ IPv6, negotiation and idle deadlines, argument validation and DirectX rendering.
 `--self-test-ui OUTPUT.bmp` creates a hidden preview using default settings;
 it neither loads a user profile nor opens a proxy. CI also saves this preview.
 `--self-test-ui-options OUTPUT.bmp` checks animated expansion and collapse, then
-captures expanded Options. `--self-test-ui-error OUTPUT.bmp` captures a wrapped
+captures Settings. `--self-test-ui-error OUTPUT.bmp` captures a wrapped
 error. Preview modes use a fixed animation step and check that the native caption
 is absent and header dragging leaves window controls clickable.
 
@@ -137,7 +148,14 @@ is absent and header dragging leaves window controls clickable.
 `--self-test-ui-update-error` capture the update confirmation, progress and retry
 states. Pass an output BMP path to each. These previews do not contact GitHub.
 `ctest --test-dir build/windows-portable -C Release --output-on-failure` checks
-release parsing, version ordering, checksums and portable rollback.
+release parsing, version ordering, checksums, portable rollback, browser arguments
+and the desktop worker lifecycle. Worker tests exercise traffic reporting,
+cancellation, errors and parent death without UAC or network route changes.
+
+`--self-test-ui-full`, `--self-test-ui-full-active`, `--self-test-ui-connecting`
+and `--self-test-ui-stopping` capture the mode selector and connection states.
+`--self-test-ui-active` captures the local proxy's traffic counters. These fixtures
+render synthetic test data without starting a connection or loading saved tokens.
 
 Headless mode takes `--server`, `--server-port`, `--port`, `--token-file`,
 `--ca`, `--fallback-server`, `--fallback-port`, `--fallback-token-file` and
@@ -167,7 +185,7 @@ The integration test checks authentication failure, a temporary firewall rule
 that blocks only the test client's server connection, engine exit and parent
 crash. It verifies normal HTTPS access and unchanged physical DNS after each.
 
-See the [design notes and Figma sketch](../../docs/desktop-design.md).
+See the [design notes](../../docs/desktop-design.md).
 
 ## Build the installer
 

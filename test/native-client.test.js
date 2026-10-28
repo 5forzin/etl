@@ -318,21 +318,27 @@ test('native desktop renders compact frames and animates expansion and collapse 
   const dir = mkdtempSync(join(tmpdir(), 'etl-ui-'));
   try {
     const heights = ['--self-test-ui', '--self-test-ui-options', '--self-test-ui-error',
-      '--self-test-ui-update', '--self-test-ui-downloading', '--self-test-ui-update-error'].map((flag, index) => {
+      '--self-test-ui-update', '--self-test-ui-downloading', '--self-test-ui-update-error',
+      '--self-test-ui-active', '--self-test-ui-full', '--self-test-ui-full-active',
+      '--self-test-ui-connecting', '--self-test-ui-stopping'].map((flag, index) => {
       const path = join(dir, `preview-${index}.bmp`);
       execFileSync(executable, [flag, path], { windowsHide: true, timeout: 8000 });
       const bitmap = readFileSync(path);
       assert.equal(bitmap.subarray(0, 2).toString(), 'BM');
-      assert.equal(bitmap.readInt32LE(18), 360, 'content changes should preserve the compact width');
+      assert.equal(bitmap.readInt32LE(18), 400, 'content changes should preserve the compact width');
       assert.ok(bitmap.length > 400_000);
       return Math.abs(bitmap.readInt32LE(22));
     });
-    assert.ok(heights[0] >= 350 && heights[0] <= 400, 'collapsed desktop should remain compact');
-    assert.ok(heights[1] > heights[0] + 250, 'Options should expand the native window');
+    assert.ok(heights[0] >= 440 && heights[0] <= 520, 'collapsed desktop should remain compact');
+    assert.ok(heights[1] > heights[0] + 150, 'Settings should expand the native window');
     assert.ok(heights[2] > heights[0], 'wrapped errors should expand the native window');
     assert.ok(heights[3] > heights[0], 'update confirmation should expand the native window');
     assert.ok(heights[4] > heights[0], 'download progress should fit in the native window');
     assert.ok(heights[5] > heights[3], 'update errors should wrap without clipping the actions');
+    assert.equal(heights[7], heights[0], 'switching modes should not move the primary action');
+    assert.equal(heights[8], heights[6], 'both active modes should have the same layout');
+    assert.equal(heights[9], heights[0], 'connecting should keep Cancel in place');
+    assert.equal(heights[10], heights[0], 'stopping should keep the status visible');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

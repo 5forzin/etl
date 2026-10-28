@@ -182,6 +182,7 @@ static Config loadConfig() {
   c.fallbackServer = readSetting(path, L"fallback_server", L"");
   c.fallbackProtectedToken = readSetting(path, L"fallback_token_protected", L"");
   c.caFile = readSetting(path, L"ca_file", L"");
+  c.vpn = readSetting(path, L"mode", L"proxy") == L"full";
   int value;
   if (portValue(readSetting(path, L"server_port", L"443"), value)) c.serverPort = value;
   if (portValue(readSetting(path, L"local_port", L"1080"), value)) c.localPort = value;
@@ -202,7 +203,8 @@ static Config loadConfig() {
 
 static bool saveConfig(const Config& c) {
   auto path = configPath();
-  bool ok = WritePrivateProfileStringW(L"client", L"server", c.server.c_str(), path.c_str()) &&
+  bool ok = WritePrivateProfileStringW(L"client", L"mode", c.vpn ? L"full" : L"proxy", path.c_str()) &&
+    WritePrivateProfileStringW(L"client", L"server", c.server.c_str(), path.c_str()) &&
     WritePrivateProfileStringW(L"client", L"server_port", std::to_wstring(c.serverPort).c_str(), path.c_str()) &&
     WritePrivateProfileStringW(L"client", L"token_protected", c.protectedToken.c_str(), path.c_str()) &&
     WritePrivateProfileStringW(L"client", L"fallback_server", c.fallbackServer.c_str(), path.c_str()) &&
@@ -1129,6 +1131,7 @@ class Service {
 
 static Service service;
 static etlvpn::Vpn vpn;
+static FullSession fullSession;
 static NOTIFYICONDATAW tray{};
 static Config config;
 static std::thread stopThread;
@@ -1157,52 +1160,80 @@ static void loadForm() {
   };
   copy(form.server, config.server); copy(form.backup, config.fallbackServer); copy(form.ca, config.caFile);
   form.remotePort = config.serverPort; form.backupPort = config.fallbackPort;
+  form.fullMode = config.vpn;
   form.localPort = config.localPort; form.timeout = config.connectTimeoutMs;
   form.savedToken = !config.protectedToken.empty();
   form.savedBackupToken = !config.fallbackProtectedToken.empty();
 }
 
+static bool connectionExists() { return service.running() || fullSession.exists(); }
+
 static void updateStatus(HWND) {
-  wcscpy_s(tray.szTip, stopping ? L"ETL - stopping" : service.running() ? L"ETL - proxy active" : L"ETL - off");
+  const wchar_t* status = stopping ? L"ETL - stopping" : fullSession.exists() ?
+    (fullSession.snapshot().phase == SessionPhase::Running ? L"ETL - full mode active" : L"ETL - connecting") :
+    service.running() ? L"ETL - proxy active" : L"ETL - off";
+  wcscpy_s(tray.szTip, status);
   Shell_NotifyIconW(NIM_MODIFY, &tray);
 }
 
 static void beginStop(HWND window, bool exit) {
   if (stopping) { exitAfterStop |= exit; return; }
-  if (!service.running()) { if (exit) DestroyWindow(window); return; }
+  if (!connectionExists()) { if (exit) DestroyWindow(window); return; }
   stopping = true; exitAfterStop = exit; updateStatus(window);
+  if (fullSession.exists()) { fullSession.requestStop(); return; }
   stopThread = std::thread([window] {
     service.stop(); PostMessageW(window, WM_SERVICE_STOPPED, 0, 0);
   });
 }
 
-static void connectOrStop(HWND window) {
-  if (stopping) return;
-  if (service.running()) { beginStop(window, false); return; }
-  Config next = config;
+static bool readForm(Config& next) {
+  next = config;
   next.server = wide(form.server.data()); next.fallbackServer = wide(form.backup.data());
   next.serverPort = form.remotePort; next.fallbackPort = form.backupPort;
   next.localPort = form.localPort; next.connectTimeoutMs = form.timeout; next.caFile = wide(form.ca.data());
+  next.vpn = form.fullMode;
   if (next.server.empty() || next.serverPort < 1 || next.serverPort > 65535 ||
       next.localPort < 1 || next.localPort > 65535 || next.fallbackPort < 1 || next.fallbackPort > 65535 ||
       next.connectTimeoutMs < 1 || next.connectTimeoutMs > 60000) {
-    uiError = "Check host, ports and timeout."; return;
+    uiError = "Check host, ports and timeout in Settings."; return false;
   }
   if (form.token[0] && !protectToken(form.token.data(), next.protectedToken)) {
-    uiError = "Token: use 64 lowercase hex characters."; return;
+    uiError = "Token: use 64 lowercase hex characters."; return false;
   }
   if (form.backupToken[0] && !protectToken(form.backupToken.data(), next.fallbackProtectedToken)) {
-    uiError = "Backup token: use 64 lowercase hex characters."; return;
+    uiError = "Backup token: use 64 lowercase hex characters."; return false;
+  }
+  if (next.protectedToken.empty()) {
+    uiError = "Add your server token in Settings."; return false;
   }
   if (next.fallbackServer.empty()) next.fallbackProtectedToken.clear();
   next.tokenFile.clear(); next.fallbackTokenFile.clear();
-  std::wstring error;
-  if (!service.start(next, error)) { uiError = utf8(error); return; }
+  return true;
+}
+
+static void acceptForm(const Config& next) {
   config = next;
   SecureZeroMemory(form.token.data(), form.token.size());
   SecureZeroMemory(form.backupToken.data(), form.backupToken.size());
   form.savedToken = !config.protectedToken.empty(); form.savedBackupToken = !config.fallbackProtectedToken.empty();
-  uiError = saveConfig(config) ? "" : "Proxy active. Settings could not be saved.";
+  uiError = saveConfig(config) ? "" : "Settings could not be saved.";
+}
+
+static void connectOrStop(HWND window, bool proxyOnly = false) {
+  if (stopping) return;
+  if (connectionExists()) { beginStop(window, false); return; }
+  Config next;
+  if (!readForm(next)) { desktop.showOptions(); return; }
+  if (proxyOnly) next.vpn = false;
+  std::wstring error;
+  if (next.vpn) {
+    const nlohmann::json payload = {{"server", utf8(next.server)}, {"serverPort", next.serverPort},
+      {"localPort", next.localPort}, {"timeout", next.connectTimeoutMs},
+      {"protectedToken", utf8(next.protectedToken)}, {"ca", utf8(next.caFile)}};
+    if (!fullSession.start(payload.dump(), error, window)) { uiError = utf8(error); return; }
+  } else if (!service.start(next, error)) { uiError = utf8(error); return; }
+  acceptForm(next);
+  form.fullMode = next.vpn;
   updateStatus(window);
 }
 
@@ -1270,13 +1301,13 @@ static void showWindow(HWND window) {
 }
 
 static void openBrowser(HWND window) {
-  if (stopping) return;
-  if (!service.running() && !localProxyAvailable(form.localPort)) {
-    connectOrStop(window);
+  if (stopping || (fullSession.exists() && fullSession.snapshot().phase != SessionPhase::Running)) return;
+  if (!connectionExists() && !localProxyAvailable(form.localPort)) {
+    connectOrStop(window, true);
     if (!service.running()) return;
   }
   std::wstring error;
-  const int port = service.running() ? config.localPort : form.localPort;
+  const int port = connectionExists() ? config.localPort : form.localPort;
   if (!openProxyBrowser(port, error)) uiError = utf8(error);
   else uiError.clear();
 }
@@ -1291,7 +1322,7 @@ static LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wparam, LPA
         IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_SHARED));
       wcscpy_s(tray.szTip, L"ETL - off");
       Shell_NotifyIconW(NIM_ADD, &tray);
-      SetTimer(window, 1, 1000, nullptr); return 0;
+      SetTimer(window, 1, 250, nullptr); return 0;
     case WM_SIZE:
       if (wparam != SIZE_MINIMIZED) desktop.resize(LOWORD(lparam), HIWORD(lparam));
       return 0;
@@ -1316,6 +1347,13 @@ static LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wparam, LPA
       else updateStatus(window);
       return 0;
     case WM_TIMER:
+      if (fullSession.exists() && fullSession.finished()) {
+        const auto ended = fullSession.snapshot();
+        if (!ended.error.empty()) uiError = ended.error;
+        fullSession.reset();
+        stopping = false;
+        if (exitAfterStop) { DestroyWindow(window); return 0; }
+      }
       updateStatus(window);
       if (updater && !updateLaunched) {
         updater->check();
@@ -1341,7 +1379,7 @@ static LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wparam, LPA
         HMENU menu = CreatePopupMenu();
         AppendMenuW(menu, MF_STRING, ID_OPEN, L"Open ETL");
         AppendMenuW(menu, MF_STRING | (stopping ? MF_GRAYED : 0), ID_CONNECT,
-          stopping ? L"Stopping" : service.running() ? L"Disconnect" : L"Connect");
+          stopping ? L"Stopping" : connectionExists() ? L"Disconnect" : form.fullMode ? L"Start full mode" : L"Start proxy");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING, ID_EXIT, L"Exit");
         SetForegroundWindow(window);
@@ -1393,11 +1431,16 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     LocalFree(argv); WSACleanup(); return 0;
   }
   const bool previewOptions = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-options";
+  const bool previewFull = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-full";
+  const bool previewFullActive = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-full-active";
+  const bool previewConnecting = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-connecting";
+  const bool previewStopping = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-stopping";
+  const bool previewActive = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-active";
   const bool previewError = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-error";
   const bool previewUpdate = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-update";
   const bool previewDownloading = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-downloading";
   const bool previewUpdateError = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-update-error";
-  const std::wstring previewPath = argc == 3 && (std::wstring(argv[1]) == L"--self-test-ui" || previewOptions ||
+  const std::wstring previewPath = argc == 3 && (std::wstring(argv[1]) == L"--self-test-ui" || previewOptions || previewActive || previewFull || previewFullActive || previewConnecting || previewStopping ||
     previewError || previewUpdate || previewDownloading || previewUpdateError) ? argv[2] : L"";
   if (argc == 2 && std::wstring(argv[1]) == L"--self-test-token-storage") {
     std::string original(64, 'a'), restored;
@@ -1513,7 +1556,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   wc.lpszClassName = L"ETLNativeClient"; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
   RegisterClassW(&wc);
   HWND window = CreateWindowExW(WS_EX_APPWINDOW, wc.lpszClassName, L"ETL", WS_POPUP | WS_MINIMIZEBOX | WS_SYSMENU,
-    CW_USEDEFAULT, CW_USEDEFAULT, 360, 400, nullptr, nullptr, instance, nullptr);
+    CW_USEDEFAULT, CW_USEDEFAULT, 400, 460, nullptr, nullptr, instance, nullptr);
   if (!window) { WSACleanup(); return 1; }
   const int rounded = 2;
   const DWORD noBorder = 0xfffffffe;
@@ -1531,6 +1574,23 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     renderPreview(DesktopState{});
     const int collapsed = height();
     bool motion = true;
+    if (previewFull || previewFullActive || previewConnecting || previewStopping) {
+      form.fullMode = true;
+      DesktopState state{};
+      state.fullMode = true; state.running = previewFullActive;
+      state.starting = previewConnecting; state.stopping = previewStopping;
+      renderPreview(state);
+    }
+    if (previewActive) {
+      DesktopState state{};
+      state.running = true; state.sessions = 3;
+      const uint64_t samples[]{0, 2048, 6000, 14000, 8000, 32000, 12000, 2048};
+      for (int i = 0; i < 64; ++i) {
+        state.received += samples[i % 8];
+        state.sent += samples[(i + 3) % 8] / 4;
+        desktop.render(form, state, .16f);
+      }
+    }
     if (previewOptions) {
       desktop.showOptions(); renderPreview(DesktopState{}, 2);
       const int growing = height();
@@ -1552,7 +1612,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     }
     if (previewUpdate || previewDownloading || previewUpdateError) {
       DesktopState state{};
-      state.update = {UpdatePhase::Available, "0.5.0", "", 0, true};
+      state.update = {UpdatePhase::Available, "0.6.0", "", 0, true};
       if (previewDownloading) { state.update.phase = UpdatePhase::Downloading; state.update.progress = .42f; }
       if (previewUpdateError) {
         state.update.phase = UpdatePhase::Failed;
@@ -1586,10 +1646,30 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
       continue;
     }
     if (!IsWindowVisible(window) || IsIconic(window)) { WaitMessage(); continue; }
-    DesktopState state{service.running(), stopping, service.sessions(), service.sent(), service.received(), service.failures(), uiError};
+    DesktopState state{};
+    state.running = service.running(); state.stopping = stopping;
+    state.sessions = service.sessions(); state.sent = service.sent();
+    state.received = service.received(); state.failures = service.failures(); state.error = uiError;
+    if (fullSession.exists()) {
+      const auto full = fullSession.snapshot();
+      state.running = full.phase == SessionPhase::Running;
+      state.starting = full.phase == SessionPhase::Starting;
+      state.stopping = stopping || full.phase == SessionPhase::Stopping;
+      state.fullMode = true;
+      state.sessions = full.sessions; state.sent = full.sent;
+      state.received = full.received; state.failures = full.failures;
+    }
     if (updater) state.update = updater->snapshot();
     switch (desktop.render(form, state)) {
-      case DesktopAction::ToggleProxy: connectOrStop(window); break;
+      case DesktopAction::ToggleConnection: connectOrStop(window); break;
+      case DesktopAction::SaveSettings: {
+        Config next;
+        if (!connectionExists() && readForm(next)) {
+          acceptForm(next);
+          if (uiError.empty()) desktop.showOptions(false);
+        }
+        break;
+      }
       case DesktopAction::OpenBrowser: openBrowser(window); break;
       case DesktopAction::CheckUpdates: if (updater) updater->check(true); break;
       case DesktopAction::InstallUpdate: if (updater) updater->download(); break;
@@ -1601,6 +1681,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   SecureZeroMemory(form.token.data(), form.token.size());
   SecureZeroMemory(form.backupToken.data(), form.backupToken.size());
   if (stopThread.joinable()) stopThread.join();
+  fullSession.reset();
   service.stop();
   updater.reset();
   WSACleanup();

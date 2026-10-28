@@ -1,38 +1,49 @@
 # Windows interface
 
-[Figma sketch](https://www.figma.com/design/BQNC74KJoWRbj8JC0fIpOl?node-id=5-136).
-The collapsed and expanded sketches are 360 pixels wide. They use editable
-layers, auto layout, color variables and a shared input component. The client displays traffic
-counters from its current session.
+The desktop is a compact, 400-pixel-wide window. Its monochrome palette uses
+near-black backgrounds, graphite surfaces, subtle outlines and a white primary
+action. Inter, consistent line icons and generous spacing define the hierarchy.
 
-The main screen contains local proxy status, server, token and traffic. The power
-icon connects or disconnects. Options reveals ports, backup, timeout and CA below
-the main controls. The window measures its content and adjusts its height without
-scrollbars. Wrapped errors also change the required height.
+The connection screen shows status, the configured server, a two-position mode
+selector, the primary action, Open browser and Settings. Server credentials and
+advanced fields live on a separate Settings screen. Traffic counters appear only
+while the connection is active and use actual session data.
 
-Opening and closing Options animates the native window height over 280 ms with
-cubic ease-out. Fields fade in and the disclosure chevron rotates. Reversing the
-animation starts from the current height. Width stays fixed and the renderer
-resizes its DirectX target before drawing each frame. The window moves upward
-only when growth would put its bottom below the monitor's work area.
+- **Proxy only** opens the configured local SOCKS5/HTTP listener. Applications
+  must opt into that proxy. “Proxy active” means the local listener is open;
+  remote authentication happens when an application uses it.
+- **Full mode** routes the PC through the existing TUN engine. A separate worker
+  requests administrator permission; the desktop and browser remain unelevated.
+  The interface reflects connecting, connected, disconnecting and failure states.
+  Cancel and Disconnect request cleanup before the worker exits. The existing
+  health checks and restoration guard remain active.
 
-The native window has no caption or border. Drag the header to move it; custom
-controls minimize or close it. Windows 11 supplies rounded corners when supported.
-Closing the window keeps the
-proxy in the tray; Exit closes its connections. “Proxy active” means the local
-listener is open. The remote connection is verified when an application uses it.
+The mode selection slides with exponential easing. Hover and focus transitions
+use a 90 ms time constant; page content fades over 100 ms. Native window height
+changes use a 280 ms cubic ease-out. Reversing an animation starts at its current
+position. Windows' reduced-animation preference disables these transitions.
+Keyboard navigation has visible focus outlines.
 
-An available update expands an inline confirmation above Options. It uses the
-same Inter font, mint action color and secondary button treatment as the rest of
-the interface. Later dismisses the offer for the session; Update downloads it,
-shows progress and restarts the client. Wrapped update errors keep Retry and Later
-visible. Options includes the current version and a manual update check.
+The menu surface uses a 20-pixel radius and a fine inner outline. The primary
+button has a pill shape. Inputs use a 10-pixel radius and persistent labels.
+Colors: background `#111111`, surface `#181818`, selected surface `#2b2b2b`,
+border `#363636`, text/action `#f1f1f1`, secondary text `#9c9c9c`.
 
-The renderer uses Dear ImGui and DirectX 11. Inter ships inside the executable
-under SIL OFL. Colors: background `#141716`, inputs `#1e2220`, border `#343b37`,
-text `#eef1ef`, secondary text `#a1aaa4` and action `#b8ecd0`. State transitions
-use exponential interpolation with a 180 ms time constant. The renderer pauses
-while the window is hidden or minimized.
+Open browser starts or reuses a proxy on the configured port, then opens Edge or
+Chrome with its own ETL profile. It does not change the user's normal browser
+profile or system proxy. Choosing Open browser while disconnected starts Proxy
+only; Full mode requires its explicit primary action.
 
-ImGui does not provide the same accessibility integration as Win32 controls.
-Keyboard navigation is enabled; screen reader support remains a limitation.
+An available update expands inline below the main controls. Later dismisses it;
+Update downloads and verifies it before disconnecting and restarting the client.
+Settings contains the current version and a manual update check.
+
+The window has a draggable header, custom minimize/close controls and native
+rounded corners on supported Windows versions. Closing hides it in the tray;
+Exit disconnects before quitting. Errors expand the content instead of covering
+actions. DirectX targets resize before each frame. The window moves upward when
+necessary to remain inside the monitor's work area.
+
+Dear ImGui and DirectX 11 render the interface; Inter is embedded under SIL OFL.
+Rendering pauses while hidden or minimized. ImGui keyboard navigation is enabled,
+but screen reader integration remains limited.

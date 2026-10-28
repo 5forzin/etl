@@ -13,13 +13,84 @@
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
 namespace {
-const ImVec4 background{.078f, .09f, .086f, 1}, surface{.118f, .133f, .125f, 1};
-const ImVec4 accent{.722f, .925f, .816f, 1}, muted{.631f, .667f, .643f, 1};
+const ImVec4 background{17 / 255.f, 17 / 255.f, 17 / 255.f, 1};
+const ImVec4 surface{24 / 255.f, 24 / 255.f, 24 / 255.f, 1};
+const ImVec4 raised{43 / 255.f, 43 / 255.f, 43 / 255.f, 1};
+const ImVec4 accent{241 / 255.f, 241 / 255.f, 241 / 255.f, 1};
+const ImVec4 muted{156 / 255.f, 156 / 255.f, 156 / 255.f, 1};
+const ImVec4 border{54 / 255.f, 54 / 255.f, 54 / 255.f, 1};
 ImFont *body = nullptr, *heading = nullptr, *brand = nullptr;
+bool reduceMotion = false;
 
-void centerText(const char* value) {
-  ImGui::SetCursorPosX((ImGui::GetWindowWidth() - ImGui::CalcTextSize(value).x) / 2);
-  ImGui::TextUnformatted(value);
+enum class Icon { Proxy, Full, Browser, Settings, Power, Stop, Back, Chevron, Minimize, Close, Upload, Download };
+
+void icon(ImDrawList* draw, Icon kind, ImVec2 origin, float size, ImU32 color) {
+  auto p = [&](float x, float y) { return ImVec2{origin.x + x * size / 24, origin.y + y * size / 24}; };
+  const float stroke = 1.45f * size / 24;
+  auto line = [&](float x, float y, float x2, float y2) { draw->AddLine(p(x, y), p(x2, y2), color, stroke); };
+  switch (kind) {
+    case Icon::Proxy:
+      draw->AddRect(p(3, 6), p(10, 18), color, 3, 0, stroke);
+      draw->AddRect(p(14, 6), p(21, 18), color, 3, 0, stroke);
+      line(10, 12, 14, 12); break;
+    case Icon::Full:
+      draw->AddCircle(p(12, 12), size * 9 / 24, color, 32, stroke);
+      draw->AddEllipse(p(12, 12), {size * 4 / 24, size * 9 / 24}, color, 0, 32, stroke);
+      line(3, 12, 21, 12); break;
+    case Icon::Browser:
+      draw->AddRect(p(3, 4), p(21, 20), color, 4, 0, stroke);
+      line(3, 9, 21, 9); draw->AddCircleFilled(p(7, 6.5f), .7f, color, 8); break;
+    case Icon::Settings:
+      for (int i = 0; i < 6; ++i) {
+        const float a = (i * 60 - 30) * 3.14159265f / 180;
+        draw->PathLineTo(p(12 + 9 * std::cos(a), 12 + 9 * std::sin(a)));
+      }
+      draw->PathStroke(color, ImDrawFlags_Closed, stroke);
+      draw->AddCircle(p(12, 12), size * 2.7f / 24, color, 24, stroke); break;
+    case Icon::Power:
+      draw->PathArcTo(p(12, 12), size * 8 / 24, -1.0f, 4.14f, 32);
+      draw->PathStroke(color, 0, stroke); line(12, 2, 12, 11); break;
+    case Icon::Stop: draw->AddRect(p(6, 6), p(18, 18), color, 3, 0, stroke); break;
+    case Icon::Back: line(14, 6, 8, 12); line(8, 12, 14, 18); break;
+    case Icon::Chevron: line(9, 7, 14, 12); line(14, 12, 9, 17); break;
+    case Icon::Minimize: line(7, 13, 17, 13); break;
+    case Icon::Close: line(7, 7, 17, 17); line(17, 7, 7, 17); break;
+    case Icon::Upload: line(12, 19, 12, 5); line(7, 10, 12, 5); line(12, 5, 17, 10); break;
+    case Icon::Download: line(12, 5, 12, 19); line(7, 14, 12, 19); line(12, 19, 17, 14); break;
+  }
+}
+
+float hoverFade(const char* id, bool target) {
+  const auto key = ImGui::GetID(id);
+  auto* storage = ImGui::GetStateStorage();
+  float value = storage->GetFloat(key);
+  value += ((target ? 1.f : 0.f) - value) * (reduceMotion ? 1.f : 1 - std::exp(-ImGui::GetIO().DeltaTime / .09f));
+  storage->SetFloat(key, value);
+  return value;
+}
+
+bool button(const char* label, ImVec2 size, Icon symbol, bool primary = false, bool row = false) {
+  const auto p = ImGui::GetCursorScreenPos();
+  const bool clicked = ImGui::InvisibleButton(label, size, ImGuiButtonFlags_EnableNav);
+  const bool focused = ImGui::IsItemFocused() && ImGui::GetIO().NavVisible;
+  const float hover = hoverFade(label, ImGui::IsItemHovered() || focused);
+  const float press = ImGui::IsItemActive() ? .04f : 0;
+  auto* draw = ImGui::GetWindowDrawList();
+  ImVec4 fill = primary ? accent : surface;
+  const float shade = primary ? -.10f * hover - press : .055f * hover + press;
+  fill.x += shade; fill.y += shade; fill.z += shade;
+  if (row) fill.w = hover;
+  draw->AddRectFilled(p, {p.x + size.x, p.y + size.y}, ImGui::GetColorU32(fill), primary ? size.y / 2 : 14);
+  if (focused) draw->AddRect({p.x - 2, p.y - 2}, {p.x + size.x + 2, p.y + size.y + 2},
+    ImGui::GetColorU32(muted), primary ? size.y / 2 : 16, 0, 1);
+  const ImU32 foreground = ImGui::GetColorU32(primary ? background : accent);
+  const bool iconOnly = label[0] == '#' && label[1] == '#';
+  const float textWidth = iconOnly ? 0 : ImGui::CalcTextSize(label).x;
+  const float left = row ? 14 : (size.x - (iconOnly ? 20 : textWidth + 30)) / 2;
+  icon(draw, symbol, {p.x + left, p.y + (size.y - 20) / 2}, 20, foreground);
+  if (!iconOnly) draw->AddText({p.x + left + 30, p.y + (size.y - ImGui::GetFontSize()) / 2}, foreground, label);
+  if (row) icon(draw, Icon::Chevron, {p.x + size.x - 32, p.y + (size.y - 18) / 2}, 18, ImGui::GetColorU32(muted));
+  return clicked;
 }
 
 void drawBrand(ImDrawList* draw, ImVec2 origin, float size, ImU32 color) {
@@ -101,34 +172,44 @@ bool DesktopUi::initialize(HWND window) {
   ImFontConfig font;
   font.FontDataOwnedByAtlas = false;
   body = io.Fonts->AddFontFromMemoryTTF(const_cast<unsigned char*>(etlFont), sizeof(etlFont), 14, &font);
-  heading = io.Fonts->AddFontFromMemoryTTF(const_cast<unsigned char*>(etlFont), sizeof(etlFont), 20, &font);
-  brand = io.Fonts->AddFontFromMemoryTTF(const_cast<unsigned char*>(etlFont), sizeof(etlFont), 22, &font);
+  heading = io.Fonts->AddFontFromMemoryTTF(const_cast<unsigned char*>(etlFont), sizeof(etlFont), 26, &font);
+  brand = io.Fonts->AddFontFromMemoryTTF(const_cast<unsigned char*>(etlFont), sizeof(etlFont), 18, &font);
   if (!body || !heading || !brand) { ImGui::DestroyContext(); releaseDevice(); return false; }
   auto& style = ImGui::GetStyle();
   ImGui::StyleColorsDark();
-  style.WindowPadding = {20, 16};
-  style.FramePadding = {12, 8};
-  style.ItemSpacing = {10, 6};
+  style.WindowPadding = {24, 20};
+  style.FramePadding = {12, 10};
+  style.ItemSpacing = {12, 8};
   style.FrameRounding = 10;
+  style.PopupRounding = 18;
+  style.WindowRounding = 22;
   style.WindowBorderSize = 0;
   style.FrameBorderSize = 1;
   style.Colors[ImGuiCol_WindowBg] = background;
   style.Colors[ImGuiCol_FrameBg] = surface;
-  style.Colors[ImGuiCol_FrameBgHovered] = {.16f, .19f, .17f, 1};
-  style.Colors[ImGuiCol_FrameBgActive] = {.18f, .22f, .19f, 1};
-  style.Colors[ImGuiCol_Border] = {.204f, .231f, .216f, 1};
-  style.Colors[ImGuiCol_Text] = {.933f, .945f, .937f, 1};
+  style.Colors[ImGuiCol_FrameBgHovered] = {.13f, .13f, .13f, 1};
+  style.Colors[ImGuiCol_FrameBgActive] = {.16f, .16f, .16f, 1};
+  style.Colors[ImGuiCol_Border] = border;
+  style.Colors[ImGuiCol_Text] = accent;
+  style.Colors[ImGuiCol_TextDisabled] = muted;
+  style.Colors[ImGuiCol_Separator] = border;
   style.Colors[ImGuiCol_Header] = surface;
-  style.Colors[ImGuiCol_HeaderHovered] = {.16f, .19f, .17f, 1};
-  style.Colors[ImGuiCol_Button] = surface;
-  style.Colors[ImGuiCol_ButtonHovered] = {.19f, .23f, .20f, 1};
-  style.Colors[ImGuiCol_ButtonActive] = {.23f, .28f, .25f, 1};
+  style.Colors[ImGuiCol_HeaderHovered] = raised;
+  style.Colors[ImGuiCol_Button] = raised;
+  style.Colors[ImGuiCol_ButtonHovered] = {.22f, .22f, .22f, 1};
+  style.Colors[ImGuiCol_ButtonActive] = {.25f, .25f, .25f, 1};
+  style.Colors[ImGuiCol_NavCursor] = accent;
+  style.Colors[ImGuiCol_TextSelectedBg] = {.40f, .40f, .40f, .6f};
   style.Colors[ImGuiCol_CheckMark] = accent;
   if (!ImGui_ImplWin32_Init(window)) { ImGui::DestroyContext(); releaseDevice(); return false; }
   if (!ImGui_ImplDX11_Init(device_, context_)) {
     ImGui_ImplWin32_Shutdown(); ImGui::DestroyContext(); releaseDevice(); return false;
   }
   initialized_ = true;
+  BOOL animations = TRUE;
+  SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &animations, 0);
+  motion_ = animations != FALSE;
+  reduceMotion = !motion_;
   return true;
 }
 
@@ -147,14 +228,14 @@ void DesktopUi::animateHeight(float target, float delta) {
   if (IsIconic(window_)) return;
   RECT bounds{}; GetWindowRect(window_, &bounds);
   if (!height_) height_ = heightFrom_ = heightTarget_ = static_cast<float>(bounds.bottom - bounds.top);
-  target = std::ceil(std::max(360.f, target));
+  target = std::ceil(std::max(440.f, target));
   if (target != heightTarget_) {
     heightFrom_ = height_;
     heightTarget_ = target;
     heightElapsed_ = 0;
   }
   constexpr float duration = .28f;
-  heightElapsed_ = std::min(duration, heightElapsed_ + std::min(delta, .05f));
+  heightElapsed_ = motion_ ? std::min(duration, heightElapsed_ + std::min(delta, .05f)) : duration;
   const float remaining = 1 - heightElapsed_ / duration;
   height_ = heightFrom_ + (heightTarget_ - heightFrom_) * (1 - remaining * remaining * remaining);
   const int height = static_cast<int>(std::lround(height_));
@@ -181,174 +262,200 @@ DesktopAction DesktopUi::render(DesktopForm& form, const DesktopState& state, fl
   if (previewStep > 0) ImGui::GetIO().DeltaTime = previewStep;
   ImGui::NewFrame();
   const float delta = ImGui::GetIO().DeltaTime;
-  const float blend = 1 - std::exp(-delta / .18f);
-  active_ += ((state.running && !state.stopping ? 1.f : 0.f) - active_) * blend;
+  const float blend = reduceMotion ? 1.f : 1 - std::exp(-delta / .10f);
+  modePosition_ += ((form.fullMode ? 1.f : 0.f) - modePosition_) * blend;
+  pageAlpha_ += (1 - pageAlpha_) * blend;
   ImGui::SetNextWindowPos({0, 0});
   ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
   ImGui::Begin("etl", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-  // Window controls stay outside the native drag region.
-  auto chromeButton = [](const char* id, int symbol) {
-    const auto p = ImGui::GetCursorScreenPos();
-    bool clicked = ImGui::InvisibleButton(id, {28, 28});
-    auto* d = ImGui::GetWindowDrawList();
-    if (ImGui::IsItemHovered() || ImGui::IsItemFocused())
-      d->AddRectFilled(p, {p.x + 28, p.y + 28}, ImGui::GetColorU32(surface), 7);
-    const ImU32 color = ImGui::GetColorU32(muted);
-    if (symbol == 0) d->AddLine({p.x + 9, p.y + 15}, {p.x + 19, p.y + 15}, color, 1.3f);
-    else if (symbol == 1) {
-      d->AddLine({p.x + 10, p.y + 10}, {p.x + 18, p.y + 18}, color, 1.3f);
-      d->AddLine({p.x + 18, p.y + 10}, {p.x + 10, p.y + 18}, color, 1.3f);
-    }
-    return clicked;
-  };
-  const auto brandOrigin = ImGui::GetCursorScreenPos();
-  drawBrand(ImGui::GetWindowDrawList(), {brandOrigin.x, brandOrigin.y + 2}, 24, ImGui::GetColorU32(ImGuiCol_Text));
-  ImGui::Dummy({24, 28}); ImGui::SameLine(0, 7);
-  ImGui::PushFont(brand); ImGui::TextUnformatted("etl"); ImGui::PopFont();
-  ImGui::SameLine(); ImGui::SetCursorPosX(ImGui::GetWindowWidth() - 82);
-  if (chromeButton("##minimize", 0)) ShowWindow(window_, SW_MINIMIZE);
-  ImGui::SameLine(0, 6);
-  if (chromeButton("##close", 1)) PostMessageW(window_, WM_CLOSE, 0, 0);
-  ImGui::Dummy({0, 4});
-  DesktopAction action = DesktopAction::None;
-  const float width = ImGui::GetContentRegionAvail().x;
-  ImGui::SetCursorPosX((ImGui::GetWindowWidth() - 72) / 2);
-  const ImVec2 start = ImGui::GetCursorScreenPos();
-  ImGui::BeginDisabled(state.stopping);
-  if (ImGui::InvisibleButton("##power", {72, 72})) action = DesktopAction::ToggleProxy;
-  ImGui::EndDisabled();
-  ImVec2 c{start.x + 36, start.y + 36};
   auto* draw = ImGui::GetWindowDrawList();
-  hover_ += ((ImGui::IsItemHovered() ? 1.f : 0.f) - hover_) * blend;
-  const ImU32 color = ImGui::GetColorU32(ImVec4{.63f + .09f * active_, .67f + .25f * active_, .64f + .17f * active_, 1});
-  draw->AddCircleFilled(c, 35, ImGui::GetColorU32(ImVec4{surface.x + .052f*hover_, surface.y + .077f*hover_, surface.z + .055f*hover_, 1}), 64);
-  draw->AddCircle(c, 35, ImGui::GetColorU32(ImVec4{.20f + .12f * active_, .24f + .23f * active_, .21f + .15f * active_, 1}), 64);
-  draw->PathArcTo(c, 11, -.92f, 4.06f, 32);
-  draw->PathStroke(color, 0, 2);
-  draw->AddLine({c.x, c.y - 15}, {c.x, c.y - 2}, color, 2);
-  if (ImGui::IsItemFocused()) draw->AddCircle(c, 38, color, 64, 2);
-  if (ImGui::IsItemHovered()) ImGui::SetTooltip(state.running ? "Disconnect" : "Connect");
-  ImGui::PushFont(heading);
-  centerText(state.stopping ? "Stopping" : state.running ? "Proxy active" : "Off");
-  ImGui::PopFont();
-  ImGui::PushStyleColor(ImGuiCol_Text, muted);
-  std::string endpoint = "127.0.0.1:" + std::to_string(form.localPort);
-  centerText(endpoint.c_str());
-  ImGui::PopStyleColor();
-  ImGui::Dummy({0, 2});
-  ImGui::BeginDisabled(state.running || state.stopping);
-  input("Server", "etl.nora.systems", form.server.data(), form.server.size());
-  input("Token", form.savedToken ? "Saved" : "", form.token.data(), form.token.size(), true);
-  ImGui::EndDisabled();
-  ImGui::Dummy({0, 4});
-  ImGui::TextColored(muted, "%d %s", state.sessions, state.sessions == 1 ? "connection" : "connections");
-  ImGui::SameLine(ImGui::GetStyle().WindowPadding.x + width * .44f);
-  ImGui::TextColored(muted, "↑ %s", bytes(state.sent).c_str());
-  ImGui::SameLine(ImGui::GetStyle().WindowPadding.x + width * .75f);
-  ImGui::TextColored(muted, "↓ %s", bytes(state.received).c_str());
-  ImGui::Dummy({0, 4});
-  if (!state.error.empty()) {
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{1, .65f, .60f, 1});
-    ImGui::TextWrapped("%s", state.error.c_str());
-    ImGui::PopStyleColor();
+  const auto windowSize = ImGui::GetWindowSize();
+  draw->AddRect({.5f, .5f}, {windowSize.x - .5f, windowSize.y - .5f},
+    ImGui::GetColorU32(border), 22, 0, 1);
+  draw->AddRect({2, 2}, {windowSize.x - 2, windowSize.y - 2}, IM_COL32(31, 31, 31, 255), 21);
+  const float width = ImGui::GetContentRegionAvail().x;
+  const auto header = ImGui::GetCursorPos();
+  if (options_) {
+    if (button("##back", {28, 28}, Icon::Back)) showOptions(false);
+    ImGui::SameLine(0, 8);
+    ImGui::PushFont(brand); ImGui::TextUnformatted("Settings"); ImGui::PopFont();
+  } else {
+    const auto origin = ImGui::GetCursorScreenPos();
+    drawBrand(draw, {origin.x, origin.y + 2}, 24, ImGui::GetColorU32(accent));
+    ImGui::Dummy({24, 28}); ImGui::SameLine(0, 9);
+    ImGui::PushFont(brand); ImGui::TextUnformatted("etl"); ImGui::PopFont();
   }
-  if (state.failures) ImGui::TextColored(muted, "%llu %s", static_cast<unsigned long long>(state.failures),
-    state.failures == 1 ? "failure" : "failures");
+  ImGui::SetCursorPos({windowSize.x - 92, header.y - 2});
+  if (button("##minimize", {28, 28}, Icon::Minimize)) ShowWindow(window_, SW_MINIMIZE);
+  ImGui::SameLine(0, 6);
+  if (button("##close", {28, 28}, Icon::Close)) PostMessageW(window_, WM_CLOSE, 0, 0);
+  ImGui::SetCursorPos({24, header.y + 52});
+  ImGui::PushStyleVar(ImGuiStyleVar_Alpha, pageAlpha_);
+  DesktopAction action = DesktopAction::None;
+  const bool busy = state.running || state.starting || state.stopping;
   const auto& update = state.update;
   const bool downloading = update.phase == UpdatePhase::Downloading || update.phase == UpdatePhase::Ready;
-  if (update.offered) {
-    ImGui::Dummy({0, 4});
-    ImGui::Separator();
-    ImGui::Dummy({0, 4});
-    ImGui::TextColored(accent, "%s", downloading ? "Updating ETL" : "Update available");
-    ImGui::TextColored(muted, "%s → %s", etlVersion, update.version.c_str());
-    if (downloading) {
-      ImGui::PushStyleColor(ImGuiCol_PlotHistogram, accent);
-      ImGui::PushStyleColor(ImGuiCol_FrameBg, surface);
-      char progress[32];
-      std::snprintf(progress, sizeof(progress), "%d%%", static_cast<int>(update.progress * 100));
-      ImGui::ProgressBar(update.progress, {-1, 8}, "");
-      ImGui::PopStyleColor(2);
-      ImGui::TextColored(muted, "%s", update.phase == UpdatePhase::Ready ? "Restarting…" : progress);
-    } else {
-      ImGui::PushStyleColor(ImGuiCol_Text, muted);
-      ImGui::TextWrapped("%s", state.running ? "ETL will restart and close active connections." : "ETL will restart after updating.");
-      ImGui::PopStyleColor();
-      if (!update.error.empty()) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{1, .65f, .60f, 1});
-        ImGui::TextWrapped("%s", update.error.c_str());
-        ImGui::PopStyleColor();
-      }
-      ImGui::BeginDisabled(state.stopping);
-      const float buttonWidth = (width - ImGui::GetStyle().ItemSpacing.x) / 2;
-      if (ImGui::Button("Later", {buttonWidth, 34})) action = DesktopAction::DismissUpdate;
-      ImGui::SameLine();
-      ImGui::PushStyleColor(ImGuiCol_Button, accent);
-      ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4{.80f, .97f, .88f, 1});
-      ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4{.64f, .84f, .73f, 1});
-      ImGui::PushStyleColor(ImGuiCol_Text, background);
-      if (ImGui::Button(update.phase == UpdatePhase::Failed ? "Retry" : "Update", {buttonWidth, 34}))
-        action = DesktopAction::InstallUpdate;
-      ImGui::PopStyleColor(4);
-      ImGui::EndDisabled();
+
+  if (!options_) {
+    const char* status = state.stopping ? "Disconnecting" : state.starting ? "Connecting" :
+      state.running ? (state.fullMode ? "Connected" : "Proxy active") : "Not connected";
+    ImGui::PushFont(heading); ImGui::TextUnformatted(status); ImGui::PopFont();
+    const auto statusPosition = ImGui::GetCursorScreenPos();
+    const char* detail = state.starting ? "Verifying your tunnel…" : state.stopping ? "Restoring your connection…" :
+      form.server.data();
+    if (state.running) {
+      draw->AddCircleFilled({statusPosition.x + 3, statusPosition.y + 7}, 3,
+        ImGui::GetColorU32(ImVec4{.65f, .78f, .65f, 1}), 16);
+      ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 14);
     }
-    ImGui::Dummy({0, 4});
-  }
-  ImGui::PushStyleColor(ImGuiCol_Button, ImVec4{0, 0, 0, 0});
-  ImGui::PushStyleColor(ImGuiCol_Text, muted);
-  ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0);
-  ImGui::BeginDisabled(state.stopping);
-  if (ImGui::Button("Open browser", {width - 110, 28})) action = DesktopAction::OpenBrowser;
-  ImGui::EndDisabled();
-  ImGui::SameLine(0, 10);
-  if (ImGui::Button("Options", {100, 28})) options_ = !options_;
-  const auto optionsBounds = ImGui::GetItemRectMax();
-  const float alphaBlend = 1 - std::exp(-delta / .08f);
-  optionsAlpha_ += ((options_ ? 1.f : 0.f) - optionsAlpha_) * alphaBlend;
-  // The chevron rotates as the disclosure opens and closes.
-  const ImVec2 pivot{optionsBounds.x - 14, optionsBounds.y - 14};
-  const float angle = optionsAlpha_ * 1.5707963f;
-  auto rotate = [&](float x, float y) {
-    return ImVec2{pivot.x + x * std::cos(angle) - y * std::sin(angle),
-      pivot.y + x * std::sin(angle) + y * std::cos(angle)};
-  };
-  draw->AddLine(rotate(-2, -4), rotate(2, 0), ImGui::GetColorU32(muted), 1.3f);
-  draw->AddLine(rotate(2, 0), rotate(-2, 4), ImGui::GetColorU32(muted), 1.3f);
-  ImGui::PopStyleVar();
-  ImGui::PopStyleColor(2);
-  float contentBottom = optionsBounds.y;
-  if (options_ || optionsAlpha_ > .01f) {
-    ImGui::Dummy({0, 4});
-    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * optionsAlpha_);
-    ImGui::BeginDisabled(state.running || state.stopping || !options_);
-    ImGui::SetNextItemWidth(110); ImGui::InputInt("Remote port", &form.remotePort, 0);
-    ImGui::SetNextItemWidth(110); ImGui::InputInt("Local port", &form.localPort, 0);
-    ImGui::SetNextItemWidth(110); ImGui::InputInt("Timeout · ms", &form.timeout, 0);
-    input("Backup", "", form.backup.data(), form.backup.size());
-    ImGui::SetNextItemWidth(110); ImGui::InputInt("Backup port", &form.backupPort, 0);
-    input("Backup token", form.savedBackupToken ? "Saved" : "Primary token", form.backupToken.data(), form.backupToken.size(), true);
-    input("CA", "", form.ca.data(), form.ca.size());
+    ImGui::TextColored(muted, "%s", detail[0] ? detail : "Configure your server in Settings");
+    ImGui::Dummy({0, 12});
+
+    const auto selector = ImGui::GetCursorScreenPos();
+    const float segment = (width - 8) / 2;
+    draw->AddRectFilled(selector, {selector.x + width, selector.y + 48}, ImGui::GetColorU32(surface), 16);
+    draw->AddRect(selector, {selector.x + width, selector.y + 48}, ImGui::GetColorU32(border), 16);
+    const float selectedX = selector.x + 4 + segment * modePosition_;
+    draw->AddRectFilled({selectedX, selector.y + 4}, {selectedX + segment, selector.y + 44},
+      ImGui::GetColorU32(raised), 12);
+    draw->AddRect({selectedX + .5f, selector.y + 4.5f}, {selectedX + segment - .5f, selector.y + 43.5f},
+      ImGui::GetColorU32(ImVec4{.23f, .23f, .23f, 1}), 12);
+    ImGui::BeginDisabled(busy);
+    for (int mode = 0; mode < 2; ++mode) {
+      ImGui::SetCursorScreenPos({selector.x + 4 + segment * mode, selector.y + 4});
+      const char* label = mode ? "Full mode" : "Proxy only";
+      if (ImGui::InvisibleButton(label, {segment, 40}, ImGuiButtonFlags_EnableNav)) form.fullMode = mode != 0;
+      const bool selected = form.fullMode == (mode != 0);
+      const float hover = hoverFade(label, ImGui::IsItemHovered());
+      const ImU32 color = ImGui::GetColorU32(selected ? accent : ImVec4{muted.x + hover * .18f,
+        muted.y + hover * .18f, muted.z + hover * .18f, 1});
+      const float labelWidth = ImGui::CalcTextSize(label).x;
+      const float x = selector.x + 4 + segment * mode + (segment - labelWidth - 28) / 2;
+      icon(draw, mode ? Icon::Full : Icon::Proxy, {x, selector.y + 14}, 20, color);
+      draw->AddText({x + 28, selector.y + 17}, color, label);
+      if (ImGui::IsItemFocused() && ImGui::GetIO().NavVisible) draw->AddRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
+        ImGui::GetColorU32(muted), 12);
+    }
     ImGui::EndDisabled();
+    ImGui::SetCursorScreenPos({selector.x, selector.y + 60});
+    ImGui::TextColored(muted, "%s", form.fullMode ? "All traffic on this PC · Admin required" : "Only apps configured to use the proxy");
+    ImGui::Dummy({0, 10});
+    ImGui::BeginDisabled(state.stopping);
+    const char* connectLabel = state.stopping ? "Disconnecting…" : state.starting ? "Cancel" :
+      state.running ? "Disconnect" : form.fullMode ? "Start full mode" : "Start proxy";
+    if (button(connectLabel, {width, 46}, state.running || state.starting ? Icon::Stop : Icon::Power, true))
+      action = DesktopAction::ToggleConnection;
+    ImGui::EndDisabled();
+    ImGui::Dummy({0, 12});
+
+    const auto panel = ImGui::GetCursorScreenPos();
+    draw->AddRectFilled(panel, {panel.x + width, panel.y + 112}, ImGui::GetColorU32(surface), 20);
+    draw->AddRect(panel, {panel.x + width, panel.y + 112}, ImGui::GetColorU32(border), 20);
+    draw->AddRect({panel.x + 2, panel.y + 2}, {panel.x + width - 2, panel.y + 110},
+      ImGui::GetColorU32(ImVec4{.115f, .115f, .115f, 1}), 19);
+    ImGui::SetCursorScreenPos({panel.x + 8, panel.y + 6});
+    ImGui::BeginDisabled(state.stopping || state.starting);
+    if (button("Open browser", {width - 16, 48}, Icon::Browser, false, true)) action = DesktopAction::OpenBrowser;
+    ImGui::EndDisabled();
+    draw->AddLine({panel.x + 20, panel.y + 56}, {panel.x + width - 20, panel.y + 56}, ImGui::GetColorU32(border));
+    ImGui::SetCursorScreenPos({panel.x + 8, panel.y + 59});
+    if (button("Settings", {width - 16, 47}, Icon::Settings, false, true)) showOptions();
+    ImGui::SetCursorScreenPos({panel.x, panel.y + 128});
+    ImGui::TextColored(muted, "127.0.0.1:%d", form.localPort);
+    const std::string traffic = state.running ? bytes(state.received) + " received" : "SOCKS5 / HTTP";
+    ImGui::SameLine(); ImGui::SetCursorPosX(windowSize.x - 24 - ImGui::CalcTextSize(traffic.c_str()).x);
+    ImGui::TextColored(muted, "%s", traffic.c_str());
+    if (state.running) {
+      ImGui::TextColored(muted, "%d %s", state.sessions, state.sessions == 1 ? "connection" : "connections");
+      const auto sent = bytes(state.sent) + " sent";
+      ImGui::SameLine(); ImGui::SetCursorPosX(windowSize.x - 24 - ImGui::CalcTextSize(sent.c_str()).x);
+      ImGui::TextColored(muted, "%s", sent.c_str());
+    }
+  } else {
+    ImGui::BeginDisabled(busy);
+    auto serverInputs = [&](const char* hostLabel, auto& host, int& port, const char* hint) {
+      if (ImGui::BeginTable(hostLabel, 2, ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableSetupColumn("Host", ImGuiTableColumnFlags_WidthStretch, 2.8f);
+        ImGui::TableSetupColumn("Port", ImGuiTableColumnFlags_WidthStretch, 1);
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn(); ImGui::TextColored(muted, "%s", hostLabel);
+        ImGui::TableNextColumn(); ImGui::TextColored(muted, "Port");
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn(); ImGui::SetNextItemWidth(-1);
+        ImGui::InputTextWithHint("##host", hint, host.data(), host.size());
+        ImGui::TableNextColumn(); ImGui::SetNextItemWidth(-1); ImGui::InputInt("##port", &port, 0);
+        ImGui::EndTable();
+      }
+    };
+    serverInputs("Server", form.server, form.remotePort, "etl.nora.systems");
+    input("Token", form.savedToken ? "Saved securely" : "", form.token.data(), form.token.size(), true);
     ImGui::Dummy({0, 6});
     ImGui::Separator();
+    ImGui::Dummy({0, 4});
+    serverInputs("Backup server", form.backup, form.backupPort, "Optional");
+    input("Backup token", form.savedBackupToken ? "Saved securely" : "Use primary token", form.backupToken.data(), form.backupToken.size(), true);
+    if (form.fullMode) ImGui::TextColored(muted, "Backup is used in Proxy mode.");
+    ImGui::Dummy({0, 6});
+    ImGui::Separator();
+    ImGui::Dummy({0, 4});
+    if (ImGui::BeginTable("Local connection", 2, ImGuiTableFlags_SizingStretchSame)) {
+      ImGui::TableNextRow();
+      ImGui::TableNextColumn(); ImGui::TextColored(muted, "Local port");
+      ImGui::TableNextColumn(); ImGui::TextColored(muted, "Timeout (ms)");
+      ImGui::TableNextRow();
+      ImGui::TableNextColumn(); ImGui::SetNextItemWidth(-1); ImGui::InputInt("##local", &form.localPort, 0);
+      ImGui::TableNextColumn(); ImGui::SetNextItemWidth(-1); ImGui::InputInt("##timeout", &form.timeout, 0);
+      ImGui::EndTable();
+    }
+    input("CA certificate", "System trust store", form.ca.data(), form.ca.size());
+    ImGui::Dummy({0, 10});
+    if (button("Save settings", {width, 42}, Icon::Settings, true)) action = DesktopAction::SaveSettings;
+    ImGui::EndDisabled();
+    if (busy) ImGui::TextColored(muted, "Disconnect to edit your settings.");
+    ImGui::Dummy({0, 8});
+    ImGui::Separator();
     ImGui::TextColored(muted, "ETL %s", etlVersion);
-    const bool busy = update.phase == UpdatePhase::Checking || downloading;
-    ImGui::BeginDisabled(busy || state.stopping || !options_);
-    if (ImGui::Button(update.phase == UpdatePhase::Checking ? "Checking…" : "Check for updates", {-1, 32}))
+    ImGui::BeginDisabled(update.phase == UpdatePhase::Checking || downloading || state.stopping);
+    if (button(update.phase == UpdatePhase::Checking ? "Checking…" : "Check for updates", {width, 36}, Icon::Download))
       action = DesktopAction::CheckUpdates;
     ImGui::EndDisabled();
     if (update.phase == UpdatePhase::Current) ImGui::TextColored(muted, "You're up to date.");
-    if (!update.offered && !update.error.empty()) {
-      ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{1, .65f, .60f, 1});
-      ImGui::TextWrapped("%s", update.error.c_str());
-      ImGui::PopStyleColor();
-    }
-    if (options_) contentBottom = ImGui::GetItemRectMax().y;
-    ImGui::PopStyleVar();
+    if (!update.offered && !update.error.empty()) ImGui::TextWrapped("%s", update.error.c_str());
   }
-  contentHeight_ = contentBottom - ImGui::GetWindowPos().y + ImGui::GetStyle().WindowPadding.y;
-  // Keep keyboard navigation from scrolling content during its reveal.
+
+  if (!state.error.empty()) {
+    ImGui::Dummy({0, 6});
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{.94f, .66f, .63f, 1});
+    ImGui::TextWrapped("%s", state.error.c_str());
+    ImGui::PopStyleColor();
+  }
+  if (!options_ && update.offered) {
+    ImGui::Dummy({0, 8}); ImGui::Separator(); ImGui::Dummy({0, 4});
+    ImGui::TextUnformatted(downloading ? "Updating ETL" : "Update available");
+    ImGui::TextColored(muted, "%s → %s", etlVersion, update.version.c_str());
+    if (downloading) {
+      ImGui::PushStyleColor(ImGuiCol_PlotHistogram, accent);
+      ImGui::ProgressBar(update.progress, {-1, 6}, "");
+      ImGui::PopStyleColor();
+      if (update.phase == UpdatePhase::Ready) ImGui::TextColored(muted, "Restarting…");
+      else ImGui::TextColored(muted, "%d%%", static_cast<int>(update.progress * 100));
+    } else {
+      ImGui::PushStyleColor(ImGuiCol_Text, muted);
+      ImGui::TextWrapped("%s", busy ? "ETL will disconnect and restart." : "ETL will restart after updating.");
+      ImGui::PopStyleColor();
+      if (!update.error.empty()) ImGui::TextWrapped("%s", update.error.c_str());
+      ImGui::BeginDisabled(state.starting || state.stopping);
+      const float half = (width - 12) / 2;
+      if (button("Later", {half, 38}, Icon::Close)) action = DesktopAction::DismissUpdate;
+      ImGui::SameLine();
+      if (button(update.phase == UpdatePhase::Failed ? "Retry" : "Update", {half, 38}, Icon::Download, true))
+        action = DesktopAction::InstallUpdate;
+      ImGui::EndDisabled();
+    }
+  }
+  contentHeight_ = ImGui::GetCursorPosY() + 16;
+  ImGui::PopStyleVar();
   ImGui::SetScrollY(0);
   ImGui::End();
   ImGui::Render();
