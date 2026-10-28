@@ -74,7 +74,7 @@ test('exported agent pairs once, preserves its identity, speaks ETL and stops af
     const bundle = join(directory, process.platform === 'win32' ? 'etl-agent.exe' : 'etl-agent');
     const metadataPath = join(directory, 'metadata.json');
     const exportedInput = native ? { ...metadata, controller: { ...metadata.controller,
-      ca: ca + readFileSync(keyPath, 'utf8') } } : metadata;
+      ca: ca.replace(/\r?\n/g, '\r\n') + readFileSync(keyPath, 'utf8') } } : metadata;
     writeFileSync(metadataPath, JSON.stringify(exportedInput));
     if (native) {
       await execute(native, ['--self-test-agent-export', 'windows', metadataPath, bundle], { windowsHide: true });
@@ -88,7 +88,9 @@ test('exported agent pairs once, preserves its identity, speaks ETL and stops af
     const binary = readFileSync(bundle);
     assert.equal(binary.subarray(-9).toString(), 'ETLAGENT1');
     const footerSize = binary.readUInt32BE(binary.length - 13);
-    assert.deepEqual(JSON.parse(binary.subarray(-13-footerSize, -13)), metadata);
+    const expected = structuredClone(metadata);
+    if (native) expected.controller.ca = ca.replace(/\r\n/g, '\n');
+    assert.deepEqual(JSON.parse(binary.subarray(-13-footerSize, -13)), expected);
     assert.ok(!binary.includes(Buffer.from(master)), 'controller credential must never be embedded');
     assert.ok(!binary.includes(readFileSync(keyPath)), 'CA files must not export private keys');
     const launch = profile => {
