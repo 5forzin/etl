@@ -299,17 +299,15 @@ DesktopAction DesktopUi::render(DesktopForm& form, const DesktopState& state, fl
 
   if (!options_) {
     const char* status = state.stopping ? "Disconnecting" : state.starting ? "Connecting" :
-      state.running ? (state.fullMode ? "Connected" : "Proxy active") : "Not connected";
+      state.running ? (state.fullMode ? "Connected" : "Proxy active") : "Disconnected";
     ImGui::PushFont(heading); ImGui::TextUnformatted(status); ImGui::PopFont();
     const auto statusPosition = ImGui::GetCursorScreenPos();
-    const char* detail = state.starting ? "Verifying your tunnel…" : state.stopping ? "Restoring your connection…" :
-      form.server.data();
     if (state.running) {
       draw->AddCircleFilled({statusPosition.x + 3, statusPosition.y + 7}, 3,
         ImGui::GetColorU32(ImVec4{.65f, .78f, .65f, 1}), 16);
       ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 14);
     }
-    ImGui::TextColored(muted, "%s", detail[0] ? detail : "Configure your server in Settings");
+    ImGui::TextColored(muted, "%s", form.server[0] ? form.server.data() : "Server not set");
     ImGui::Dummy({0, 12});
 
     const auto selector = ImGui::GetCursorScreenPos();
@@ -338,14 +336,13 @@ DesktopAction DesktopUi::render(DesktopForm& form, const DesktopState& state, fl
         ImGui::GetColorU32(muted), 12);
     }
     ImGui::EndDisabled();
-    ImGui::SetCursorScreenPos({selector.x, selector.y + 60});
-    ImGui::TextColored(muted, "%s", form.fullMode ? "All traffic on this PC · Admin required" : "Only apps configured to use the proxy");
-    ImGui::Dummy({0, 10});
+    ImGui::SetCursorScreenPos({selector.x, selector.y + 64});
     ImGui::BeginDisabled(state.stopping);
     const char* connectLabel = state.stopping ? "Disconnecting…" : state.starting ? "Cancel" :
-      state.running ? "Disconnect" : form.fullMode ? "Start full mode" : "Start proxy";
+      state.running ? "Disconnect" : "Connect";
     if (button(connectLabel, {width, 46}, state.running || state.starting ? Icon::Stop : Icon::Power, true))
       action = DesktopAction::ToggleConnection;
+    if (form.fullMode && !busy && ImGui::IsItemHovered()) ImGui::SetTooltip("Requires administrator permission.");
     ImGui::EndDisabled();
     ImGui::Dummy({0, 12});
 
@@ -363,14 +360,19 @@ DesktopAction DesktopUi::render(DesktopForm& form, const DesktopState& state, fl
     if (button("Settings", {width - 16, 47}, Icon::Settings, false, true)) showOptions();
     ImGui::SetCursorScreenPos({panel.x, panel.y + 128});
     ImGui::TextColored(muted, "127.0.0.1:%d", form.localPort);
-    const std::string traffic = state.running ? bytes(state.received) + " received" : "SOCKS5 / HTTP";
-    ImGui::SameLine(); ImGui::SetCursorPosX(windowSize.x - 24 - ImGui::CalcTextSize(traffic.c_str()).x);
-    ImGui::TextColored(muted, "%s", traffic.c_str());
     if (state.running) {
       ImGui::TextColored(muted, "%d %s", state.sessions, state.sessions == 1 ? "connection" : "connections");
-      const auto sent = bytes(state.sent) + " sent";
-      ImGui::SameLine(); ImGui::SetCursorPosX(windowSize.x - 24 - ImGui::CalcTextSize(sent.c_str()).x);
-      ImGui::TextColored(muted, "%s", sent.c_str());
+      const auto sent = bytes(state.sent), received = bytes(state.received);
+      const float sentWidth = ImGui::CalcTextSize(sent.c_str()).x;
+      const float receivedWidth = ImGui::CalcTextSize(received.c_str()).x;
+      ImGui::SameLine(); ImGui::SetCursorPosX(windowSize.x - 24 - sentWidth - receivedWidth - 52);
+      auto position = ImGui::GetCursorScreenPos();
+      icon(draw, Icon::Upload, {position.x, position.y - 1}, 16, ImGui::GetColorU32(muted));
+      ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 20); ImGui::TextColored(muted, "%s", sent.c_str());
+      ImGui::SameLine(0, 12);
+      position = ImGui::GetCursorScreenPos();
+      icon(draw, Icon::Download, {position.x, position.y - 1}, 16, ImGui::GetColorU32(muted));
+      ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 20); ImGui::TextColored(muted, "%s", received.c_str());
     }
   } else {
     ImGui::BeginDisabled(busy);
@@ -389,13 +391,12 @@ DesktopAction DesktopUi::render(DesktopForm& form, const DesktopState& state, fl
       }
     };
     serverInputs("Server", form.server, form.remotePort, "etl.nora.systems");
-    input("Token", form.savedToken ? "Saved securely" : "", form.token.data(), form.token.size(), true);
+    input("Token", form.savedToken ? "Saved" : "", form.token.data(), form.token.size(), true);
     ImGui::Dummy({0, 6});
     ImGui::Separator();
     ImGui::Dummy({0, 4});
-    serverInputs("Backup server", form.backup, form.backupPort, "Optional");
-    input("Backup token", form.savedBackupToken ? "Saved securely" : "Use primary token", form.backupToken.data(), form.backupToken.size(), true);
-    if (form.fullMode) ImGui::TextColored(muted, "Backup is used in Proxy mode.");
+    serverInputs(form.fullMode ? "Backup (proxy only)" : "Backup server", form.backup, form.backupPort, "");
+    input("Backup token", form.savedBackupToken ? "Saved" : "Primary token", form.backupToken.data(), form.backupToken.size(), true);
     ImGui::Dummy({0, 6});
     ImGui::Separator();
     ImGui::Dummy({0, 4});
@@ -410,17 +411,17 @@ DesktopAction DesktopUi::render(DesktopForm& form, const DesktopState& state, fl
     }
     input("CA certificate", "System trust store", form.ca.data(), form.ca.size());
     ImGui::Dummy({0, 10});
-    if (button("Save settings", {width, 42}, Icon::Settings, true)) action = DesktopAction::SaveSettings;
+    if (button("Save", {width, 42}, Icon::Settings, true)) action = DesktopAction::SaveSettings;
     ImGui::EndDisabled();
-    if (busy) ImGui::TextColored(muted, "Disconnect to edit your settings.");
+    if (busy) ImGui::TextColored(muted, "Disconnect to edit.");
     ImGui::Dummy({0, 8});
     ImGui::Separator();
-    ImGui::TextColored(muted, "ETL %s", etlVersion);
+    ImGui::TextColored(muted, "v%s", etlVersion);
     ImGui::BeginDisabled(update.phase == UpdatePhase::Checking || downloading || state.stopping);
     if (button(update.phase == UpdatePhase::Checking ? "Checking…" : "Check for updates", {width, 36}, Icon::Download))
       action = DesktopAction::CheckUpdates;
     ImGui::EndDisabled();
-    if (update.phase == UpdatePhase::Current) ImGui::TextColored(muted, "You're up to date.");
+    if (update.phase == UpdatePhase::Current) ImGui::TextColored(muted, "Up to date");
     if (!update.offered && !update.error.empty()) ImGui::TextWrapped("%s", update.error.c_str());
   }
 
@@ -432,7 +433,7 @@ DesktopAction DesktopUi::render(DesktopForm& form, const DesktopState& state, fl
   }
   if (!options_ && update.offered) {
     ImGui::Dummy({0, 8}); ImGui::Separator(); ImGui::Dummy({0, 4});
-    ImGui::TextUnformatted(downloading ? "Updating ETL" : "Update available");
+    ImGui::TextUnformatted(downloading ? "Updating" : "Update available");
     ImGui::TextColored(muted, "%s → %s", etlVersion, update.version.c_str());
     if (downloading) {
       ImGui::PushStyleColor(ImGuiCol_PlotHistogram, accent);
@@ -442,7 +443,7 @@ DesktopAction DesktopUi::render(DesktopForm& form, const DesktopState& state, fl
       else ImGui::TextColored(muted, "%d%%", static_cast<int>(update.progress * 100));
     } else {
       ImGui::PushStyleColor(ImGuiCol_Text, muted);
-      ImGui::TextWrapped("%s", busy ? "ETL will disconnect and restart." : "ETL will restart after updating.");
+      ImGui::TextWrapped("%s", busy ? "Disconnects and restarts ETL." : "Restarts ETL.");
       ImGui::PopStyleColor();
       if (!update.error.empty()) ImGui::TextWrapped("%s", update.error.c_str());
       ImGui::BeginDisabled(state.starting || state.stopping);

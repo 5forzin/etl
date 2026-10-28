@@ -46,7 +46,7 @@ Closing the window hides it in the tray and keeps the selected mode running.
 
 The borderless window is 400 pixels wide, with a draggable header and custom
 minimize and close controls. Settings contains server credentials, ports, backup,
-timeout and CA. Save settings persists edits without starting a connection. The
+timeout and CA. Save persists edits without starting a connection. The
 mode selector, hover states, page transitions and window height animate smoothly,
 respecting Windows' reduced-animation preference.
 
