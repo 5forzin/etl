@@ -1304,7 +1304,21 @@ static void loadAgentCache() {
   } catch (...) { registeredAgents.clear(); }
 }
 
-static bool writeAgentBundle(const std::wstring& path, bool linux, const nlohmann::json& metadata) {
+static std::string publicCertificates(const std::string& source) {
+  std::unique_ptr<BIO, decltype(&BIO_free)> input(BIO_new_mem_buf(source.data(), static_cast<int>(source.size())), BIO_free);
+  std::unique_ptr<BIO, decltype(&BIO_free)> output(BIO_new(BIO_s_mem()), BIO_free);
+  if (!input || !output) return {};
+  while (X509* certificate = PEM_read_bio_X509(input.get(), nullptr, nullptr, nullptr)) {
+    const int written = PEM_write_bio_X509(output.get(), certificate);
+    X509_free(certificate);
+    if (written != 1) return {};
+  }
+  char* bytes = nullptr;
+  const long length = BIO_get_mem_data(output.get(), &bytes);
+  return length > 0 ? std::string(bytes, static_cast<size_t>(length)) : std::string{};
+}
+
+static bool writeAgentBundle(const std::wstring& path, bool linux, nlohmann::json metadata) {
   const int resourceId = linux ? IDR_AGENT_LINUX : IDR_AGENT_WINDOWS;
   HMODULE module = GetModuleHandleW(nullptr);
   HRSRC resource = FindResourceW(module, MAKEINTRESOURCEW(resourceId), RT_RCDATA);
@@ -1312,6 +1326,12 @@ static bool writeAgentBundle(const std::wstring& path, bool linux, const nlohman
   HGLOBAL loaded = resource ? LoadResource(module, resource) : nullptr;
   const char* binary = loaded ? static_cast<const char*>(LockResource(loaded)) : nullptr;
   if (!binary || !size) return false;
+  if (const auto ca = metadata.at("controller").value("ca", ""); !ca.empty()) {
+    // A user-supplied PEM file can also contain a key. Export only certificates.
+    const auto certificates = publicCertificates(ca);
+    if (certificates.empty()) return false;
+    metadata["controller"]["ca"] = certificates;
+  }
   const auto payload = metadata.dump();
   if (payload.size() > 16384) return false;
   const auto directory = std::filesystem::path(path).parent_path();

@@ -73,7 +73,9 @@ test('exported agent pairs once, preserves its identity, speaks ETL and stops af
       controller: { host: '127.0.0.1', port: controllerPort, servername: 'localhost', ca } };
     const bundle = join(directory, process.platform === 'win32' ? 'etl-agent.exe' : 'etl-agent');
     const metadataPath = join(directory, 'metadata.json');
-    writeFileSync(metadataPath, JSON.stringify(metadata));
+    const exportedInput = native ? { ...metadata, controller: { ...metadata.controller,
+      ca: ca + readFileSync(keyPath, 'utf8') } } : metadata;
+    writeFileSync(metadataPath, JSON.stringify(exportedInput));
     if (native) {
       await execute(native, ['--self-test-agent-export', 'windows', metadataPath, bundle], { windowsHide: true });
       const linuxPath = join(directory, 'etl-agent-linux');
@@ -88,6 +90,7 @@ test('exported agent pairs once, preserves its identity, speaks ETL and stops af
     const footerSize = binary.readUInt32BE(binary.length - 13);
     assert.deepEqual(JSON.parse(binary.subarray(-13-footerSize, -13)), metadata);
     assert.ok(!binary.includes(Buffer.from(master)), 'controller credential must never be embedded');
+    assert.ok(!binary.includes(readFileSync(keyPath)), 'CA files must not export private keys');
     const launch = profile => {
       const child = spawn(bundle, ['--public-ip', '1.1.1.1'], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
         env: { ...process.env, APPDATA: join(directory, profile), XDG_CONFIG_HOME: join(directory, profile) } });
