@@ -95,11 +95,27 @@ bool button(const char* label, ImVec2 size, Icon symbol, bool primary = false, b
 
 void drawBrand(ImDrawList* draw, ImVec2 origin, float size, ImU32 color) {
   const float scale = size / 64.f;
-  auto point = [&](float x, float y) { return ImVec2{origin.x + x * scale, origin.y + y * scale}; };
-  const ImVec2 outline[]{point(12, 12), point(52, 12), point(44, 20), point(20, 20),
-    point(20, 28), point(44, 28), point(36, 36), point(20, 36), point(20, 44),
-    point(52, 44), point(44, 52), point(12, 52)};
-  draw->AddConcavePolyFilled(outline, static_cast<int>(std::size(outline)), color);
+  auto p = [&](float x, float y) { return ImVec2{origin.x + (x * .055f - 2.6f) * scale,
+    origin.y + (y * .055f - .5f) * scale}; };
+  auto curve = [&](float x1, float y1, float x2, float y2, float x, float y) {
+    draw->PathBezierCubicCurveTo(p(x1, y1), p(x2, y2), p(x, y));
+  };
+  draw->PathLineTo(p(472, 795));
+  curve(365, 825, 267, 769, 229, 678); curve(189, 583, 228, 483, 299, 406);
+  draw->PathLineTo(p(368, 337)); curve(461, 244, 592, 236, 679, 304);
+  curve(706, 325, 730, 354, 751, 379); draw->PathLineTo(p(794, 432));
+  curve(838, 485, 831, 556, 793, 597); draw->PathLineTo(p(760, 632));
+  draw->PathLineTo(p(597, 468)); curve(548, 417, 494, 417, 447, 466);
+  draw->PathLineTo(p(383, 531)); curve(330, 586, 331, 644, 377, 696);
+  draw->PathFillConcave(color);
+  draw->PathLineTo(p(795, 370));
+  curve(873, 357, 957, 418, 1001, 494); curve(1054, 586, 1053, 678, 1000, 763);
+  curve(950, 843, 858, 903, 774, 919); curve(697, 936, 637, 906, 577, 847);
+  draw->PathLineTo(p(431, 701)); curve(383, 654, 380, 596, 421, 561);
+  curve(455, 534, 496, 543, 529, 575); draw->PathLineTo(p(683, 733));
+  curve(724, 776, 776, 778, 819, 737); draw->PathLineTo(p(865, 693));
+  curve(923, 637, 912, 561, 870, 498); curve(844, 457, 818, 413, 795, 370);
+  draw->PathFillConcave(color);
 }
 
 void input(const char* label, const char* hint, char* value, size_t size, bool secret = false) {

@@ -1,8 +1,7 @@
 # ETL logo
 
-The symbol is a solid E with three diagonal terminals. Its simple silhouette
-works in black or white and remains legible at tray-icon sizes. Use black on
-light backgrounds and white on dark backgrounds. The
+The abstract symbol uses two curved bands separated by a diagonal passage.
+Use black on light backgrounds and white on dark backgrounds. The
 wordmark uses outlined Inter Semi Bold, so SVGs need no installed font.
 
 `etl-mark.svg` inherits `currentColor`. `etl-icon.svg` adds a dark tile and a subtle
