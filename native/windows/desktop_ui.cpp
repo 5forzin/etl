@@ -143,8 +143,9 @@ void DesktopUi::releaseDevice() {
   if (device_) { device_->Release(); device_ = nullptr; }
 }
 
-bool DesktopUi::initialize(HWND window) {
+bool DesktopUi::initialize(HWND window, DesktopMotion motion) {
   window_ = window;
+  motionPreference_ = motion;
   DXGI_SWAP_CHAIN_DESC desc{};
   desc.BufferCount = 2;
   desc.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -207,8 +208,8 @@ bool DesktopUi::initialize(HWND window) {
   }
   initialized_ = true;
   BOOL animations = TRUE;
-  SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &animations, 0);
-  motion_ = animations != FALSE;
+  if (motion == DesktopMotion::System) SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &animations, 0);
+  motion_ = motion == DesktopMotion::Enabled || (motion == DesktopMotion::System && animations != FALSE);
   reduceMotion = !motion_;
   return true;
 }
@@ -252,7 +253,7 @@ void DesktopUi::animateHeight(float target, float delta) {
 DesktopAction DesktopUi::render(DesktopForm& form, const DesktopState& state, float previewStep) {
   if (!initialized_ || !target_) {
     shutdown();
-    if (!initialize(window_)) { Sleep(100); return DesktopAction::None; }
+    if (!initialize(window_, motionPreference_)) { Sleep(100); return DesktopAction::None; }
   }
   animateHeight(contentHeight_, previewStep > 0 ? previewStep : ImGui::GetIO().DeltaTime);
   if (!target_) return DesktopAction::None;
@@ -467,7 +468,7 @@ DesktopAction DesktopUi::render(DesktopForm& form, const DesktopState& state, fl
   const HRESULT result = swap_->Present(1, 0);
   if (result == DXGI_ERROR_DEVICE_REMOVED || result == DXGI_ERROR_DEVICE_RESET) {
     shutdown();
-    initialize(window_);
+    initialize(window_, motionPreference_);
   } else if (result == DXGI_STATUS_OCCLUDED && previewStep <= 0) Sleep(100);
   return action;
 }

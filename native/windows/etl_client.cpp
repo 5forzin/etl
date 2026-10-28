@@ -1431,6 +1431,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     LocalFree(argv); WSACleanup(); return 0;
   }
   const bool previewOptions = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-options";
+  const bool previewReduced = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-reduced";
   const bool previewFull = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-full";
   const bool previewFullActive = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-full-active";
   const bool previewConnecting = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-connecting";
@@ -1441,7 +1442,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   const bool previewDownloading = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-downloading";
   const bool previewUpdateError = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-update-error";
   const std::wstring previewPath = argc == 3 && (std::wstring(argv[1]) == L"--self-test-ui" || previewOptions || previewActive || previewFull || previewFullActive || previewConnecting || previewStopping ||
-    previewError || previewUpdate || previewDownloading || previewUpdateError) ? argv[2] : L"";
+    previewError || previewUpdate || previewDownloading || previewUpdateError || previewReduced) ? argv[2] : L"";
   if (argc == 2 && std::wstring(argv[1]) == L"--self-test-token-storage") {
     std::string original(64, 'a'), restored;
     std::wstring protectedValue;
@@ -1562,7 +1563,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   const DWORD noBorder = 0xfffffffe;
   DwmSetWindowAttribute(window, static_cast<DWMWINDOWATTRIBUTE>(33), &rounded, sizeof(rounded));
   DwmSetWindowAttribute(window, static_cast<DWMWINDOWATTRIBUTE>(34), &noBorder, sizeof(noBorder));
-  if (!desktop.initialize(window)) {
+  const auto motionPreference = previewPath.empty() ? DesktopMotion::System :
+    previewReduced ? DesktopMotion::Reduced : DesktopMotion::Enabled;
+  if (!desktop.initialize(window, motionPreference)) {
     MessageBoxW(window, L"DirectX 11 could not start.", L"ETL", MB_ICONERROR);
     DestroyWindow(window); WSACleanup(); return 2;
   }
@@ -1591,7 +1594,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         desktop.render(form, state, .16f);
       }
     }
-    if (previewOptions) {
+    if (previewOptions || previewReduced) {
       desktop.showOptions(); renderPreview(DesktopState{}, 2);
       const int growing = height();
       renderPreview(DesktopState{});
@@ -1599,8 +1602,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
       desktop.showOptions(false); renderPreview(DesktopState{}, 2);
       const int shrinking = height();
       renderPreview(DesktopState{});
-      motion = growing > collapsed && growing < expanded &&
-        shrinking > collapsed && shrinking < expanded && height() == collapsed;
+      motion = height() == collapsed && (previewReduced ?
+        growing == expanded && shrinking == collapsed :
+        growing > collapsed && growing < expanded && shrinking > collapsed && shrinking < expanded);
       desktop.showOptions(); renderPreview(DesktopState{});
     }
     if (previewError) {

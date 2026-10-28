@@ -25,10 +25,11 @@ struct DesktopState {
 };
 
 enum class DesktopAction { None, ToggleConnection, OpenBrowser, SaveSettings, CheckUpdates, InstallUpdate, DismissUpdate };
+enum class DesktopMotion { System, Enabled, Reduced };
 
 class DesktopUi {
  public:
-  bool initialize(HWND window);
+  bool initialize(HWND window, DesktopMotion motion = DesktopMotion::System);
   DesktopAction render(DesktopForm& form, const DesktopState& state, float previewStep = 0);
   void resize(unsigned width, unsigned height);
   void shutdown();
@@ -47,6 +48,7 @@ class DesktopUi {
   bool initialized_ = false;
   float modePosition_ = 0, pageAlpha_ = 1;
   bool motion_ = true;
+  DesktopMotion motionPreference_ = DesktopMotion::System;
   bool options_ = false;
   float height_ = 0, heightFrom_ = 0, heightTarget_ = 0, heightElapsed_ = 0;
   float contentHeight_ = 460;

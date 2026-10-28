@@ -156,6 +156,9 @@ cancellation, errors and parent death without UAC or network route changes.
 and `--self-test-ui-stopping` capture the mode selector and connection states.
 `--self-test-ui-active` captures the local proxy's traffic counters. These fixtures
 render synthetic test data without starting a connection or loading saved tokens.
+Preview animations are deterministic and independent of the host's animation
+preference. `--self-test-ui-reduced` checks that Settings opens and closes
+immediately when reduced motion is requested.
 
 Headless mode takes `--server`, `--server-port`, `--port`, `--token-file`,
 `--ca`, `--fallback-server`, `--fallback-port`, `--fallback-token-file` and

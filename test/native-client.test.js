@@ -320,7 +320,7 @@ test('native desktop renders compact frames and animates expansion and collapse 
     const heights = ['--self-test-ui', '--self-test-ui-options', '--self-test-ui-error',
       '--self-test-ui-update', '--self-test-ui-downloading', '--self-test-ui-update-error',
       '--self-test-ui-active', '--self-test-ui-full', '--self-test-ui-full-active',
-      '--self-test-ui-connecting', '--self-test-ui-stopping'].map((flag, index) => {
+      '--self-test-ui-connecting', '--self-test-ui-stopping', '--self-test-ui-reduced'].map((flag, index) => {
       const path = join(dir, `preview-${index}.bmp`);
       execFileSync(executable, [flag, path], { windowsHide: true, timeout: 8000 });
       const bitmap = readFileSync(path);
@@ -339,6 +339,7 @@ test('native desktop renders compact frames and animates expansion and collapse 
     assert.equal(heights[8], heights[6], 'both active modes should have the same layout');
     assert.equal(heights[9], heights[0], 'connecting should keep Cancel in place');
     assert.equal(heights[10], heights[0], 'stopping should keep the status visible');
+    assert.equal(heights[11], heights[1], 'reduced motion should preserve the Settings layout');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
