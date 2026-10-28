@@ -320,7 +320,8 @@ test('native desktop renders compact frames and animates expansion and collapse 
     const heights = ['--self-test-ui', '--self-test-ui-options', '--self-test-ui-error',
       '--self-test-ui-update', '--self-test-ui-downloading', '--self-test-ui-update-error',
       '--self-test-ui-active', '--self-test-ui-full', '--self-test-ui-full-active',
-      '--self-test-ui-connecting', '--self-test-ui-stopping', '--self-test-ui-reduced'].map((flag, index) => {
+      '--self-test-ui-connecting', '--self-test-ui-stopping', '--self-test-ui-reduced',
+      '--self-test-ui-servers', '--self-test-ui-agent-export'].map((flag, index) => {
       const path = join(dir, `preview-${index}.bmp`);
       execFileSync(executable, [flag, path], { windowsHide: true, timeout: 8000 });
       const bitmap = readFileSync(path);
@@ -364,7 +365,10 @@ test('native Windows client relays SOCKS5 UDP ASSOCIATE through a v2 session',
     await once(echo, 'listening');
     const echoPort = echo.address().port;
     server = createTunnelServer({ key: readFileSync(keyPath), cert: readFileSync(certPath),
-      getToken: () => token, resolve: async () => [{ address: '127.0.0.1', family: 4 }] });
+      getToken: () => token, resolve: async host => {
+        if (host === '127.0.0.2') throw new Error('Blocked fixture destination');
+        return [{ address: '127.0.0.1', family: 4 }];
+      } });
     const serverPort = await listen(server);
     const localPort = await freePort();
     child = spawn(executable, ['--headless', '--server', 'localhost', '--server-port', String(serverPort),
@@ -389,6 +393,8 @@ test('native Windows client relays SOCKS5 UDP ASSOCIATE through a v2 session',
       echoPort >> 8, echoPort & 255]);
     const payload = Buffer.from('native-udp-over-etl-v2');
     const replyWait = once(app, 'message', { signal: AbortSignal.timeout(8000) });
+    const rejected = Buffer.from(header); rejected[7] = 2;
+    app.send(Buffer.concat([rejected, payload]), relayPort, '127.0.0.1');
     app.send(Buffer.concat([header, payload]), relayPort, '127.0.0.1');
     const [message] = await replyWait;
     assert.deepEqual(message.subarray(10), payload);

@@ -27,7 +27,7 @@ user. Updates and uninstall preserve saved tokens and settings.
 
 For a portable copy, download `etl-client.exe` instead. Both builds include the
 same client. See the [Windows guide](native/windows/README.md) to build either.
-Enter your server and token, set the remote port under Options, then click the power button.
+Enter your server and token in Settings, choose Proxy only or Full mode, then Connect.
 
 With Node.js 24 or later:
 
@@ -44,11 +44,23 @@ For a non-default server port, add `--server-port 24443`.
 See [setup and operations](docs/getting-started.md) for certificates, Docker,
 token provisioning and backup configuration.
 
+## Add a server
+
+In the Windows app, open **Servers → Add server**, choose Windows x64 or Linux
+x64, and generate the file. Copy it to a server with a public IPv4 address and
+allow the selected TCP port. Run it within 24 hours; it registers automatically
+and appears in Servers. No Node.js or Go installation is needed on that server.
+
+The generated executable contains a single-use pairing code, never the primary
+server token. The primary server must run this revision's agent controller.
+See [agents](docs/agents.md) for execution, persistent state and revocation.
+
 ## Scope
 
-ETL currently forwards TCP. It has no UDP relay, TUN adapter or system-wide
-routing. Applications must use the proxy. SOCKS clients should send hostnames
-through it (`socks5h`); local DNS, UDP and WebRTC stay outside its coverage.
+ETL forwards TCP and supports UDP through SOCKS5 UDP ASSOCIATE. Proxy only
+affects applications configured to use it. Windows Full mode uses a TUN adapter
+and restores normal routing if the tunnel fails. SOCKS clients should send
+hostnames through the proxy (`socks5h`).
 
 TLS protects the client-to-server link. The network can still see the endpoint
 and traffic patterns. The exit host can see destination metadata. ETL has not
@@ -59,11 +71,13 @@ had an independent security audit and makes no anonymity or detectability claim.
 ~~~sh
 npm run check
 npm test
+go -C agent test ./...
 ~~~
 
 Tests create temporary certificates with OpenSSL and use local listeners. Set
 `ETL_NATIVE_CLIENT` to a built Windows EXE to include native integration and
 DirectX rendering checks. Otherwise those tests are skipped.
+Set `ETL_AGENT` to a built agent template to test executable pairing and revocation.
 
 - [Architecture](docs/architecture.md)
 - [Protocol](docs/protocol.md)

@@ -39,8 +39,8 @@ this updater must be installed manually by users of earlier versions.
 Run `etl-client.exe`, enter the server and token in Settings, then choose a mode.
 **Proxy only** opens the local listener. **Full mode** starts a separate elevated
 worker and routes the PC through the TUN adapter. The desktop and browser keep
-normal user permissions. Full mode uses the primary server; the backup remains
-saved for Proxy mode. It authenticates before changing routes and restores the
+normal user permissions. Full mode uses the selected server; the primary
+profile's backup remains saved for Proxy mode. It authenticates before changing routes and restores the
 normal connection after a tunnel failure, Disconnect, Exit or a desktop crash.
 Closing the window hides it in the tray and keeps the selected mode running.
 
@@ -56,6 +56,14 @@ It prefers the default browser when that is Edge or Chrome. Profiles live under
 `%LOCALAPPDATA%\ETL\Browser`, separately for each browser and proxy port.
 If disconnected, this action starts Proxy only or reuses an existing local SOCKS5
 listener. It does not change the system proxy or normal browser profile.
+
+Servers lists the primary profile and registered agents. Add server generates a
+Windows or Linux x64 executable with a single-use pairing code. The templates
+are embedded in the app, so exporting needs no compiler or additional download.
+Agents appear automatically after registration. Selecting one preserves the
+primary and backup profile. Agent credentials are cached with current-user DPAPI;
+each connection verifies that agent's own certificate and hostname. See
+[agents](../../docs/agents.md) for server requirements and execution.
 
 The token input is masked. A saved token remains
 in use when the field is blank; entering a new token replaces it. Leaving the
@@ -86,6 +94,10 @@ Checks send no destination or application data and do not block primary traffic.
 Active streams never move between servers. TLS verification stays enabled.
 
 ## Build a portable executable
+
+Install Go 1.25 or later and make `go` available on PATH. CMake compiles static
+Windows and Linux x64 agent templates and embeds both in the desktop executable.
+CI uses Go 1.27.3. Override its path with `-DETL_GO_EXECUTABLE=PATH` if needed.
 
 MSYS2 UCRT64 with GCC, OpenSSL, CMake and Ninja:
 
@@ -161,7 +173,7 @@ preference. `--self-test-ui-reduced` checks that Settings opens and closes
 immediately when reduced motion is requested.
 
 Headless mode takes `--server`, `--server-port`, `--port`, `--token-file`,
-`--ca`, `--fallback-server`, `--fallback-port`, `--fallback-token-file` and
+`--ca`, `--servername`, `--fallback-server`, `--fallback-port`, `--fallback-token-file` and
 `--connect-timeout-ms`. It additionally accepts `--handshake-timeout-ms`
 (1–65535; default 10000) and `--idle-timeout-ms` (1–600000; default 120000).
 `--fallback-check-interval-ms` sets the backup check interval (100–60000;

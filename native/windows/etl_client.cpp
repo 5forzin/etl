@@ -4,9 +4,12 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <wincrypt.h>
+#include <commdlg.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 #include <openssl/crypto.h>
+#include <openssl/pem.h>
+#include <openssl/sha.h>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -16,6 +19,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <mutex>
 #include <memory>
 #include <set>
@@ -64,6 +68,7 @@ struct Config {
   int idleTimeoutMs = 120000;
   int localPort = 1080;
   std::wstring caFile;
+  std::string caPem, tlsServername, selectedAgent;
   // VPN mode: engine + TUN adapter, optionally restricted to one scoped /32.
   bool vpn = false;
   std::wstring vpnScope;
@@ -182,6 +187,7 @@ static Config loadConfig() {
   c.fallbackServer = readSetting(path, L"fallback_server", L"");
   c.fallbackProtectedToken = readSetting(path, L"fallback_token_protected", L"");
   c.caFile = readSetting(path, L"ca_file", L"");
+  c.selectedAgent = utf8(readSetting(path, L"selected_agent", L""));
   c.vpn = readSetting(path, L"mode", L"proxy") == L"full";
   int value;
   if (portValue(readSetting(path, L"server_port", L"443"), value)) c.serverPort = value;
@@ -204,6 +210,8 @@ static Config loadConfig() {
 static bool saveConfig(const Config& c) {
   auto path = configPath();
   bool ok = WritePrivateProfileStringW(L"client", L"mode", c.vpn ? L"full" : L"proxy", path.c_str()) &&
+    WritePrivateProfileStringW(L"client", L"selected_agent",
+      std::wstring(c.selectedAgent.begin(), c.selectedAgent.end()).c_str(), path.c_str()) &&
     WritePrivateProfileStringW(L"client", L"server", c.server.c_str(), path.c_str()) &&
     WritePrivateProfileStringW(L"client", L"server_port", std::to_wstring(c.serverPort).c_str(), path.c_str()) &&
     WritePrivateProfileStringW(L"client", L"token_protected", c.protectedToken.c_str(), path.c_str()) &&
@@ -373,8 +381,12 @@ class DatagramReader {
     const size_t headerSize = (size_t(static_cast<unsigned char>(buffer_[0])) << 8) |
       static_cast<unsigned char>(buffer_[1]);
     if (headerSize < 2 || headerSize > 1024) return -1;
-    if (buffer_.size() < 2 + headerSize + 2) return 0;
+    if (buffer_.size() < 2 + headerSize) return 0;
     const std::string header(buffer_.data() + 2, headerSize);
+    if (header.rfind("{\"code\":", 0) == 0) {
+      buffer_.erase(0, 2 + headerSize); dropped = true; return 1;
+    }
+    if (buffer_.size() < 2 + headerSize + 2) return 0;
     const size_t length = (size_t(static_cast<unsigned char>(buffer_[2 + headerSize])) << 8) |
       static_cast<unsigned char>(buffer_[3 + headerSize]);
     if (!length || length > 1500) return -1;
@@ -382,7 +394,6 @@ class DatagramReader {
     datagram.payload.assign(buffer_.begin() + 4 + headerSize,
       buffer_.begin() + 4 + headerSize + length);
     buffer_.erase(0, 4 + headerSize + length);
-    if (header.rfind("{\"code\":", 0) == 0) { dropped = true; return 1; }
     const std::string needle = "\"host\":\"";
     const size_t hostAt = header.find(needle);
     const size_t portAt = header.find("\",\"port\":");
@@ -740,6 +751,73 @@ static void addWindowsTrust(SSL_CTX* ctx) {
   CertCloseStore(roots, 0);
 }
 
+static SSL_CTX* clientContext(const Config& config) {
+  SSL_CTX* context = SSL_CTX_new(TLS_client_method());
+  if (!context) return nullptr;
+  SSL_CTX_set_min_proto_version(context, TLS1_3_VERSION);
+  SSL_CTX_set_verify(context, SSL_VERIFY_PEER, nullptr);
+  if (config.caPem.empty()) {
+    SSL_CTX_set_default_verify_paths(context);
+    addWindowsTrust(context);
+    if (!config.caFile.empty() && SSL_CTX_load_verify_file(context, utf8(config.caFile).c_str()) != 1) {
+      SSL_CTX_free(context); return nullptr;
+    }
+  } else {
+    BIO* bio = BIO_new_mem_buf(config.caPem.data(), static_cast<int>(config.caPem.size()));
+    X509* certificate = bio ? PEM_read_bio_X509(bio, nullptr, nullptr, nullptr) : nullptr;
+    const bool ok = certificate && X509_STORE_add_cert(SSL_CTX_get_cert_store(context), certificate) == 1;
+    X509_free(certificate); BIO_free(bio);
+    if (!ok) { SSL_CTX_free(context); return nullptr; }
+  }
+  return context;
+}
+
+static nlohmann::json readJsonFrame(SSL* ssl) {
+  unsigned char prefix[2];
+  if (!sslRead(ssl, prefix, 2)) throw std::runtime_error("Controller disconnected.");
+  const size_t length = (size_t(prefix[0]) << 8) | prefix[1];
+  if (length < 2 || length > 16384) throw std::runtime_error("Invalid controller response.");
+  std::string body(length, '\0');
+  if (!sslRead(ssl, body.data(), body.size())) throw std::runtime_error("Controller disconnected.");
+  auto value = nlohmann::json::parse(body);
+  if (!value.is_object()) throw std::runtime_error("Invalid controller response.");
+  return value;
+}
+
+static nlohmann::json agentRequest(const Config& controller, const nlohmann::json& request) {
+  std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)> context(clientContext(controller), SSL_CTX_free);
+  if (!context) throw std::runtime_error("Invalid controller CA certificate.");
+  const std::atomic<bool> running{true};
+  const auto deadline = ConnectClock::now() + std::chrono::milliseconds(controller.connectTimeoutMs);
+  struct Socket { SOCKET value; ~Socket() { if (value != INVALID_SOCKET) closesocket(value); } };
+  Socket socket{connectServer(controller.server, controller.serverPort, running, deadline)};
+  if (socket.value == INVALID_SOCKET) throw std::runtime_error("Controller unreachable.");
+  SocketBudget budget(socket.value, 8000);
+  std::unique_ptr<SSL, decltype(&SSL_free)> ssl(SSL_new(context.get()), SSL_free);
+  const auto hostname = utf8(controller.server);
+  if (!ssl || SSL_set_fd(ssl.get(), static_cast<int>(socket.value)) != 1 ||
+      SSL_set_tlsext_host_name(ssl.get(), hostname.c_str()) != 1 || SSL_set1_host(ssl.get(), hostname.c_str()) != 1 ||
+      SSL_connect(ssl.get()) != 1 || SSL_get_verify_result(ssl.get()) != X509_V_OK)
+    throw std::runtime_error("Controller TLS verification failed.");
+  std::string token;
+  if (!tokenForConfig(controller, token)) throw std::runtime_error("Add your server token in Settings.");
+  std::string hello = nlohmann::json{{"v", 3}, {"mode", "manage"}, {"token", token}}.dump();
+  const bool sent = writeFrame(ssl.get(), hello);
+  OPENSSL_cleanse(token.data(), token.size()); OPENSSL_cleanse(hello.data(), hello.size());
+  if (!sent || readJsonFrame(ssl.get()).value("code", "") != "OK")
+    throw std::runtime_error("Agent management unavailable. Update the controller and check its token.");
+  if (!writeFrame(ssl.get(), request.dump())) throw std::runtime_error("Controller disconnected.");
+  auto response = readJsonFrame(ssl.get());
+  if (response.value("code", "") != "OK") throw std::runtime_error("Controller rejected the request.");
+  if (request.value("action", "") == "list") {
+    const int count = response.at("count").get<int>();
+    if (count < 0 || count > 128) throw std::runtime_error("Invalid server list.");
+    response["agents"] = nlohmann::json::array();
+    for (int i = 0; i < count; ++i) response["agents"].push_back(readJsonFrame(ssl.get()));
+  }
+  return response;
+}
+
 class Service {
  public:
   bool start(const Config& config, std::wstring& error) {
@@ -758,15 +836,8 @@ class Service {
     if (config.server.empty() || config.serverPort < 1 || config.serverPort > 65535 ||
         config.localPort < 1 || config.localPort > 65535 || config.fallbackPort < 1 || config.fallbackPort > 65535 ||
         config.handshakeTimeoutMs < 1 || config.idleTimeoutMs < 1) { error = L"Invalid settings."; return false; }
-    ctx_ = SSL_CTX_new(TLS_client_method());
-    if (!ctx_) { error = L"TLS could not start."; return false; }
-    SSL_CTX_set_min_proto_version(ctx_, TLS1_3_VERSION);
-    SSL_CTX_set_verify(ctx_, SSL_VERIFY_PEER, nullptr);
-    SSL_CTX_set_default_verify_paths(ctx_);
-    addWindowsTrust(ctx_);
-    if (!config.caFile.empty() && SSL_CTX_load_verify_file(ctx_, utf8(config.caFile).c_str()) != 1) {
-      error = L"Invalid CA file."; SSL_CTX_free(ctx_); ctx_ = nullptr; return false;
-    }
+    ctx_ = clientContext(config);
+    if (!ctx_) { error = L"TLS could not start. Check the CA certificate."; return false; }
     SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (listener == INVALID_SOCKET) { error = L"Local listener could not start."; SSL_CTX_free(ctx_); ctx_ = nullptr; return false; }
     sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); addr.sin_port = htons(static_cast<u_short>(config.localPort));
@@ -862,7 +933,7 @@ class Service {
     try {
       ssl = SSL_new(ctx_);
       if (ssl) {
-        std::string server = utf8(endpoint);
+        std::string server = !fallback && !config_.tlsServername.empty() ? config_.tlsServername : utf8(endpoint);
         if (SSL_set_fd(ssl, static_cast<int>(remote)) == 1 &&
             SSL_set_tlsext_host_name(ssl, server.c_str()) == 1 &&
             SSL_set1_host(ssl, server.c_str()) == 1 &&
@@ -1134,6 +1205,7 @@ static etlvpn::Vpn vpn;
 static FullSession fullSession;
 static NOTIFYICONDATAW tray{};
 static Config config;
+static Config activeConfig;
 static std::thread stopThread;
 static bool stopping = false;
 static bool exitAfterStop = false;
@@ -1144,6 +1216,17 @@ static std::string uiError;
 static std::unique_ptr<UpdateClient> updater;
 static bool updateLaunched = false;
 static std::string notifiedUpdate;
+static std::future<nlohmann::json> agentTask;
+static std::string agentMessage;
+static std::string agentOperation;
+static ConnectClock::time_point nextAgentRefresh{};
+struct RegisteredAgent {
+  DesktopServer display;
+  int port = 0;
+  std::string servername, ca;
+  std::wstring protectedToken;
+};
+static std::vector<RegisteredAgent> registeredAgents;
 
 static std::wstring wide(const char* value) {
   int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value, -1, nullptr, 0);
@@ -1151,6 +1234,132 @@ static std::wstring wide(const char* value) {
   std::wstring result(n, L'\0');
   MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value, -1, result.data(), n);
   result.pop_back(); return result;
+}
+
+static std::string controllerIdentity(const Config& controller) {
+  const auto value = utf8(controller.server) + ":" + std::to_string(controller.serverPort) + utf8(controller.protectedToken);
+  unsigned char digest[SHA256_DIGEST_LENGTH];
+  SHA256(reinterpret_cast<const unsigned char*>(value.data()), value.size(), digest);
+  std::string identity;
+  constexpr char digits[] = "0123456789abcdef";
+  for (auto byte : digest) { identity += digits[byte >> 4]; identity += digits[byte & 15]; }
+  return identity;
+}
+
+static bool hexId(const std::string& value) {
+  return value.size() == 32 && std::all_of(value.begin(), value.end(), [](char c) {
+    return (c >= 'a' && c <= 'f') || (c >= '0' && c <= '9');
+  });
+}
+
+static RegisteredAgent parseAgent(nlohmann::json entry, bool cached = false) {
+  RegisteredAgent agent;
+  agent.display.id = entry.at("id").get<std::string>();
+  agent.display.name = entry.at("name").get<std::string>();
+  agent.display.host = entry.at("host").get<std::string>();
+  agent.display.online = !cached && entry.value("online", false);
+  agent.port = entry.at("port").get<int>();
+  agent.servername = entry.at("servername").get<std::string>();
+  agent.ca = entry.at("ca").get<std::string>();
+  in_addr ipv4{}; in6_addr ipv6{};
+  if (!hexId(agent.display.id) || agent.display.name.empty() || agent.display.name.size() > 256 ||
+      agent.port < 1 || agent.port > 65535 || agent.servername != agent.display.id + ".etl-agent" ||
+      agent.ca.empty() || agent.ca.size() > 4096 ||
+      (InetPtonA(AF_INET, agent.display.host.c_str(), &ipv4) != 1 && InetPtonA(AF_INET6, agent.display.host.c_str(), &ipv6) != 1))
+    throw std::runtime_error("Invalid server identity.");
+  if (cached) agent.protectedToken = wide(entry.at("protectedToken").get<std::string>().c_str());
+  else {
+    auto token = entry.at("proxyToken").get<std::string>();
+    const bool ok = protectToken(token, agent.protectedToken);
+    OPENSSL_cleanse(token.data(), token.size());
+    if (!ok) throw std::runtime_error("Server credential could not be saved.");
+  }
+  return agent;
+}
+
+static void saveAgentCache() {
+  nlohmann::json cache{{"controller", controllerIdentity(config)}, {"agents", nlohmann::json::array()}};
+  for (const auto& agent : registeredAgents) cache["agents"].push_back({{"id", agent.display.id},
+    {"name", agent.display.name}, {"host", agent.display.host}, {"port", agent.port}, {"servername", agent.servername},
+    {"ca", agent.ca}, {"protectedToken", utf8(agent.protectedToken)}});
+  const auto path = std::filesystem::path(configPath()).parent_path() / L"servers.json";
+  const auto temporary = path.wstring() + L"." + std::to_wstring(GetCurrentProcessId()) + L".tmp";
+  std::ofstream file(std::filesystem::path(temporary), std::ios::binary | std::ios::trunc);
+  file << cache.dump(); file.close();
+  if (!file || !MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    DeleteFileW(temporary.c_str()); throw std::runtime_error("Server cache could not be saved.");
+  }
+}
+
+static void loadAgentCache() {
+  registeredAgents.clear();
+  try {
+    const auto path = std::filesystem::path(configPath()).parent_path() / L"servers.json";
+    if (!std::filesystem::exists(path) || std::filesystem::file_size(path) > 4 * 1024 * 1024) return;
+    std::ifstream file(path); nlohmann::json cache; file >> cache;
+    if (cache.at("controller") != controllerIdentity(config) || !cache.at("agents").is_array() || cache["agents"].size() > 128) return;
+    std::vector<RegisteredAgent> agents;
+    for (const auto& entry : cache["agents"]) agents.push_back(parseAgent(entry, true));
+    registeredAgents = std::move(agents);
+  } catch (...) { registeredAgents.clear(); }
+}
+
+static bool writeAgentBundle(const std::wstring& path, bool linux, const nlohmann::json& metadata) {
+  const int resourceId = linux ? IDR_AGENT_LINUX : IDR_AGENT_WINDOWS;
+  HMODULE module = GetModuleHandleW(nullptr);
+  HRSRC resource = FindResourceW(module, MAKEINTRESOURCEW(resourceId), RT_RCDATA);
+  const DWORD size = resource ? SizeofResource(module, resource) : 0;
+  HGLOBAL loaded = resource ? LoadResource(module, resource) : nullptr;
+  const char* binary = loaded ? static_cast<const char*>(LockResource(loaded)) : nullptr;
+  if (!binary || !size) return false;
+  const auto payload = metadata.dump();
+  if (payload.size() > 16384) return false;
+  const auto directory = std::filesystem::path(path).parent_path();
+  wchar_t temporary[MAX_PATH]{};
+  if (!GetTempFileNameW(directory.c_str(), L"etl", 0, temporary)) return false;
+  std::ofstream file(std::filesystem::path(temporary), std::ios::binary | std::ios::trunc);
+  const unsigned char length[]{static_cast<unsigned char>(payload.size() >> 24),
+    static_cast<unsigned char>(payload.size() >> 16), static_cast<unsigned char>(payload.size() >> 8),
+    static_cast<unsigned char>(payload.size())};
+  file.write(binary, size); file.write(payload.data(), payload.size());
+  file.write(reinterpret_cast<const char*>(length), sizeof(length)); file.write("ETLAGENT1", 9); file.close();
+  const bool ok = file.good() && MoveFileExW(temporary, path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+  if (!ok) DeleteFileW(temporary);
+  return ok;
+}
+
+static void refreshAgents() {
+  if (agentTask.valid() || config.protectedToken.empty()) return;
+  agentOperation = "list";
+  agentTask = std::async(std::launch::async, [controller = config] {
+    auto result = agentRequest(controller, {{"action", "list"}});
+    result["controller"] = controllerIdentity(controller);
+    return result;
+  });
+  nextAgentRefresh = ConnectClock::now() + std::chrono::seconds(15);
+}
+
+static void pollAgents() {
+  if (agentTask.valid() && agentTask.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+    try {
+      auto result = agentTask.get();
+      if (agentOperation == "list") {
+        if (result.at("controller") != controllerIdentity(config)) { nextAgentRefresh = ConnectClock::now(); return; }
+        std::vector<RegisteredAgent> agents;
+        for (const auto& entry : result.at("agents")) agents.push_back(parseAgent(entry));
+        registeredAgents = std::move(agents); saveAgentCache();
+        if (agentMessage.rfind("Saved.", 0) != 0) agentMessage.clear();
+      } else {
+        agentMessage = result.value("message", "");
+        nextAgentRefresh = ConnectClock::now();
+      }
+    } catch (const std::exception& error) {
+      agentMessage = error.what();
+      for (auto& agent : registeredAgents) agent.display.online = false;
+      nextAgentRefresh = ConnectClock::now() + std::chrono::seconds(30);
+    }
+  }
+  if (!agentTask.valid() && ConnectClock::now() >= nextAgentRefresh) refreshAgents();
 }
 
 static void loadForm() {
@@ -1161,6 +1370,7 @@ static void loadForm() {
   copy(form.server, config.server); copy(form.backup, config.fallbackServer); copy(form.ca, config.caFile);
   form.remotePort = config.serverPort; form.backupPort = config.fallbackPort;
   form.fullMode = config.vpn;
+  form.selectedAgent = config.selectedAgent;
   form.localPort = config.localPort; form.timeout = config.connectTimeoutMs;
   form.savedToken = !config.protectedToken.empty();
   form.savedBackupToken = !config.fallbackProtectedToken.empty();
@@ -1192,6 +1402,7 @@ static bool readForm(Config& next) {
   next.serverPort = form.remotePort; next.fallbackPort = form.backupPort;
   next.localPort = form.localPort; next.connectTimeoutMs = form.timeout; next.caFile = wide(form.ca.data());
   next.vpn = form.fullMode;
+  next.selectedAgent = form.selectedAgent;
   if (next.server.empty() || next.serverPort < 1 || next.serverPort > 65535 ||
       next.localPort < 1 || next.localPort > 65535 || next.fallbackPort < 1 || next.fallbackPort > 65535 ||
       next.connectTimeoutMs < 1 || next.connectTimeoutMs > 60000) {
@@ -1212,11 +1423,79 @@ static bool readForm(Config& next) {
 }
 
 static void acceptForm(const Config& next) {
+  const bool controllerChanged = controllerIdentity(config) != controllerIdentity(next) || config.caFile != next.caFile;
   config = next;
+  if (controllerChanged) { loadAgentCache(); nextAgentRefresh = ConnectClock::now(); }
   SecureZeroMemory(form.token.data(), form.token.size());
   SecureZeroMemory(form.backupToken.data(), form.backupToken.size());
   form.savedToken = !config.protectedToken.empty(); form.savedBackupToken = !config.fallbackProtectedToken.empty();
   uiError = saveConfig(config) ? "" : "Settings could not be saved.";
+}
+
+static void exportAgent(HWND window) {
+  if (agentTask.valid()) return;
+  Config controller;
+  if (!readForm(controller)) { desktop.showOptions(); return; }
+  const std::string name = form.agentName.data();
+  if (name.empty() || name.find_first_not_of(" \t") == std::string::npos || form.agentPort < 1 || form.agentPort > 65535) {
+    agentMessage = "Enter a name and valid port."; return;
+  }
+  wchar_t path[MAX_PATH]{};
+  const bool linux = form.agentPlatform == 1;
+  wcscpy_s(path, linux ? L"etl-agent-linux-x64" : L"etl-agent-windows-x64.exe");
+  OPENFILENAMEW dialog{}; dialog.lStructSize = sizeof(dialog); dialog.hwndOwner = window;
+  dialog.lpstrFile = path; dialog.nMaxFile = MAX_PATH;
+  dialog.lpstrTitle = L"Save ETL agent";
+  dialog.lpstrFilter = linux ? L"Linux executable\0*\0\0" : L"Windows executable\0*.exe\0\0";
+  dialog.lpstrDefExt = linux ? nullptr : L"exe";
+  dialog.Flags = OFN_EXPLORER | OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR;
+  if (!GetSaveFileNameW(&dialog)) return;
+  acceptForm(controller);
+  agentMessage.clear(); agentOperation = "export";
+  const int port = form.agentPort;
+  agentTask = std::async(std::launch::async, [controller, name, port, linux, path = std::wstring(path)] {
+    std::string ca;
+    if (!controller.caFile.empty()) {
+      if (std::filesystem::file_size(controller.caFile) > 8192) throw std::runtime_error("Controller CA is too large.");
+      std::ifstream file(std::filesystem::path(controller.caFile), std::ios::binary);
+      ca.assign(std::istreambuf_iterator<char>(file), {});
+      if (ca.empty()) throw std::runtime_error("Controller CA could not be read.");
+    }
+    const auto grant = agentRequest(controller, {{"action", "create"}, {"name", name}, {"port", port}});
+    const nlohmann::json metadata{{"version", 1}, {"id", grant.at("id")}, {"name", name},
+      {"pairingCode", grant.at("pairingCode")}, {"port", port},
+      {"controller", {{"host", utf8(controller.server)}, {"port", controller.serverPort},
+        {"servername", utf8(controller.server)}, {"ca", ca}}}};
+    if (!writeAgentBundle(path, linux, metadata)) {
+      try { agentRequest(controller, {{"action", "remove"}, {"id", grant.at("id")}}); } catch (...) {}
+      throw std::runtime_error("Agent file could not be saved.");
+    }
+    return nlohmann::json{{"message", linux ? "Saved. On Linux: chmod +x etl-agent-linux-x64 && ./etl-agent-linux-x64" :
+      "Saved. Run the file on your Windows server."}};
+  });
+}
+
+static void removeAgent() {
+  if (agentTask.valid() || !hexId(form.selectedAgent)) return;
+  agentOperation = "remove"; agentMessage.clear();
+  agentTask = std::async(std::launch::async, [controller = config, id = form.selectedAgent] {
+    return agentRequest(controller, {{"action", "remove"}, {"id", id}});
+  });
+  form.selectedAgent.clear(); config.selectedAgent.clear(); saveConfig(config);
+}
+
+static bool selectedConnection(const Config& profile, Config& connection) {
+  connection = profile;
+  if (profile.selectedAgent.empty()) return true;
+  const auto found = std::find_if(registeredAgents.begin(), registeredAgents.end(), [&](const auto& agent) {
+    return agent.display.id == profile.selectedAgent;
+  });
+  if (found == registeredAgents.end()) { uiError = "Selected server unavailable. Choose a server."; return false; }
+  connection.server = wide(found->display.host.c_str()); connection.serverPort = found->port;
+  connection.tlsServername = found->servername; connection.caPem = found->ca; connection.caFile.clear();
+  connection.protectedToken = found->protectedToken; connection.tokenFile.clear();
+  connection.fallbackServer.clear(); connection.fallbackProtectedToken.clear(); connection.fallbackTokenFile.clear();
+  return true;
 }
 
 static void connectOrStop(HWND window, bool proxyOnly = false) {
@@ -1225,13 +1504,17 @@ static void connectOrStop(HWND window, bool proxyOnly = false) {
   Config next;
   if (!readForm(next)) { desktop.showOptions(); return; }
   if (proxyOnly) next.vpn = false;
+  Config connection;
+  if (!selectedConnection(next, connection)) { desktop.showServers(); return; }
   std::wstring error;
-  if (next.vpn) {
-    const nlohmann::json payload = {{"server", utf8(next.server)}, {"serverPort", next.serverPort},
-      {"localPort", next.localPort}, {"timeout", next.connectTimeoutMs},
-      {"protectedToken", utf8(next.protectedToken)}, {"ca", utf8(next.caFile)}};
+  if (connection.vpn) {
+    const nlohmann::json payload = {{"server", utf8(connection.server)}, {"serverPort", connection.serverPort},
+      {"localPort", connection.localPort}, {"timeout", connection.connectTimeoutMs},
+      {"protectedToken", utf8(connection.protectedToken)}, {"ca", utf8(connection.caFile)},
+      {"caPem", connection.caPem}, {"servername", connection.tlsServername}};
     if (!fullSession.start(payload.dump(), error, window)) { uiError = utf8(error); return; }
-  } else if (!service.start(next, error)) { uiError = utf8(error); return; }
+  } else if (!service.start(connection, error)) { uiError = utf8(error); return; }
+  activeConfig = connection;
   acceptForm(next);
   form.fullMode = next.vpn;
   updateStatus(window);
@@ -1266,6 +1549,7 @@ static int runDesktopFull(const std::wstring& id, DWORD parent) {
     next.connectTimeoutMs = payload.at("timeout").get<int>();
     next.protectedToken = wide(payload.at("protectedToken").get<std::string>().c_str());
     next.caFile = wide(payload.at("ca").get<std::string>().c_str());
+    next.caPem = payload.value("caPem", ""); next.tlsServername = payload.value("servername", "");
     const auto plan = etlvpn::planRoutes(next.server);
     if (!plan.ok) return finish("Server address or default route unavailable.");
     if (session.wait(0)) return finish("");
@@ -1307,7 +1591,7 @@ static void openBrowser(HWND window) {
     if (!service.running()) return;
   }
   std::wstring error;
-  const int port = connectionExists() ? config.localPort : form.localPort;
+  const int port = connectionExists() ? activeConfig.localPort : form.localPort;
   if (!openProxyBrowser(port, error)) uiError = utf8(error);
   else uiError.clear();
 }
@@ -1409,6 +1693,30 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   }
   WSADATA data;
   if (WSAStartup(MAKEWORD(2, 2), &data)) { LocalFree(argv); return 1; }
+  if (argc == 5 && std::wstring(argv[1]) == L"--self-test-agent-export") {
+    bool ok = false;
+    try {
+      std::ifstream file{std::filesystem::path(argv[3])}; nlohmann::json metadata; file >> metadata;
+      ok = writeAgentBundle(argv[4], std::wstring(argv[2]) == L"linux", metadata);
+    } catch (...) {}
+    LocalFree(argv); WSACleanup(); return ok ? 0 : 27;
+  }
+  if (argc == 5 && std::wstring(argv[1]) == L"--self-test-agent-control") {
+    int result = 0;
+    try {
+      std::ifstream file{std::filesystem::path(argv[2])}; nlohmann::json settings; file >> settings;
+      Config controller;
+      controller.server = wide(settings.at("host").get<std::string>().c_str());
+      controller.serverPort = settings.at("port").get<int>();
+      controller.caFile = wide(settings.at("caFile").get<std::string>().c_str());
+      controller.tokenFile = wide(settings.at("tokenFile").get<std::string>().c_str());
+      std::ifstream requestFile{std::filesystem::path(argv[3])}; nlohmann::json request; requestFile >> request;
+      const auto response = agentRequest(controller, request);
+      std::ofstream output{std::filesystem::path(argv[4]), std::ios::binary}; output << response.dump();
+      if (!output) result = 28;
+    } catch (...) { result = 28; }
+    LocalFree(argv); WSACleanup(); return result;
+  }
   if (argc == 4 && std::wstring(argv[1]) == L"--desktop-full") {
     const int result = runDesktopFull(argv[2], std::wcstoul(argv[3], nullptr, 10));
     LocalFree(argv); WSACleanup(); return result;
@@ -1432,6 +1740,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   }
   const bool previewOptions = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-options";
   const bool previewReduced = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-reduced";
+  const bool previewServers = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-servers";
+  const bool previewAgentExport = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-agent-export";
   const bool previewFull = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-full";
   const bool previewFullActive = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-full-active";
   const bool previewConnecting = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-connecting";
@@ -1441,7 +1751,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   const bool previewUpdate = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-update";
   const bool previewDownloading = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-downloading";
   const bool previewUpdateError = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-update-error";
-  const std::wstring previewPath = argc == 3 && (std::wstring(argv[1]) == L"--self-test-ui" || previewOptions || previewActive || previewFull || previewFullActive || previewConnecting || previewStopping ||
+  const std::wstring previewPath = argc == 3 && (std::wstring(argv[1]) == L"--self-test-ui" || previewOptions || previewActive || previewFull || previewFullActive || previewConnecting || previewStopping || previewServers || previewAgentExport ||
     previewError || previewUpdate || previewDownloading || previewUpdateError || previewReduced) ? argv[2] : L"";
   if (argc == 2 && std::wstring(argv[1]) == L"--self-test-token-storage") {
     std::string original(64, 'a'), restored;
@@ -1458,6 +1768,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     for (int i = 2; i + 1 < argc; i += 2) {
       std::wstring name = argv[i], value = argv[i + 1];
       if (name == L"--server") c.server = value;
+      else if (name == L"--servername") c.tlsServername = utf8(value);
       else if (name == L"--fallback-server") c.fallbackServer = value;
       else if (name == L"--fallback-token-file") c.fallbackTokenFile = value;
       else if (name == L"--token-file") c.tokenFile = value;
@@ -1551,6 +1862,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   }
   LocalFree(argv);
   config = previewPath.empty() ? loadConfig() : Config{};
+  if (previewPath.empty()) loadAgentCache();
   loadForm();
   WNDCLASSW wc{}; wc.lpfnWndProc = windowProc; wc.hInstance = instance;
   wc.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_ETL));
@@ -1577,6 +1889,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     renderPreview(DesktopState{});
     const int collapsed = height();
     bool motion = true;
+    if (previewServers || previewAgentExport) {
+      DesktopState state{};
+      state.servers = {{"a", "Frankfurt", "1.1.1.1", true}, {"b", "New York", "8.8.8.8", false}};
+      if (previewAgentExport) { desktop.showAgentExport(); strcpy_s(form.agentName.data(), form.agentName.size(), "Frankfurt"); }
+      else desktop.showServers();
+      renderPreview(state);
+    }
     if (previewFull || previewFullActive || previewConnecting || previewStopping) {
       form.fullMode = true;
       DesktopState state{};
@@ -1644,6 +1963,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
       TranslateMessage(&message); DispatchMessageW(&message);
     }
     if (quit) break;
+    pollAgents();
     if (updater && !updateLaunched && updater->snapshot().phase == UpdatePhase::Ready && updater->launch()) {
       updateLaunched = true;
       beginStop(window, true);
@@ -1654,6 +1974,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     state.running = service.running(); state.stopping = stopping;
     state.sessions = service.sessions(); state.sent = service.sent();
     state.received = service.received(); state.failures = service.failures(); state.error = uiError;
+    for (const auto& agent : registeredAgents) state.servers.push_back(agent.display);
+    state.agentsBusy = agentTask.valid(); state.agentMessage = agentMessage;
+    if (connectionExists()) state.activeServer = utf8(activeConfig.server);
     if (fullSession.exists()) {
       const auto full = fullSession.snapshot();
       state.running = full.phase == SessionPhase::Running;
@@ -1675,6 +1998,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         break;
       }
       case DesktopAction::OpenBrowser: openBrowser(window); break;
+      case DesktopAction::RefreshServers: agentMessage.clear(); refreshAgents(); break;
+      case DesktopAction::ExportAgent: exportAgent(window); break;
+      case DesktopAction::RemoveServer: removeAgent(); break;
+      case DesktopAction::SelectServer:
+        config.selectedAgent = form.selectedAgent; saveConfig(config); break;
       case DesktopAction::CheckUpdates: if (updater) updater->check(true); break;
       case DesktopAction::InstallUpdate: if (updater) updater->download(); break;
       case DesktopAction::DismissUpdate: if (updater) updater->dismiss(); break;
@@ -1688,6 +2016,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   fullSession.reset();
   service.stop();
   updater.reset();
+  if (agentTask.valid()) agentTask.wait();
   WSACleanup();
   return 0;
 }

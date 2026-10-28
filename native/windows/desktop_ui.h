@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdint>
 #include <string>
+#include <vector>
 #include "updater.h"
 
 struct DesktopForm {
@@ -13,6 +14,14 @@ struct DesktopForm {
   int remotePort = 443, backupPort = 443, localPort = 1080, timeout = 5000;
   bool savedToken = false, savedBackupToken = false;
   bool fullMode = false;
+  std::string selectedAgent;
+  std::array<char, 65> agentName{};
+  int agentPort = 8443, agentPlatform = 0;
+};
+
+struct DesktopServer {
+  std::string id, name, host;
+  bool online = false;
 };
 
 struct DesktopState {
@@ -22,9 +31,13 @@ struct DesktopState {
   uint64_t sent = 0, received = 0, failures = 0;
   std::string error;
   UpdateState update;
+  std::vector<DesktopServer> servers;
+  bool agentsBusy = false;
+  std::string agentMessage, activeServer;
 };
 
-enum class DesktopAction { None, ToggleConnection, OpenBrowser, SaveSettings, CheckUpdates, InstallUpdate, DismissUpdate };
+enum class DesktopAction { None, ToggleConnection, OpenBrowser, SaveSettings, CheckUpdates, InstallUpdate,
+  DismissUpdate, RefreshServers, ExportAgent, RemoveServer, SelectServer };
 enum class DesktopMotion { System, Enabled, Reduced };
 
 class DesktopUi {
@@ -35,7 +48,9 @@ class DesktopUi {
   void shutdown();
   bool capture(const std::wstring& path);
   bool message(HWND window, UINT message, WPARAM wparam, LPARAM lparam);
-  void showOptions(bool show = true) { if (options_ != show) { options_ = show; pageAlpha_ = 0; } }
+  void showOptions(bool show = true) { if (options_ != show || servers_) { options_ = show; servers_ = false; pageAlpha_ = 0; } }
+  void showServers() { options_ = false; servers_ = true; pageAlpha_ = 0; }
+  void showAgentExport() { showServers(); exporting_ = true; }
  private:
   bool createTarget();
   void releaseDevice();
@@ -50,6 +65,7 @@ class DesktopUi {
   bool motion_ = true;
   DesktopMotion motionPreference_ = DesktopMotion::System;
   bool options_ = false;
+  bool servers_ = false, exporting_ = false;
   float height_ = 0, heightFrom_ = 0, heightTarget_ = 0, heightElapsed_ = 0;
   float contentHeight_ = 460;
 };

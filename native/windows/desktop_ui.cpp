@@ -285,10 +285,10 @@ DesktopAction DesktopUi::render(DesktopForm& form, const DesktopState& state, fl
   draw->AddRect({2, 2}, {windowSize.x - 2, windowSize.y - 2}, IM_COL32(31, 31, 31, 255), 21);
   const float width = ImGui::GetContentRegionAvail().x;
   const auto header = ImGui::GetCursorPos();
-  if (options_) {
+  if (options_ || servers_) {
     if (button("##back", {28, 28}, Icon::Back)) showOptions(false);
     ImGui::SameLine(0, 8);
-    ImGui::PushFont(brand); ImGui::TextUnformatted("Settings"); ImGui::PopFont();
+    ImGui::PushFont(brand); ImGui::TextUnformatted(servers_ ? "Servers" : "Settings"); ImGui::PopFont();
   } else {
     const auto origin = ImGui::GetCursorScreenPos();
     drawBrand(draw, {origin.x, origin.y + 2}, 24, ImGui::GetColorU32(accent));
@@ -306,7 +306,7 @@ DesktopAction DesktopUi::render(DesktopForm& form, const DesktopState& state, fl
   const auto& update = state.update;
   const bool downloading = update.phase == UpdatePhase::Downloading || update.phase == UpdatePhase::Ready;
 
-  if (!options_) {
+  if (!options_ && !servers_) {
     const char* status = state.stopping ? "Disconnecting" : state.starting ? "Connecting" :
       state.running ? (state.fullMode ? "Connected" : "Proxy active") : "Disconnected";
     ImGui::PushFont(heading); ImGui::TextUnformatted(status); ImGui::PopFont();
@@ -316,7 +316,10 @@ DesktopAction DesktopUi::render(DesktopForm& form, const DesktopState& state, fl
         ImGui::GetColorU32(ImVec4{.65f, .78f, .65f, 1}), 16);
       ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 14);
     }
-    ImGui::TextColored(muted, "%s", form.server[0] ? form.server.data() : "Server not set");
+    std::string serverLabel = form.server[0] ? form.server.data() : "Server not set";
+    for (const auto& server : state.servers) if (server.id == form.selectedAgent) serverLabel = server.name;
+    if (busy && !state.activeServer.empty()) serverLabel = state.activeServer;
+    ImGui::TextColored(muted, "%s", serverLabel.c_str());
     ImGui::Dummy({0, 12});
 
     const auto selector = ImGui::GetCursorScreenPos();
@@ -356,9 +359,9 @@ DesktopAction DesktopUi::render(DesktopForm& form, const DesktopState& state, fl
     ImGui::Dummy({0, 12});
 
     const auto panel = ImGui::GetCursorScreenPos();
-    draw->AddRectFilled(panel, {panel.x + width, panel.y + 112}, ImGui::GetColorU32(surface), 20);
-    draw->AddRect(panel, {panel.x + width, panel.y + 112}, ImGui::GetColorU32(border), 20);
-    draw->AddRect({panel.x + 2, panel.y + 2}, {panel.x + width - 2, panel.y + 110},
+    draw->AddRectFilled(panel, {panel.x + width, panel.y + 165}, ImGui::GetColorU32(surface), 20);
+    draw->AddRect(panel, {panel.x + width, panel.y + 165}, ImGui::GetColorU32(border), 20);
+    draw->AddRect({panel.x + 2, panel.y + 2}, {panel.x + width - 2, panel.y + 163},
       ImGui::GetColorU32(ImVec4{.115f, .115f, .115f, 1}), 19);
     ImGui::SetCursorScreenPos({panel.x + 8, panel.y + 6});
     ImGui::BeginDisabled(state.stopping || state.starting);
@@ -366,8 +369,11 @@ DesktopAction DesktopUi::render(DesktopForm& form, const DesktopState& state, fl
     ImGui::EndDisabled();
     draw->AddLine({panel.x + 20, panel.y + 56}, {panel.x + width - 20, panel.y + 56}, ImGui::GetColorU32(border));
     ImGui::SetCursorScreenPos({panel.x + 8, panel.y + 59});
+    if (button("Servers", {width - 16, 47}, Icon::Proxy, false, true)) { showServers(); action = DesktopAction::RefreshServers; }
+    draw->AddLine({panel.x + 20, panel.y + 109}, {panel.x + width - 20, panel.y + 109}, ImGui::GetColorU32(border));
+    ImGui::SetCursorScreenPos({panel.x + 8, panel.y + 112});
     if (button("Settings", {width - 16, 47}, Icon::Settings, false, true)) showOptions();
-    ImGui::SetCursorScreenPos({panel.x, panel.y + 128});
+    ImGui::SetCursorScreenPos({panel.x, panel.y + 181});
     ImGui::TextColored(muted, "127.0.0.1:%d", form.localPort);
     if (state.running) {
       ImGui::TextColored(muted, "%d %s", state.sessions, state.sessions == 1 ? "connection" : "connections");
@@ -383,8 +389,73 @@ DesktopAction DesktopUi::render(DesktopForm& form, const DesktopState& state, fl
       icon(draw, Icon::Download, {position.x, position.y - 1}, 16, ImGui::GetColorU32(muted));
       ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 20); ImGui::TextColored(muted, "%s", received.c_str());
     }
+  } else if (servers_) {
+    if (exporting_) {
+      input("Name", "", form.agentName.data(), form.agentName.size());
+      ImGui::TextColored(muted, "Platform");
+      ImGui::SetNextItemWidth(-1);
+      ImGui::Combo("##platform", &form.agentPlatform, "Windows x64\0Linux x64\0");
+      ImGui::TextColored(muted, "Port"); ImGui::SetNextItemWidth(-1);
+      ImGui::InputInt("##agentPort", &form.agentPort, 0);
+      ImGui::PushStyleColor(ImGuiCol_Text, muted);
+      ImGui::TextWrapped("Allow inbound TCP %d on the server. Run within 24 hours to pair.", form.agentPort);
+      if (form.agentPort > 0 && form.agentPort < 1024 && form.agentPlatform == 1)
+        ImGui::TextWrapped("Ports below 1024 may require sudo.");
+      ImGui::PopStyleColor();
+      ImGui::Dummy({0, 8});
+      ImGui::BeginDisabled(state.agentsBusy);
+      if (button("Generate file", {width, 42}, Icon::Download, true)) action = DesktopAction::ExportAgent;
+      if (button("Back to servers", {width, 36}, Icon::Back)) { exporting_ = false; pageAlpha_ = 0; }
+      ImGui::EndDisabled();
+    } else {
+      ImGui::BeginDisabled(busy);
+      const float listHeight = std::min(260.f, 56.f * (1 + static_cast<float>(state.servers.size())));
+      if (ImGui::BeginChild("server-list", {width, listHeight}, ImGuiChildFlags_None)) {
+        auto serverRow = [&](const std::string& id, const char* name, const char* address, bool online) {
+          ImGui::PushID(id.empty() ? "primary" : id.c_str());
+          const auto origin = ImGui::GetCursorScreenPos();
+          const bool selected = form.selectedAgent == id;
+          if (ImGui::Selectable("##server", selected, ImGuiSelectableFlags_None, {0, 46})) {
+            form.selectedAgent = id; action = DesktopAction::SelectServer;
+          }
+          auto* listDraw = ImGui::GetWindowDrawList();
+          listDraw->PushClipRect({origin.x + 10, origin.y}, {origin.x + width - 26, origin.y + 46}, true);
+          listDraw->AddText({origin.x + 10, origin.y + 5}, ImGui::GetColorU32(accent), name);
+          listDraw->AddText({origin.x + 10, origin.y + 25}, ImGui::GetColorU32(muted), address);
+          listDraw->PopClipRect();
+          if (!id.empty()) listDraw->AddCircleFilled({origin.x + width - 18, origin.y + 22}, 3,
+            ImGui::GetColorU32(online ? ImVec4{.65f, .78f, .65f, 1} : muted), 12);
+          if (ImGui::IsItemHovered() && !id.empty()) ImGui::SetTooltip("%s", online ? "Online" : "Offline");
+          ImGui::PopID();
+        };
+        serverRow("", "Primary", form.server.data(), true);
+        for (const auto& server : state.servers)
+          serverRow(server.id, server.name.c_str(), server.host.c_str(), server.online);
+      }
+      ImGui::EndChild();
+      ImGui::EndDisabled();
+      ImGui::Dummy({0, 8});
+      ImGui::BeginDisabled(state.agentsBusy);
+      if (button("Add server", {width, 42}, Icon::Proxy, true)) { exporting_ = true; pageAlpha_ = 0; }
+      if (button("Refresh", {width, 36}, Icon::Download)) action = DesktopAction::RefreshServers;
+      ImGui::BeginDisabled(busy || form.selectedAgent.empty());
+      if (button("Remove server", {width, 36}, Icon::Close)) ImGui::OpenPopup("Remove server?");
+      ImGui::EndDisabled();
+      ImGui::EndDisabled();
+      if (ImGui::BeginPopupModal("Remove server?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextUnformatted("The agent will be disconnected.");
+        if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+        ImGui::SameLine();
+        if (ImGui::Button("Remove")) { action = DesktopAction::RemoveServer; ImGui::CloseCurrentPopup(); }
+        ImGui::EndPopup();
+      }
+    }
+    if (state.agentsBusy) ImGui::TextColored(muted, "Connecting…");
+    else if (!state.agentMessage.empty()) {
+      ImGui::PushStyleColor(ImGuiCol_Text, muted); ImGui::TextWrapped("%s", state.agentMessage.c_str()); ImGui::PopStyleColor();
+    }
   } else {
-    ImGui::BeginDisabled(busy);
+    ImGui::BeginDisabled(busy || state.agentsBusy);
     auto serverInputs = [&](const char* hostLabel, auto& host, int& port, const char* hint) {
       if (ImGui::BeginTable(hostLabel, 2, ImGuiTableFlags_SizingStretchProp)) {
         ImGui::TableSetupColumn("Host", ImGuiTableColumnFlags_WidthStretch, 2.8f);
@@ -440,7 +511,7 @@ DesktopAction DesktopUi::render(DesktopForm& form, const DesktopState& state, fl
     ImGui::TextWrapped("%s", state.error.c_str());
     ImGui::PopStyleColor();
   }
-  if (!options_ && update.offered) {
+  if (!options_ && !servers_ && update.offered) {
     ImGui::Dummy({0, 8}); ImGui::Separator(); ImGui::Dummy({0, 4});
     ImGui::TextUnformatted(downloading ? "Updating" : "Update available");
     ImGui::TextColored(muted, "%s → %s", etlVersion, update.version.c_str());

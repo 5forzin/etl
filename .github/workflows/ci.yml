@@ -15,6 +15,19 @@ jobs:
           node-version: '24'
       - run: npm run check
       - run: npm test
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.3'
+          cache-dependency-path: agent/go.mod
+      - run: go -C agent vet ./...
+      - run: go -C agent test -race ./...
+      - name: Test the standalone agent
+        shell: pwsh
+        run: |
+          $env:CGO_ENABLED = '0'
+          $env:ETL_AGENT = Join-Path $env:RUNNER_TEMP 'etl-agent.exe'
+          go -C agent build -trimpath -o $env:ETL_AGENT .
+          node --test test/agent-bundle.test.js
       - name: Check PowerShell scripts
         if: runner.os == 'Windows'
         shell: pwsh
@@ -38,6 +51,10 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: '24'
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.3'
+          cache-dependency-path: agent/go.mod
       - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
         with:
           msystem: UCRT64
@@ -57,7 +74,8 @@ jobs:
           pwsh -NoProfile -File native/windows/package.ps1 -Portable -RuntimeBin "$(cygpath -w /ucrt64/bin)"
           export ETL_NATIVE_CLIENT="$(cygpath -w "$PWD/dist/windows-portable/etl-client.exe")"
           export ETL_OPENSSL="$(cygpath -w /ucrt64/bin/openssl.exe)"
-          node --test test/native-client.test.js test/fallback.test.js
+          export ETL_AGENT="$(cygpath -w "$PWD/build/windows-portable/etl-agent-windows-amd64.exe")"
+          node --test test/native-client.test.js test/fallback.test.js test/agent-bundle.test.js
           node -e 'require("node:child_process").execFileSync(process.env.ETL_NATIVE_CLIENT, ["--self-test-ui", "dist/windows-portable/desktop-preview.bmp"], {windowsHide: true})'
       - uses: actions/upload-artifact@v7
         with:

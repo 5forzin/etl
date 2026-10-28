@@ -32,8 +32,23 @@ foreach(component ${ETL_HEV_COMPONENTS})
   endif()
 endforeach()
 
+find_program(ETL_GO_EXECUTABLE go REQUIRED)
+get_filename_component(ETL_AGENT_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/../../agent" ABSOLUTE)
+set(ETL_AGENT_WINDOWS "${CMAKE_CURRENT_BINARY_DIR}/etl-agent-windows-amd64.exe")
+set(ETL_AGENT_LINUX "${CMAKE_CURRENT_BINARY_DIR}/etl-agent-linux-amd64")
+file(GLOB ETL_AGENT_FILES CONFIGURE_DEPENDS "${ETL_AGENT_SOURCE}/*.go" "${ETL_AGENT_SOURCE}/*.txt" "${ETL_AGENT_SOURCE}/go.mod")
+add_custom_command(OUTPUT "${ETL_AGENT_WINDOWS}" "${ETL_AGENT_LINUX}"
+  COMMAND ${CMAKE_COMMAND} -E env CGO_ENABLED=0 GOOS=windows GOARCH=amd64
+    "${ETL_GO_EXECUTABLE}" -C "${ETL_AGENT_SOURCE}" build -trimpath -buildvcs=false
+    -ldflags "-s -w -X main.version=${ETL_VERSION}" -o "${ETL_AGENT_WINDOWS}" .
+  COMMAND ${CMAKE_COMMAND} -E env CGO_ENABLED=0 GOOS=linux GOARCH=amd64
+    "${ETL_GO_EXECUTABLE}" -C "${ETL_AGENT_SOURCE}" build -trimpath -buildvcs=false
+    -ldflags "-s -w -X main.version=${ETL_VERSION}" -o "${ETL_AGENT_LINUX}" .
+  DEPENDS ${ETL_AGENT_FILES} VERBATIM)
+add_custom_target(etl-agent-templates DEPENDS "${ETL_AGENT_WINDOWS}" "${ETL_AGENT_LINUX}")
 configure_file(etl-client.rc.in "${CMAKE_CURRENT_BINARY_DIR}/etl-client.rc" @ONLY)
-set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/etl-client.rc" PROPERTIES OBJECT_DEPENDS "${ETL_ICON_PATH}")
+set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/etl-client.rc" PROPERTIES
+  OBJECT_DEPENDS "${ETL_ICON_PATH};${ETL_AGENT_WINDOWS};${ETL_AGENT_LINUX}")
 configure_file(etl_version.h.in "${CMAKE_CURRENT_BINARY_DIR}/etl_version.h" @ONLY)
 
 option(ETL_PORTABLE "Build a single EXE without MSYS2 runtime DLLs" OFF)
@@ -74,10 +89,11 @@ target_compile_features(etl-ui PUBLIC cxx_std_17)
 target_compile_definitions(etl-ui PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(etl-ui PUBLIC d3d11 dxgi d3dcompiler dwmapi)
 add_executable(etl-client WIN32 etl_client.cpp vpn.cpp browser.cpp desktop_session.cpp "${CMAKE_CURRENT_BINARY_DIR}/etl-client.rc")
+add_dependencies(etl-client etl-agent-templates)
 target_include_directories(etl-client PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_features(etl-client PRIVATE cxx_std_17)
 target_compile_definitions(etl-client PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0602)
-target_link_libraries(etl-client PRIVATE etl-ui etl-updater OpenSSL::SSL OpenSSL::Crypto ws2_32 crypt32 shell32 ole32 iphlpapi)
+target_link_libraries(etl-client PRIVATE etl-ui etl-updater OpenSSL::SSL OpenSSL::Crypto ws2_32 crypt32 shell32 ole32 iphlpapi comdlg32)
 if(MSVC)
   target_compile_options(etl-client PRIVATE /utf-8 /W4)
   target_compile_options(etl-ui PRIVATE /utf-8)
