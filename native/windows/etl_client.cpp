@@ -27,6 +27,8 @@
 #include "resources.h"
 #include "vpn.h"
 #include "browser.h"
+#include "desktop_session.h"
+#include <nlohmann/json.hpp>
 #include <windowsx.h>
 #include <dwmapi.h>
 
@@ -1204,6 +1206,64 @@ static void connectOrStop(HWND window) {
   updateStatus(window);
 }
 
+static int runDesktopFull(const std::wstring& id, DWORD parent) {
+  FullSessionWorker session;
+  if (!session.open(id, parent)) return 4;
+  if (session.wait(0)) { session.publish(SessionPhase::Stopped); return 0; }
+  std::wstring error;
+  HANDLE ownership = CreateMutexW(nullptr, FALSE, L"Global\\ETL.Desktop.FullMode");
+  const DWORD ownershipWait = ownership ? WaitForSingleObject(ownership, 0) : WAIT_FAILED;
+  const bool acquired = ownershipWait == WAIT_OBJECT_0 || ownershipWait == WAIT_ABANDONED;
+  auto finish = [&](const std::string& failure) {
+    session.publish(SessionPhase::Stopping);
+    vpn.stop();
+    service.stop();
+    session.publish(failure.empty() ? SessionPhase::Stopped : SessionPhase::Failed, failure);
+    if (acquired) ReleaseMutex(ownership);
+    if (ownership) CloseHandle(ownership);
+    return failure.empty() ? 0 : 4;
+  };
+  if (!acquired) return finish("Full mode is already active in another ETL window.");
+  if (!etlvpn::isElevated()) return finish("Full mode requires Windows administrator permission.");
+  try {
+    const auto payload = nlohmann::json::parse(session.configuration());
+    Config next;
+    next.vpn = true;
+    next.server = wide(payload.at("server").get<std::string>().c_str());
+    next.serverPort = payload.at("serverPort").get<int>();
+    next.localPort = payload.at("localPort").get<int>();
+    next.connectTimeoutMs = payload.at("timeout").get<int>();
+    next.protectedToken = wide(payload.at("protectedToken").get<std::string>().c_str());
+    next.caFile = wide(payload.at("ca").get<std::string>().c_str());
+    const auto plan = etlvpn::planRoutes(next.server);
+    if (!plan.ok) return finish("Server address or default route unavailable.");
+    if (session.wait(0)) return finish("");
+    next.vpnServerIp = plan.server;
+    if (!service.start(next, error)) return finish(utf8(error));
+    if (!service.checkTunnel()) return finish("Tunnel unavailable. Your normal connection is unchanged.");
+    if (session.wait(0)) return finish("");
+    if (!vpn.start(next.localPort, plan, L"", error)) return finish(utf8(error));
+    if (session.wait(0)) return finish("");
+    session.publish(SessionPhase::Running);
+    unsigned failedChecks = 0;
+    auto nextCheck = std::chrono::steady_clock::now();
+    while (!session.wait(200)) {
+      session.traffic(service.sessions(), service.sent(), service.received(), service.failures());
+      const bool engineFailed = vpn.waitEngine(0);
+      if (engineFailed || std::chrono::steady_clock::now() >= nextCheck) {
+        const bool healthy = !engineFailed && vpn.healthy();
+        failedChecks = healthy ? 0 : failedChecks + 1;
+        if (engineFailed || failedChecks >= 2)
+          return finish("Tunnel lost. Your normal connection has been restored.");
+        nextCheck = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      }
+    }
+    return finish("");
+  } catch (const std::exception&) {
+    return finish("Full mode could not start. Your normal connection has been restored.");
+  }
+}
+
 static void showWindow(HWND window) {
   ShowWindow(window, IsIconic(window) ? SW_RESTORE : SW_SHOW);
   SetForegroundWindow(window);
@@ -1311,6 +1371,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   }
   WSADATA data;
   if (WSAStartup(MAKEWORD(2, 2), &data)) { LocalFree(argv); return 1; }
+  if (argc == 4 && std::wstring(argv[1]) == L"--desktop-full") {
+    const int result = runDesktopFull(argv[2], std::wcstoul(argv[3], nullptr, 10));
+    LocalFree(argv); WSACleanup(); return result;
+  }
   if (argc > 1 && std::wstring(argv[1]) == L"--apply-update") {
     const int result = applyUpdate(argc, argv);
     LocalFree(argv); WSACleanup(); return result;
