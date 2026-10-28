@@ -298,7 +298,11 @@ DesktopAction DesktopUi::render(DesktopForm& form, const DesktopState& state, fl
   ImGui::PushStyleColor(ImGuiCol_Button, ImVec4{0, 0, 0, 0});
   ImGui::PushStyleColor(ImGuiCol_Text, muted);
   ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0);
-  if (ImGui::Button("Options", {-1, 28})) options_ = !options_;
+  ImGui::BeginDisabled(state.stopping);
+  if (ImGui::Button("Open browser", {width - 110, 28})) action = DesktopAction::OpenBrowser;
+  ImGui::EndDisabled();
+  ImGui::SameLine(0, 10);
+  if (ImGui::Button("Options", {100, 28})) options_ = !options_;
   const auto optionsBounds = ImGui::GetItemRectMax();
   const float alphaBlend = 1 - std::exp(-delta / .08f);
   optionsAlpha_ += ((options_ ? 1.f : 0.f) - optionsAlpha_) * alphaBlend;

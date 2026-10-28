@@ -40,6 +40,12 @@ Run `etl-client.exe`, enter the server and token, then click the power button.
 The borderless window is 360 pixels wide, with a draggable header and custom
 minimize and close controls. Options expands ports, backup, timeout and CA below
 the main controls. The window grows and shrinks smoothly to fit, without scrollbars.
+Open browser starts or reuses the configured local proxy and opens Edge or Chrome
+with a separate ETL profile and remote hostname resolution. It prefers the default
+browser when that is Edge or Chrome. Profiles live under `%LOCALAPPDATA%\ETL\Browser`,
+separately for each browser and proxy port. The system proxy and normal browser
+profile remain unchanged.
+
 The token input is masked. A saved token remains
 in use when the field is blank; entering a new token replaces it. Leaving the
 backup host empty disables failover. A new backup with no token uses the primary

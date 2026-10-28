@@ -22,7 +22,7 @@ struct DesktopState {
   UpdateState update;
 };
 
-enum class DesktopAction { None, ToggleProxy, CheckUpdates, InstallUpdate, DismissUpdate };
+enum class DesktopAction { None, ToggleProxy, OpenBrowser, CheckUpdates, InstallUpdate, DismissUpdate };
 
 class DesktopUi {
  public:

@@ -26,6 +26,7 @@
 #include "desktop_ui.h"
 #include "resources.h"
 #include "vpn.h"
+#include "browser.h"
 #include <windowsx.h>
 #include <dwmapi.h>
 
@@ -1208,6 +1209,18 @@ static void showWindow(HWND window) {
   SetForegroundWindow(window);
 }
 
+static void openBrowser(HWND window) {
+  if (stopping) return;
+  if (!service.running() && !localProxyAvailable(form.localPort)) {
+    connectOrStop(window);
+    if (!service.running()) return;
+  }
+  std::wstring error;
+  const int port = service.running() ? config.localPort : form.localPort;
+  if (!openProxyBrowser(port, error)) uiError = utf8(error);
+  else uiError.clear();
+}
+
 static LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
   if (desktop.message(window, message, wparam, lparam)) return 1;
   switch (message) {
@@ -1513,6 +1526,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     if (updater) state.update = updater->snapshot();
     switch (desktop.render(form, state)) {
       case DesktopAction::ToggleProxy: connectOrStop(window); break;
+      case DesktopAction::OpenBrowser: openBrowser(window); break;
       case DesktopAction::CheckUpdates: if (updater) updater->check(true); break;
       case DesktopAction::InstallUpdate: if (updater) updater->download(); break;
       case DesktopAction::DismissUpdate: if (updater) updater->dismiss(); break;
