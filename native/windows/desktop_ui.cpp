@@ -96,18 +96,10 @@ bool button(const char* label, ImVec2 size, Icon symbol, bool primary = false, b
 void drawBrand(ImDrawList* draw, ImVec2 origin, float size, ImU32 color) {
   const float scale = size / 64.f;
   auto point = [&](float x, float y) { return ImVec2{origin.x + x * scale, origin.y + y * scale}; };
-  const float stroke = 8 * scale;
-  draw->AddLine(point(40, 12), point(22, 12), color, stroke);
-  draw->PathArcTo(point(22, 22), 10 * scale, 3.14159265f, 4.71238898f, 12);
-  draw->PathStroke(color, 0, stroke);
-  draw->AddLine(point(12, 22), point(12, 40), color, stroke);
-  draw->AddLine(point(24, 52), point(42, 52), color, stroke);
-  draw->PathArcTo(point(42, 42), 10 * scale, 0, 1.57079633f, 12);
-  draw->PathStroke(color, 0, stroke);
-  draw->AddLine(point(52, 42), point(52, 24), color, stroke);
-  draw->AddLine(point(24, 32), point(40, 32), color, stroke);
-  for (const ImVec2 endpoint : {point(40, 12), point(12, 40), point(24, 52), point(52, 24), point(24, 32), point(40, 32)})
-    draw->AddCircleFilled(endpoint, stroke / 2, color, 12);
+  const ImVec2 outline[]{point(12, 12), point(52, 12), point(44, 20), point(20, 20),
+    point(20, 28), point(44, 28), point(36, 36), point(20, 36), point(20, 44),
+    point(52, 44), point(44, 52), point(12, 52)};
+  draw->AddConcavePolyFilled(outline, static_cast<int>(std::size(outline)), color);
 }
 
 void input(const char* label, const char* hint, char* value, size_t size, bool secret = false) {

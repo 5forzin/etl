@@ -1,14 +1,15 @@
 # ETL logo
 
-The symbol uses two opposing rounded corners and a central connection. Use the
-black logo on light backgrounds and the white logo on dark backgrounds. The
+The symbol is a solid E with three diagonal terminals. Its simple silhouette
+works in black or white and remains legible at tray-icon sizes. Use black on
+light backgrounds and white on dark backgrounds. The
 wordmark uses outlined Inter Semi Bold, so SVGs need no installed font.
 
 `etl-mark.svg` inherits `currentColor`. `etl-icon.svg` adds a dark tile and a subtle
 border so the application icon remains visible on either background. `etl.ico`
 contains 16, 20, 24, 32, 40, 48, 64, 128 and 256 pixel images.
 
-Editable source: [Figma](https://www.figma.com/design/BQNC74KJoWRbj8JC0fIpOl?node-id=20-13).
+The SVGs are the editable sources.
 Inter's [license](../../native/windows/assets/LICENSE-Inter.txt) applies to its
 letterforms.
 

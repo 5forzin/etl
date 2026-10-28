@@ -28,7 +28,7 @@ for (const variant of ['black','white']) {
   const logo = await readFile(resolve(directory,`etl-logo-${variant}.svg`));
   await sharp(logo,{density:288}).png().toFile(resolve(directory,`etl-logo-${variant}.png`));
   const mark = (await readFile(resolve(directory,'etl-mark.svg'),'utf8'))
-    .replace('currentColor',variant === 'black' ? '#151918' : '#f7f8f7');
+    .replace('currentColor',variant === 'black' ? '#111111' : '#ffffff');
   await sharp(Buffer.from(mark),{density:384}).resize(110,110).png()
     .toFile(resolve(directory,`wizard-${variant}.png`));
   const banner = `<svg xmlns="http://www.w3.org/2000/svg" width="404" height="772" viewBox="0 0 202 386"><rect width="202" height="386" fill="${variant === 'black' ? '#ffffff' : '#202020'}"/><g transform="translate(53 145) scale(1.5)">${mark.replace(/<\/?svg[^>]*>/g,'')}</g></svg>`;

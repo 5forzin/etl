@@ -33,6 +33,7 @@ foreach(component ${ETL_HEV_COMPONENTS})
 endforeach()
 
 configure_file(etl-client.rc.in "${CMAKE_CURRENT_BINARY_DIR}/etl-client.rc" @ONLY)
+set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/etl-client.rc" PROPERTIES OBJECT_DEPENDS "${ETL_ICON_PATH}")
 configure_file(etl_version.h.in "${CMAKE_CURRENT_BINARY_DIR}/etl_version.h" @ONLY)
 
 option(ETL_PORTABLE "Build a single EXE without MSYS2 runtime DLLs" OFF)
