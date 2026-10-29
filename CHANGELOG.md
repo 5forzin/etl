@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.6.0 (2026-10-29)
+
+- Redesign the Windows desktop with a monochrome interface, an abstract logo,
+  consistent borders and spacing, aligned controls, and smooth page transitions.
+  Respect the Windows reduced-animation preference.
+- Choose Proxy only or Full mode from the desktop. Full mode runs in a separate
+  elevated worker and restores normal connectivity when the tunnel fails.
+- Open an isolated Edge or Chrome session through the configured local proxy.
+  Keep the normal browser profile and system proxy settings unchanged.
+- Generate standalone Windows and Linux x64 agents with single-use pairing codes.
+  Register and select servers from the desktop while preserving the primary and
+  backup profiles. Agent hosts need a public IPv4 address and an inbound TCP port.
+- Keep server lists compact and scroll long lists inside their rounded panel.
+  Truncate long names and addresses, format large traffic totals, and align
+  settings fields and header controls.
+- Add native previews for long lists, long hostnames, large traffic totals and
+  profiles without registered agents.
+
+Existing proxy connections remain compatible. Update the primary Node server to
+0.6.0 to enable agent enrollment and management. Desktop upgrades preserve saved
+settings and encrypted credentials.
+
 ## 0.5.0 (2026-10-17)
 
 - Add the ETL v2 protocol: a UDP session mode framed inside the same TLS 1.3
