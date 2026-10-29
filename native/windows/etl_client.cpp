@@ -1761,6 +1761,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   const bool previewOptions = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-options";
   const bool previewReduced = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-reduced";
   const bool previewServers = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-servers";
+  const bool previewServersMany = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-servers-many";
+  const bool previewServersEmpty = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-servers-empty";
+  const bool previewLongServer = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-long-server";
   const bool previewAgentExport = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-agent-export";
   const bool previewFull = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-full";
   const bool previewFullActive = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-full-active";
@@ -1771,7 +1774,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   const bool previewUpdate = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-update";
   const bool previewDownloading = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-downloading";
   const bool previewUpdateError = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-update-error";
-  const std::wstring previewPath = argc == 3 && (std::wstring(argv[1]) == L"--self-test-ui" || previewOptions || previewActive || previewFull || previewFullActive || previewConnecting || previewStopping || previewServers || previewAgentExport ||
+  const std::wstring previewPath = argc == 3 && (std::wstring(argv[1]) == L"--self-test-ui" || previewOptions || previewActive || previewFull || previewFullActive || previewConnecting || previewStopping || previewServers || previewServersMany || previewServersEmpty || previewLongServer || previewAgentExport ||
     previewError || previewUpdate || previewDownloading || previewUpdateError || previewReduced) ? argv[2] : L"";
   if (argc == 2 && std::wstring(argv[1]) == L"--self-test-token-storage") {
     std::string original(64, 'a'), restored;
@@ -1909,11 +1912,26 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     renderPreview(DesktopState{});
     const int collapsed = height();
     bool motion = true;
-    if (previewServers || previewAgentExport) {
+    if (previewServers || previewServersMany || previewServersEmpty || previewAgentExport) {
       DesktopState state{};
       state.servers = {{"a", "Frankfurt", "1.1.1.1", true}, {"b", "New York", "8.8.8.8", false}};
+      if (previewServersEmpty) state.servers.clear();
+      if (previewServersMany) {
+        state.servers[0].name = "Frankfurt — production and continuous integration workers";
+        state.servers[0].host = "gateway.research.production.eu-central-1.example.com";
+        for (int i = 0; i < 8; ++i) state.servers.push_back({"extra-" + std::to_string(i),
+          "Server " + std::to_string(i + 3), "192.0.2." + std::to_string(i + 1), true});
+        form.selectedAgent = "a";
+      }
       if (previewAgentExport) { desktop.showAgentExport(); strcpy_s(form.agentName.data(), form.agentName.size(), "Frankfurt"); }
       else desktop.showServers();
+      renderPreview(state);
+    }
+    if (previewLongServer) {
+      DesktopState state{};
+      state.running = true; state.sessions = 128;
+      state.sent = 123ULL * 1024 * 1024 * 1024; state.received = 987ULL * 1024 * 1024 * 1024;
+      state.activeServer = "gateway.research.build-workers.production.cluster.eu-central-1.example.com";
       renderPreview(state);
     }
     if (previewFull || previewFullActive || previewConnecting || previewStopping) {

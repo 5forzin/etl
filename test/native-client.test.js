@@ -314,14 +314,16 @@ test('native client rejects a trailing headless option',
 });
 
 test('native desktop renders compact frames and animates expansion and collapse without starting a proxy',
-  { skip: !executable || process.platform !== 'win32', timeout: 20000 }, () => {
+  { skip: !executable || process.platform !== 'win32', timeout: 30000 }, () => {
   const dir = mkdtempSync(join(tmpdir(), 'etl-ui-'));
   try {
     const heights = ['--self-test-ui', '--self-test-ui-options', '--self-test-ui-error',
       '--self-test-ui-update', '--self-test-ui-downloading', '--self-test-ui-update-error',
       '--self-test-ui-active', '--self-test-ui-full', '--self-test-ui-full-active',
       '--self-test-ui-connecting', '--self-test-ui-stopping', '--self-test-ui-reduced',
-      '--self-test-ui-servers', '--self-test-ui-agent-export'].map((flag, index) => {
+      '--self-test-ui-servers', '--self-test-ui-agent-export',
+      '--self-test-ui-servers-many', '--self-test-ui-long-server',
+      '--self-test-ui-servers-empty'].map((flag, index) => {
       const path = join(dir, `preview-${index}.bmp`);
       execFileSync(executable, [flag, path], { windowsHide: true, timeout: 8000 });
       const bitmap = readFileSync(path);
@@ -341,6 +343,9 @@ test('native desktop renders compact frames and animates expansion and collapse 
     assert.equal(heights[9], heights[0], 'connecting should keep Cancel in place');
     assert.equal(heights[10], heights[0], 'stopping should keep the status visible');
     assert.equal(heights[11], heights[1], 'reduced motion should preserve the Settings layout');
+    assert.ok(heights[14] < 600, 'long server lists should scroll within a bounded window');
+    assert.equal(heights[15], heights[6], 'long hostnames and large traffic totals should not change the active layout');
+    assert.ok(heights[16] < heights[12], 'a profile without agents should not leave empty server rows');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

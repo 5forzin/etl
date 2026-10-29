@@ -49,7 +49,7 @@ class DesktopUi {
   bool capture(const std::wstring& path);
   bool message(HWND window, UINT message, WPARAM wparam, LPARAM lparam);
   void showOptions(bool show = true) { if (options_ != show || servers_) { options_ = show; servers_ = false; pageAlpha_ = 0; } }
-  void showServers() { options_ = false; servers_ = true; pageAlpha_ = 0; }
+  void showServers() { options_ = false; servers_ = true; exporting_ = false; pageAlpha_ = 0; }
   void showAgentExport() { showServers(); exporting_ = true; }
  private:
   bool createTarget();

@@ -172,6 +172,11 @@ Preview animations are deterministic and independent of the host's animation
 preference. `--self-test-ui-reduced` checks that Settings opens and closes
 immediately when reduced motion is requested.
 
+`--self-test-ui-servers-many` previews a scrolling list with long names and
+addresses; `--self-test-ui-servers-empty` checks a profile without agents.
+`--self-test-ui-long-server` checks the connected layout with a long hostname
+and large traffic counters.
+
 Headless mode takes `--server`, `--server-port`, `--port`, `--token-file`,
 `--ca`, `--servername`, `--fallback-server`, `--fallback-port`, `--fallback-token-file` and
 `--connect-timeout-ms`. It additionally accepts `--handshake-timeout-ms`
