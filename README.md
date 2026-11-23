@@ -27,7 +27,8 @@ user. Updates and uninstall preserve saved tokens and settings.
 
 For a portable copy, download `etl-client.exe` instead. Both builds include the
 same client. See the [Windows guide](native/windows/README.md) to build either.
-Enter your server and token in Settings, choose Proxy only or Full mode, then Connect.
+Enter your server and token in Settings, choose Proxy only, Selective or Full mode,
+then Connect.
 
 With Node.js 24 or later:
 
@@ -59,7 +60,9 @@ See [agents](docs/agents.md) for execution, persistent state and revocation.
 
 ETL forwards TCP and supports UDP through SOCKS5 UDP ASSOCIATE. Proxy only
 affects applications configured to use it. Windows Full mode uses a TUN adapter
-and restores normal routing if the tunnel fails. SOCKS clients should send
+and restores normal routing if the tunnel fails. Windows Selective mode uses the
+same adapter only for Twingate relay connections that the network blocks, so
+Twingate works on networks that allow little more than HTTPS. SOCKS clients should send
 hostnames through the proxy (`socks5h`).
 
 TLS protects the client-to-server link. The network can still see the endpoint

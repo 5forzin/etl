@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <cwctype>
 #include <fstream>
 #include <sstream>
 #include <thread>
@@ -157,6 +158,87 @@ bool probeDnsTcp(const char* address, unsigned short port, unsigned long timeout
   ok = ok && length >= 12 && length <= 4096 && validDnsResponse(response + 2, 12, query);
   closesocket(socket);
   return ok;
+}
+
+// Applications whose stuck relay connections Selective mode routes through ETL.
+static const wchar_t* const kSelectiveApps[] = {L"twingate.service.exe"};
+
+bool publicIpv4(uint32_t address) {
+  const auto* b = reinterpret_cast<const unsigned char*>(&address);
+  return !(b[0] == 0 || b[0] == 10 || b[0] == 127 || b[0] >= 224 ||
+    (b[0] == 100 && b[1] >= 64 && b[1] <= 127) || (b[0] == 169 && b[1] == 254) ||
+    (b[0] == 172 && b[1] >= 16 && b[1] <= 31) || (b[0] == 192 && b[1] == 168) ||
+    (b[0] == 192 && b[1] == 0 && (b[2] == 0 || b[2] == 2)) ||
+    (b[0] == 198 && (b[1] == 18 || b[1] == 19)) || (b[0] == 198 && b[1] == 51 && b[2] == 100) ||
+    (b[0] == 203 && b[1] == 0 && b[2] == 113));
+}
+
+bool selectiveApp(const std::wstring& imageName) {
+  std::wstring name = imageName;
+  std::transform(name.begin(), name.end(), name.begin(), [](wchar_t c) { return static_cast<wchar_t>(towlower(c)); });
+  for (const wchar_t* app : kSelectiveApps) if (name == app) return true;
+  return false;
+}
+
+bool selectiveDestination(unsigned long tcpState, uint32_t remote, uint16_t remotePort, uint32_t server) {
+  // Ports the network already allows are left alone, and so is the ETL server
+  // itself: routing it into the tunnel would loop the tunnel through itself.
+  return tcpState == MIB_TCP_STATE_SYN_SENT && remotePort != 53 && remotePort != 80 &&
+    remotePort != 443 && remote != server && publicIpv4(remote);
+}
+
+bool selectiveCandidate(const std::wstring& imageName, unsigned long tcpState,
+                        uint32_t remote, uint16_t remotePort, uint32_t server) {
+  return selectiveDestination(tcpState, remote, remotePort, server) && selectiveApp(imageName);
+}
+
+std::string ipv4Text(uint32_t address) {
+  char text[INET_ADDRSTRLEN]{};
+  in_addr value{}; value.s_addr = address;
+  return inet_ntop(AF_INET, &value, text, sizeof(text)) ? text : "";
+}
+
+SelectiveScanner::SelectiveScanner(const std::string& serverIp) {
+  in_addr value{};
+  if (inet_pton(AF_INET, serverIp.c_str(), &value) == 1) server_ = value.s_addr;
+}
+
+bool SelectiveScanner::matches(unsigned long pid) {
+  const ULONGLONG now = GetTickCount64();
+  const auto cached = processes_.find(pid);
+  if (cached != processes_.end() && now - cached->second.first < 30000) return cached->second.second;
+  bool match = false;
+  if (HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)) {
+    wchar_t path[MAX_PATH]{};
+    DWORD size = MAX_PATH;
+    if (QueryFullProcessImageNameW(process, 0, path, &size)) {
+      match = selectiveApp(std::filesystem::path(std::wstring(path, size)).filename().wstring());
+    }
+    CloseHandle(process);
+  }
+  processes_[pid] = {now, match};
+  return match;
+}
+
+std::vector<uint32_t> SelectiveScanner::scan() {
+  std::vector<uint32_t> fresh;
+  ULONG size = 0;
+  if (GetExtendedTcpTable(nullptr, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) != ERROR_INSUFFICIENT_BUFFER)
+    return fresh;
+  std::vector<unsigned char> buffer(size + 1024);
+  size = static_cast<ULONG>(buffer.size());
+  auto* table = reinterpret_cast<PMIB_TCPTABLE_OWNER_PID>(buffer.data());
+  if (GetExtendedTcpTable(table, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) != NO_ERROR) return fresh;
+  for (DWORD i = 0; i < table->dwNumEntries && seen_.size() < kMaxDestinations; ++i) {
+    const MIB_TCPROW_OWNER_PID& row = table->table[i];
+    const uint16_t port = ntohs(static_cast<u_short>(row.dwRemotePort));
+    // The address/port filter runs first so process lookups stay rare.
+    if (seen_.count(row.dwRemoteAddr) || !selectiveDestination(row.dwState, row.dwRemoteAddr, port, server_) ||
+        !matches(row.dwOwningPid)) continue;
+    seen_.insert(row.dwRemoteAddr);
+    fresh.push_back(row.dwRemoteAddr);
+  }
+  return fresh;
 }
 
 std::filesystem::path runtimeDirectory() {
@@ -350,10 +432,31 @@ RoutePlan planRoutes(const std::wstring& server) {
   return plan;
 }
 
+// Windows applies the strong host model to the interface that OWNS a packet's
+// source address: a socket bound to the Wi-Fi address can only leave through
+// another interface when the Wi-Fi interface allows weak host sends. Measured
+// with Twingate: TUN send+receive alone kept every relay attempt in SYN-SENT;
+// adding Wi-Fi weakhostsend (receive not needed) connected them, in both the
+// Selective and Full layouts. store=active keeps the change out of the
+// persistent configuration, so a reboot also undoes it.
+static bool weakHostSendEnabled(unsigned long interfaceIndex) {
+  MIB_IPINTERFACE_ROW row{};
+  InitializeIpInterfaceEntry(&row);
+  row.Family = AF_INET;
+  row.InterfaceIndex = interfaceIndex;
+  return GetIpInterfaceEntry(&row) == NO_ERROR && row.WeakHostSend;
+}
+
+static bool setWeakHostSend(unsigned long interfaceIndex, bool enabled, std::string* error = nullptr) {
+  return runCommand(L"netsh interface ipv4 set interface interface=" + std::to_wstring(interfaceIndex) +
+    L" weakhostsend=" + (enabled ? L"enabled" : L"disabled") + L" store=active", error);
+}
+
 // The dead-man switch is a second copy of this executable watching the
 // parent process; it is deliberately NOT assigned to the engine job so a
-// crash of the main client still leaves a cleaner behind.
-static bool spawnGuard(const std::wstring& server, HANDLE& guard) {
+// crash of the main client still leaves a cleaner behind. When the physical
+// interface's weak host send is changed, the guard also knows to undo it.
+static bool spawnGuard(const std::wstring& server, unsigned long weakHostInterface, HANDLE& guard) {
   wchar_t path[MAX_PATH]{};
   const DWORD length = GetModuleFileNameW(nullptr, path, MAX_PATH);
   if (!length || length >= MAX_PATH) {
@@ -369,6 +472,7 @@ static bool spawnGuard(const std::wstring& server, HANDLE& guard) {
   }
   std::wstring command(std::wstring(L"\"") + path + L"\" --vpn-guard " + server +
     L" " + std::to_wstring(GetCurrentProcessId()) + L" " + eventName);
+  if (weakHostInterface) command += L" " + std::to_wstring(weakHostInterface);
   std::vector<wchar_t> mutableCommand(command.begin(), command.end());
   mutableCommand.push_back(L'\0');
   STARTUPINFOW startup{};
@@ -423,8 +527,9 @@ static void guardLog(const std::string& message) {
 }
 
 int runGuard(const std::wstring& server, unsigned long parentPid,
-             const std::wstring& readyEvent) {
-  guardLog("starting parent=" + std::to_string(parentPid));
+             const std::wstring& readyEvent, unsigned long weakHostInterface) {
+  guardLog("starting parent=" + std::to_string(parentPid) +
+    (weakHostInterface ? " weakhost-if=" + std::to_string(weakHostInterface) : std::string()));
   auto finish = [](int code) {
     guardLog("exiting code=" + std::to_string(code));
     // Avoid DLL-detach deadlocks in the watchdog's cleanup path.
@@ -480,16 +585,25 @@ int runGuard(const std::wstring& server, unsigned long parentPid,
     guardLog("Route delete attempt " + std::to_string(attempt) + ": " + error);
     if (attempt == 1) Sleep(250);
   }
+  // A clean stop already restored it; disabling again is then a no-op.
+  if (weakHostInterface) {
+    std::string weakHostError;
+    if (!setWeakHostSend(weakHostInterface, false, &weakHostError)) {
+      guardLog("Weak host restore: " + weakHostError);
+      removed = false;
+    }
+  }
   std::string error;
   if (!runCommand(L"ipconfig /flushdns", &error)) guardLog("DNS flush: " + error);
   return finish(removed ? 0 : 1);
 }
 
-bool Vpn::start(int localPort, const RoutePlan& plan,
+bool Vpn::start(int localPort, const RoutePlan& plan, VpnLayout layout,
                 const std::wstring& scope, std::wstring& error) {
   try {
-    checkpoint("start");
+    checkpoint(layout == VpnLayout::Selective ? "start selective" : layout == VpnLayout::Scoped ? "start scoped" : "start");
     if (job_) { error = L"VPN mode is already running."; return false; }
+    if ((layout == VpnLayout::Scoped) == scope.empty()) { error = L"A scoped route needs exactly one address."; return false; }
     if (!isElevated()) { error = L"VPN mode requires elevation."; return false; }
     const std::filesystem::path directory = runtimeDirectory();
     checkpoint("extract");
@@ -504,8 +618,11 @@ bool Vpn::start(int localPort, const RoutePlan& plan,
     checkpoint("plan-ok", plan.server + " via " + (plan.gateway.empty() ? std::string("if") : plan.gateway));
     const std::wstring serverIp = widen(plan.server);
     const std::wstring gateway = widen(plan.gateway);
+    // Only an interface whose weak host send is off is changed (and restored);
+    // the guard learns about it before anything is modified.
+    const unsigned long weakHostInterface = weakHostSendEnabled(plan.interfaceIndex) ? 0 : plan.interfaceIndex;
     HANDLE guard = nullptr;
-    if (!spawnGuard(serverIp, guard)) {
+    if (!spawnGuard(serverIp, weakHostInterface, guard)) {
       error = L"Restoration guard could not be armed."; return false;
     }
     guard_ = guard;
@@ -575,18 +692,28 @@ bool Vpn::start(int localPort, const RoutePlan& plan,
       return false;
     }
     // Services such as Twingate bind their sockets to the physical adapter's
-    // address. Under Windows' default strong host model a packet with that source
-    // address is never routed into another interface, so those sockets would go
-    // around the tunnel (a blocked relay port then simply times out). The weak
-    // host model on the TUN adapter alone lets them in and accepts the replies.
-    // The setting lives and dies with this adapter, so no physical interface is
-    // changed and there is nothing to restore. A failure only affects such sockets.
+    // address. Under Windows' default strong host model such packets never enter
+    // another interface, so they would go around the tunnel (a blocked relay port
+    // then simply times out). The TUN adapter sends and receives them, and the
+    // physical interface must allow weak host sends (see weakHostSendEnabled).
+    // The TUN setting dies with the adapter; the physical one is restored by
+    // stop() or the guard. A failure only affects sockets bound that way.
     checkpoint("weak-host");
     std::string weakHostError;
     if (!runCommand(L"netsh interface ipv4 set interface interface=" + std::to_wstring(adapter) +
         L" weakhostsend=enabled weakhostreceive=enabled store=active", &weakHostError))
       checkpoint("weak-host-failed", weakHostError);
-    if (!scope.empty()) {
+    if (weakHostInterface) {
+      if (setWeakHostSend(weakHostInterface, true, &weakHostError)) {
+        physicalWeakHost_ = weakHostInterface;
+        checkpoint("physical-weak-host", std::to_string(weakHostInterface));
+      } else checkpoint("physical-weak-host-failed", weakHostError);
+    }
+    layout_ = layout;
+    if (layout == VpnLayout::Selective) {
+      // Destinations arrive later through routeDestination(); DNS stays untouched.
+      selectiveAdapter_ = adapter;
+    } else if (layout == VpnLayout::Scoped) {
       // Scoped traffic must keep the physical adapter's real DNS answers.
       checkpoint("scoped-route");
       if (!runCommand(L"route add " + scope + L" mask 255.255.255.255 " + kTunAddress +
@@ -646,6 +773,21 @@ bool Vpn::start(int localPort, const RoutePlan& plan,
   }
 }
 
+bool Vpn::routeDestination(uint32_t address) {
+  if (layout_ != VpnLayout::Selective || !selectiveAdapter_ || !publicIpv4(address)) return false;
+  const std::wstring ip = widen(ipv4Text(address));
+  if (ip.empty() || std::find(selectiveRoutes_.begin(), selectiveRoutes_.end(), ip) != selectiveRoutes_.end()) return false;
+  std::string error;
+  if (!runCommand(L"route add " + ip + L" mask 255.255.255.255 " + kTunAddress +
+      L" metric 1 if " + std::to_wstring(selectiveAdapter_), &error)) {
+    checkpoint("selective-route-failed", ipv4Text(address) + " " + error);
+    return false;
+  }
+  selectiveRoutes_.push_back(ip);
+  checkpoint("selective-route", ipv4Text(address));
+  return true;
+}
+
 static void stopGuard(void*& guard) {
   if (!guard) return;
   HANDLE handle = static_cast<HANDLE>(guard);
@@ -657,8 +799,18 @@ static void stopGuard(void*& guard) {
 }
 
 void Vpn::stop() {
-  if (!job_ && !process_ && !guard_ && serverRoute_.empty() &&
-      scopeRoute_.empty() && !mapDnsRoute_ && !fullAdapter_) return;
+  if (!job_ && !process_ && !guard_ && serverRoute_.empty() && scopeRoute_.empty() &&
+      !mapDnsRoute_ && !fullAdapter_ && selectiveRoutes_.empty() && !physicalWeakHost_) return;
+  for (const auto& route : selectiveRoutes_) runCommand(L"route delete " + route + L" mask 255.255.255.255 " + kTunAddress);
+  selectiveRoutes_.clear();
+  selectiveAdapter_ = 0;
+  layout_ = VpnLayout::Full;
+  if (physicalWeakHost_) {
+    std::string error;
+    if (!setWeakHostSend(physicalWeakHost_, false, &error)) checkpoint("physical-weak-host-restore-failed", error);
+    else checkpoint("physical-weak-host-restored");
+    physicalWeakHost_ = 0;
+  }
   HANDLE job = static_cast<HANDLE>(job_);
   HANDLE process = static_cast<HANDLE>(process_);
   job_ = nullptr;

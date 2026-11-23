@@ -4,14 +4,17 @@ The desktop is a compact, 400-pixel-wide window. Its monochrome palette uses
 near-black backgrounds, graphite surfaces, subtle outlines and a white primary
 action. Inter, consistent line icons and generous spacing define the hierarchy.
 
-The connection screen shows status, the configured server, a two-position mode
-selector, the primary action, Open browser and Settings. Server credentials and
+The connection screen shows status, the configured server, a three-position mode
+selector (Proxy only, Selective, Full mode), the primary action, Open browser and
+Settings. Hovering a mode explains what goes through ETL. Server credentials and
 advanced fields live on a separate Settings screen. Traffic counters appear only
 while the connection is active and use actual session data.
 
 - **Proxy only** opens the configured local SOCKS5/HTTP listener. Applications
   must opt into that proxy. “Proxy active” means the local listener is open;
   remote authentication happens when an application uses it.
+- **Selective** routes only Twingate's blocked relay connections through the TUN
+  engine and reports how many relay addresses it routed below the counters.
 - **Full mode** routes the PC through the existing TUN engine. A separate worker
   requests administrator permission; the desktop and browser remain unelevated.
   The interface reflects connecting, connected, disconnecting and failure states.

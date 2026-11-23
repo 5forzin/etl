@@ -1,7 +1,11 @@
 #pragma once
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
+#include <map>
+#include <set>
 #include <string>
+#include <vector>
 
 // VPN mode orchestration: the embedded hev-socks5-tunnel runtime provides the
 // TUN device and lwIP; this module owns extraction, spawning, routing, DNS and
@@ -63,13 +67,51 @@ struct RoutePlan {
 RoutePlan planRoutes(const std::wstring& server);
 void checkpoint(const char* step);
 
+// Selective mode routes only the destinations that listed applications cannot
+// reach directly. Twingate opens its relay connections on TCP ports that
+// restrictive networks drop; such an attempt sits in SYN-SENT, and routing its
+// /32 into the tunnel lets the next SYN retransmission through ETL.
+// Pure filter (addresses in network byte order, as in MIB_TCPROW).
+bool publicIpv4(uint32_t address);
+bool selectiveApp(const std::wstring& imageName);
+bool selectiveDestination(unsigned long tcpState, uint32_t remote, uint16_t remotePort, uint32_t server);
+bool selectiveCandidate(const std::wstring& imageName, unsigned long tcpState,
+                        uint32_t remote, uint16_t remotePort, uint32_t server);
+std::string ipv4Text(uint32_t address);
+
+class SelectiveScanner {
+ public:
+  static constexpr size_t kMaxDestinations = 256;
+  explicit SelectiveScanner(const std::string& serverIp);
+  // Destinations seen for the first time since the previous scan.
+  std::vector<uint32_t> scan();
+  size_t routed() const { return seen_.size(); }
+
+ private:
+  bool matches(unsigned long pid);
+  uint32_t server_ = 0;
+  std::set<uint32_t> seen_;
+  // pid -> (checked at, matches); pids are reused, so entries expire.
+  std::map<unsigned long, std::pair<unsigned long long, bool>> processes_;
+};
+
+enum class VpnLayout {
+  Full,       // default routes, mapped DNS, IPv6 half-defaults
+  Scoped,     // one fixed /32 (headless tests)
+  Selective,  // /32 routes added at runtime through routeDestination()
+};
+
 class Vpn {
  public:
   // A scope installs only its /32 and leaves DNS alone. Empty scope routes
   // IPv4 and IPv6 through the TUN and pairs mapdns with its fake-IP route.
-  bool start(int localPort, const RoutePlan& plan,
+  // Scoped requires `scope`; the other layouts require it empty.
+  bool start(int localPort, const RoutePlan& plan, VpnLayout layout,
              const std::wstring& scope, std::wstring& error);
   void stop();
+  // Selective layout only: send one more destination (network byte order)
+  // through the tunnel. Returns false if it is not routable or already routed.
+  bool routeDestination(uint32_t address);
   // Returns true on engine exit or wait failure; logs the reason for teardown.
   bool waitEngine(unsigned long timeoutMs) const;
   HealthReport health() const;
@@ -87,13 +129,17 @@ class Vpn {
   bool defaultRoutes_[2]{};
   bool ipv6Routes_[2]{};
   mutable int dnsState_ = -1;   // last mapped-DNS result, so transitions are logged once
+  VpnLayout layout_ = VpnLayout::Full;
+  unsigned long selectiveAdapter_ = 0;
+  std::vector<std::wstring> selectiveRoutes_;
+  unsigned long physicalWeakHost_ = 0;  // interface whose weak host send to restore
 };
 
 bool extractRuntime(const std::filesystem::path& directory, std::wstring& error);
 bool isElevated();
 std::filesystem::path runtimeDirectory();
 int runGuard(const std::wstring& server, unsigned long parentPid,
-             const std::wstring& readyEvent = L"");
+             const std::wstring& readyEvent = L"", unsigned long weakHostInterface = 0);
 
 // Offline checks: extraction with hash verification and the routing plan.
 bool selfTestExtract(std::wstring& error);

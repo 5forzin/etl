@@ -25,6 +25,12 @@ $endpoint = ([Net.Dns]::GetHostAddresses($Server) | Where-Object {
 if (!$endpoint) { throw 'Cannot resolve the ETL IPv4 endpoint.' }
 $baselineDns = Get-DnsClientServerAddress | Where-Object InterfaceAlias -ne 'ETL' |
   Select-Object InterfaceIndex,AddressFamily,ServerAddresses | ConvertTo-Json -Depth 4 -Compress
+# Full mode turns on weak host sends on the physical interface while it runs.
+function Get-WeakHostState {
+  return Get-NetIPInterface -AddressFamily IPv4 | Where-Object InterfaceAlias -ne 'ETL' |
+    Sort-Object InterfaceIndex | ForEach-Object { "$($_.InterfaceIndex)=$($_.WeakHostSend)/$($_.WeakHostReceive)" }
+}
+$baselineWeakHost = (Get-WeakHostState) -join ','
 
 function Test-EtlRoutes {
   return @(Get-NetRoute -InterfaceAlias ETL -ErrorAction SilentlyContinue | Where-Object {
@@ -44,6 +50,7 @@ function Assert-NormalNetwork {
   $dns = Get-DnsClientServerAddress | Where-Object InterfaceAlias -ne 'ETL' |
     Select-Object InterfaceIndex,AddressFamily,ServerAddresses | ConvertTo-Json -Depth 4 -Compress
   if ($dns -ne $baselineDns) { throw 'Physical DNS configuration changed.' }
+  Wait-Until { ((Get-WeakHostState) -join ',') -eq $baselineWeakHost } 'Physical weak host settings were not restored.'
   & curl.exe --noproxy '*' --silent --show-error --fail --connect-timeout 6 --max-time 12 --output NUL 'https://example.com'
   if ($LASTEXITCODE -ne 0) { throw 'Normal HTTPS connection was not restored.' }
 }
@@ -67,10 +74,15 @@ function Start-HealthyEtl {
     $routes.Count -eq 5 -and $dns -contains '198.18.0.2'
   } 'Full mode did not start.'
   # Sockets bound to the physical adapter's address (Twingate) only reach the TUN
-  # when it uses the weak host model, and only the TUN adapter may be changed.
+  # when the TUN sends and receives for other addresses and the physical
+  # interface allows weak host sends; receive on the physical side stays as is.
   $weakHost = Get-NetIPInterface -InterfaceAlias ETL -AddressFamily IPv4 -ErrorAction SilentlyContinue
   if ($weakHost.WeakHostSend -ne 'Enabled' -or $weakHost.WeakHostReceive -ne 'Enabled') {
     throw 'Full mode did not enable weak host routing on the TUN adapter.'
+  }
+  $physical = Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Where-Object NextHop -ne '0.0.0.0' | Sort-Object RouteMetric | Select-Object -First 1
+  if ((Get-NetIPInterface -InterfaceIndex $physical.InterfaceIndex -AddressFamily IPv4).WeakHostSend -ne 'Enabled') {
+    throw 'Full mode did not allow weak host sends on the physical interface.'
   }
   & curl.exe --noproxy '*' --silent --show-error --fail --connect-timeout 6 --max-time 12 --output NUL 'https://example.com' 2> (Join-Path $directory 'recovery-https.log')
   if ($LASTEXITCODE -ne 0) { throw 'Full mode could not relay HTTPS.' }

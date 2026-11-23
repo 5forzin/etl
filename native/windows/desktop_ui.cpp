@@ -28,7 +28,7 @@ constexpr float primaryHeight = 44, secondaryHeight = 40;
 ImFont *body = nullptr, *heading = nullptr, *brand = nullptr;
 bool reduceMotion = false;
 
-enum class Icon { Proxy, Full, Browser, Settings, Power, Stop, Back, Chevron, Minimize, Close, Upload, Download };
+enum class Icon { Proxy, Selective, Full, Browser, Settings, Power, Stop, Back, Chevron, Minimize, Close, Upload, Download };
 
 void icon(ImDrawList* draw, Icon kind, ImVec2 origin, float size, ImU32 color) {
   auto p = [&](float x, float y) { return ImVec2{origin.x + x * size / 24, origin.y + y * size / 24}; };
@@ -39,6 +39,10 @@ void icon(ImDrawList* draw, Icon kind, ImVec2 origin, float size, ImU32 color) {
       draw->AddRect(p(3, 6), p(10, 18), color, 3, 0, stroke);
       draw->AddRect(p(14, 6), p(21, 18), color, 3, 0, stroke);
       line(10, 12, 14, 12); break;
+    case Icon::Selective:  // one path forks: only part of the traffic is diverted
+      line(3, 12, 10, 12); line(10, 12, 17, 6.5f); line(10, 12, 17, 17.5f);
+      draw->AddCircle(p(19, 5.5f), size * 2 / 24, color, 12, stroke);
+      draw->AddCircleFilled(p(19, 18.5f), size * 2 / 24, color, 12); break;
     case Icon::Full:
       draw->AddCircle(p(12, 12), size * 9 / 24, color, 32, stroke);
       draw->AddEllipse(p(12, 12), {size * 4 / 24, size * 9 / 24}, color, 0, 32, stroke);
@@ -316,7 +320,7 @@ DesktopAction DesktopUi::render(DesktopForm& form, const DesktopState& state, fl
   ImGui::NewFrame();
   const float delta = ImGui::GetIO().DeltaTime;
   const float blend = reduceMotion ? 1.f : 1 - std::exp(-delta / .10f);
-  modePosition_ += ((form.fullMode ? 1.f : 0.f) - modePosition_) * blend;
+  modePosition_ += (static_cast<float>(form.mode) - modePosition_) * blend;
   pageAlpha_ += (1 - pageAlpha_) * blend;
   ImGui::SetNextWindowPos({0, 0});
   ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
@@ -358,7 +362,7 @@ DesktopAction DesktopUi::render(DesktopForm& form, const DesktopState& state, fl
 
   if (!options_ && !servers_) {
     const char* status = state.stopping ? "Disconnecting" : state.starting ? "Connecting" :
-      state.running ? (state.fullMode ? "Connected" : "Proxy active") : "Disconnected";
+      state.running ? (state.mode == DesktopMode::Proxy ? "Proxy active" : "Connected") : "Disconnected";
     ImGui::PushFont(heading); ImGui::TextUnformatted(status); ImGui::PopFont();
     const auto statusPosition = ImGui::GetCursorScreenPos();
     if (state.running) {
@@ -374,23 +378,29 @@ DesktopAction DesktopUi::render(DesktopForm& form, const DesktopState& state, fl
     ImGui::Dummy({0, 8});
 
     const auto selector = ImGui::GetCursorScreenPos();
-    const float segment = (width - 8) / 2;
+    constexpr int modes = 3;
+    const float segment = (width - 8) / modes;
     panel(draw, selector, {width, 48});
     const float selectedX = std::round(selector.x + 4 + segment * modePosition_);
     draw->AddRectFilled({selectedX, selector.y + 4}, {selectedX + segment, selector.y + 44},
       ImGui::GetColorU32(raised), 12);
     ImGui::BeginDisabled(busy);
-    for (int mode = 0; mode < 2; ++mode) {
+    static const char* const labels[modes]{"Proxy only", "Selective", "Full mode"};
+    static const char* const hints[modes]{"Only apps set to use 127.0.0.1 go through ETL.",
+      "Only Twingate's blocked relay connections go through ETL.", "All traffic of this PC goes through ETL."};
+    static const Icon icons[modes]{Icon::Proxy, Icon::Selective, Icon::Full};
+    for (int mode = 0; mode < modes; ++mode) {
       ImGui::SetCursorScreenPos({selector.x + 4 + segment * mode, selector.y + 4});
-      const char* label = mode ? "Full mode" : "Proxy only";
-      if (ImGui::InvisibleButton(label, {segment, 40}, ImGuiButtonFlags_EnableNav)) form.fullMode = mode != 0;
-      const bool selected = form.fullMode == (mode != 0);
+      const char* label = labels[mode];
+      if (ImGui::InvisibleButton(label, {segment, 40}, ImGuiButtonFlags_EnableNav)) form.mode = static_cast<DesktopMode>(mode);
+      if (!busy && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) ImGui::SetTooltip("%s", hints[mode]);
+      const bool selected = form.mode == static_cast<DesktopMode>(mode);
       const float hover = hoverFade(label, ImGui::IsItemHovered());
       const ImU32 color = ImGui::GetColorU32(selected ? accent : ImVec4{muted.x + hover * .18f,
         muted.y + hover * .18f, muted.z + hover * .18f, 1});
       const float labelWidth = ImGui::CalcTextSize(label).x;
       const float x = selector.x + 4 + segment * mode + (segment - labelWidth - 28) / 2;
-      icon(draw, mode ? Icon::Full : Icon::Proxy, {x, selector.y + 14}, 20, color);
+      icon(draw, icons[mode], {x, selector.y + 14}, 20, color);
       draw->AddText({std::round(x + 28), selector.y + (48 - ImGui::GetFontSize()) / 2}, color, label);
       if (ImGui::IsItemFocused() && ImGui::GetIO().NavVisible) draw->AddRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
         ImGui::GetColorU32(muted), 12);
@@ -402,7 +412,7 @@ DesktopAction DesktopUi::render(DesktopForm& form, const DesktopState& state, fl
       state.running ? "Disconnect" : "Connect";
     if (button(connectLabel, {width, primaryHeight}, state.running || state.starting ? Icon::Stop : Icon::Power, true))
       action = DesktopAction::ToggleConnection;
-    if (form.fullMode && !busy && ImGui::IsItemHovered()) ImGui::SetTooltip("Requires administrator permission.");
+    if (form.mode != DesktopMode::Proxy && !busy && ImGui::IsItemHovered()) ImGui::SetTooltip("Requires administrator permission.");
     ImGui::EndDisabled();
     ImGui::Dummy({0, 8});
 
@@ -546,7 +556,7 @@ DesktopAction DesktopUi::render(DesktopForm& form, const DesktopState& state, fl
     ImGui::Dummy({0, 8});
     ImGui::Separator();
     ImGui::Dummy({0, 4});
-    serverInputs(form.fullMode ? "Backup (proxy only)" : "Backup server", form.backup, form.backupPort, "");
+    serverInputs(form.mode != DesktopMode::Proxy ? "Backup (proxy only)" : "Backup server", form.backup, form.backupPort, "");
     input("Backup token", form.savedBackupToken ? "Saved" : "Primary token", form.backupToken.data(), form.backupToken.size(), true);
     ImGui::Dummy({0, 8});
     ImGui::Separator();
@@ -580,7 +590,15 @@ DesktopAction DesktopUi::render(DesktopForm& form, const DesktopState& state, fl
     if (!update.offered && !update.error.empty()) ImGui::TextWrapped("%s", update.error.c_str());
   }
 
-  if (!options_ && !servers_ && state.running && state.fullMode && state.dnsBypassed) {
+  if (!options_ && !servers_ && state.running && state.mode == DesktopMode::Selective) {
+    ImGui::Dummy({0, 6});
+    ImGui::PushStyleColor(ImGuiCol_Text, muted);
+    if (state.routed > 0) ImGui::TextWrapped("%d Twingate relay %s routed through ETL.", state.routed,
+      state.routed == 1 ? "address" : "addresses");
+    else ImGui::TextWrapped("Waiting for blocked Twingate relay connections.");
+    ImGui::PopStyleColor();
+  }
+  if (!options_ && !servers_ && state.running && state.mode == DesktopMode::Full && state.dnsBypassed) {
     ImGui::Dummy({0, 6});
     ImGui::PushStyleColor(ImGuiCol_Text, muted);
     ImGui::TextWrapped("DNS is not reaching the tunnel. Another VPN or firewall may block UDP port 53. "

@@ -11,6 +11,7 @@ struct SessionMemory {
   DWORD version = 1, parent = 0, configurationSize = 0;
   volatile LONG phase = static_cast<LONG>(SessionPhase::Starting), sessions = 0;
   volatile LONG dnsBypassed = 0;  // 1 when system DNS cannot use the tunnel's mapped DNS
+  volatile LONG routed = 0;       // Selective: destinations routed through the tunnel
   alignas(8) volatile LONG64 sent = 0, received = 0, failures = 0;
   char configuration[8192]{};
   char error[512]{};
@@ -118,6 +119,7 @@ SessionSnapshot FullSession::snapshot() const {
   out.received = InterlockedCompareExchange64(&memory_->received, 0, 0);
   out.failures = InterlockedCompareExchange64(&memory_->failures, 0, 0);
   out.dnsBypassed = InterlockedCompareExchange(&memory_->dnsBypassed, 0, 0) != 0;
+  out.routed = InterlockedCompareExchange(&memory_->routed, 0, 0);
   if (out.phase == SessionPhase::Failed)
     out.error.assign(memory_->error, strnlen(memory_->error, sizeof(memory_->error)));
   if (finished() && out.phase != SessionPhase::Stopped && out.phase != SessionPhase::Failed) {
@@ -178,6 +180,10 @@ void FullSessionWorker::traffic(int sessions, uint64_t sent, uint64_t received, 
 
 void FullSessionWorker::dnsBypassed(bool bypassed) {
   if (memory_) InterlockedExchange(&memory_->dnsBypassed, bypassed ? 1 : 0);
+}
+
+void FullSessionWorker::routed(int destinations) {
+  if (memory_) InterlockedExchange(&memory_->routed, destinations);
 }
 
 FullSessionWorker::~FullSessionWorker() {

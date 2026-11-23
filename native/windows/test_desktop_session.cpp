@@ -32,6 +32,7 @@ int wmain(int argc, wchar_t** argv) {
     if (configuration != "cancel") {
       worker.traffic(3, 100, 200, 1);
       worker.dnsBypassed(true);
+      worker.routed(2);
       worker.publish(SessionPhase::Running);
     }
     if (!worker.wait(5000)) return 3;
@@ -58,6 +59,7 @@ int wmain(int argc, wchar_t** argv) {
     require(active.sessions == 3 && active.sent == 100 && active.received == 200 && active.failures == 1,
       "traffic counters did not cross the process boundary");
     require(active.dnsBypassed, "the DNS warning did not cross the process boundary");
+    require(active.routed == 2, "the Selective route count did not cross the process boundary");
     require(!session.start("duplicate", error, nullptr, false), "duplicate start was accepted");
     session.requestStop();
     require(until([&] { return session.finished(); }), "worker did not stop");

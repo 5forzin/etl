@@ -1,6 +1,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <iphlpapi.h>
 #include <chrono>
 #include <iostream>
 #include <stdexcept>
@@ -86,11 +87,43 @@ static void watchPolicy() {
   require(etlvpn::TunnelWatch(start).dnsViaTunnel(), "DNS was reported blocked before the first check");
 }
 
+static uint32_t ip(const char* text) {
+  in_addr value{};
+  require(inet_pton(AF_INET, text, &value) == 1, "Invalid fixture address");
+  return value.s_addr;
+}
+
+static void selectivePolicy() {
+  const uint32_t relay = ip("178.128.255.126"), server = ip("13.140.191.31");
+  const auto stuck = MIB_TCP_STATE_SYN_SENT;
+  require(etlvpn::selectiveCandidate(L"Twingate.Service.exe", stuck, relay, 30501, server),
+    "A blocked Twingate relay attempt was not routed");
+  require(etlvpn::selectiveCandidate(L"TWINGATE.SERVICE.EXE", stuck, relay, 30506, server),
+    "Image names must match case-insensitively");
+  require(!etlvpn::selectiveCandidate(L"Twingate.Service.exe", MIB_TCP_STATE_ESTAB, relay, 30501, server),
+    "A working connection would be re-routed mid-stream");
+  for (const uint16_t allowed : {53, 80, 443})
+    require(!etlvpn::selectiveCandidate(L"Twingate.Service.exe", stuck, relay, allowed, server),
+      "A port the network allows was routed");
+  require(!etlvpn::selectiveCandidate(L"Twingate.Service.exe", stuck, server, 30501, server),
+    "The ETL server itself would be routed into its own tunnel");
+  for (const char* local : {"10.1.2.3", "172.16.79.254", "192.168.0.1", "100.96.30.29", "127.0.0.1",
+                            "169.254.1.1", "198.18.0.2", "224.0.0.251", "0.0.0.0"})
+    require(!etlvpn::selectiveCandidate(L"Twingate.Service.exe", stuck, ip(local), 30501, server),
+      "A private, local or special address was routed");
+  require(!etlvpn::selectiveCandidate(L"chrome.exe", stuck, relay, 30501, server),
+    "Another application's traffic was routed");
+  require(!etlvpn::selectiveCandidate(L"Twingate.Service.exe.bak", stuck, relay, 30501, server),
+    "A similar image name matched");
+  require(etlvpn::ipv4Text(relay) == "178.128.255.126", "Addresses lost their byte order");
+}
+
 int main() {
   WSADATA data{};
   if (WSAStartup(MAKEWORD(2, 2), &data) != 0) return 1;
   try {
     watchPolicy();
+    selectivePolicy();
     require(exchange(Reply::Valid), "Healthy DNS relay rejected");
     require(!exchange(Reply::WrongId), "Unrelated DNS reply accepted");
     require(!exchange(Reply::Truncated), "Truncated relay reply accepted");

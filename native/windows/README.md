@@ -37,12 +37,25 @@ and assets without a valid digest are not installed. The first release containin
 this updater must be installed manually by users of earlier versions.
 
 Run `etl-client.exe`, enter the server and token in Settings, then choose a mode.
-**Proxy only** opens the local listener. **Full mode** starts a separate elevated
-worker and routes the PC through the TUN adapter. The desktop and browser keep
-normal user permissions. Full mode uses the selected server; the primary
-profile's backup remains saved for Proxy mode. It authenticates before changing routes and restores the
-normal connection after a tunnel failure, Disconnect, Exit or a desktop crash.
-Closing the window hides it in the tray and keeps the selected mode running.
+
+- **Proxy only** opens the local listener. Only applications configured to use
+  `127.0.0.1:<local port>` go through ETL.
+- **Selective** routes only the connections that the network blocks for Twingate.
+  When `Twingate.Service.exe` tries to reach one of its relays on a port the
+  network drops (the attempt sits in SYN-SENT; ports 53, 80 and 443 are never
+  touched), ETL adds a /32 route for that relay to the TUN adapter and the next
+  retransmission goes through ETL. DNS, the default route and every other
+  connection stay on the normal network. The app shows how many relay addresses
+  it routed. Use it when Twingate's private resources time out on a restrictive
+  network.
+- **Full mode** routes the whole PC through the TUN adapter.
+
+Selective and Full start a separate elevated worker; the desktop and browser
+keep normal user permissions. Both use the selected server; the primary profile's
+backup remains saved for Proxy only. They authenticate before changing routes and
+restore the normal connection after a tunnel failure, Disconnect, Exit or a
+desktop crash. Closing the window hides it in the tray and keeps the selected
+mode running.
 
 The borderless window is 400 pixels wide, with a draggable header and custom
 minimize and close controls. Settings contains server credentials, ports, backup,
@@ -164,8 +177,9 @@ release parsing, version ordering, checksums, portable rollback, browser argumen
 and the desktop worker lifecycle. Worker tests exercise traffic reporting,
 cancellation, errors and parent death without UAC or network route changes.
 
-`--self-test-ui-full`, `--self-test-ui-full-active`, `--self-test-ui-full-dns`, `--self-test-ui-connecting`
-and `--self-test-ui-stopping` capture the mode selector and connection states.
+`--self-test-ui-full`, `--self-test-ui-full-active`, `--self-test-ui-full-dns`, `--self-test-ui-selective`,
+`--self-test-ui-connecting` and `--self-test-ui-stopping` capture the mode selector
+and connection states.
 Previews are 32-bit bitmaps with straight alpha: the corners outside the rounded
 window outline are transparent and the outline is anti-aliased, as on screen.
 `--self-test-ui-active` captures the local proxy's traffic counters. These fixtures
@@ -196,12 +210,22 @@ seconds while failing); an engine exit restores it immediately. The client then
 exits with code 5. Physical default routes and DNS settings remain unchanged,
 and restoration removes the TUN routes and flushes cached synthetic DNS answers.
 
-Full mode enables the Windows weak host model (send and receive) on its own TUN
-adapter only, so that adapter may carry packets whose address belongs to another
-interface. Some services, Twingate among them, bind their sockets to the physical
-adapter's address. The setting disappears with the adapter, so no physical
-interface is modified and nothing needs restoring. On its own it does not route
-Twingate's relay connections through the tunnel.
+Some services, Twingate among them, bind their sockets to the physical adapter's
+address. Under Windows' default strong host model such packets never leave
+through another interface, and the check applies to the interface that owns the
+source address. Measured with Twingate on a network that blocks its relay ports:
+weak host send and receive on the TUN adapter alone left every relay attempt in
+SYN-SENT; also allowing weak host sends on the physical interface connected them
+in both Selective and Full mode (weak host receive there made no difference).
+So while Selective or Full mode runs, the TUN adapter sends and receives for other
+addresses, and the interface that carries the default route allows weak host
+sends. That change uses `store=active` and is undone on Disconnect, on a tunnel
+failure, by the restoration guard after a crash, and by a reboot. If weak host
+sends were already enabled, ETL leaves them alone.
+
+`--vpn-selective 1` (with `--vpn 1`) selects the Selective layout in headless
+mode and prints each relay address it routes. It cannot be combined with
+`--vpn-scope`.
 
 The same check also sends a UDP query to the engine's mapped DNS. That result is
 informational: other VPN clients (Twingate, for example) block UDP port 53 outside

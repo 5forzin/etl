@@ -70,7 +70,9 @@ struct Config {
   std::wstring caFile;
   std::string caPem, tlsServername, selectedAgent;
   // VPN mode: engine + TUN adapter, optionally restricted to one scoped /32.
+  // Selective routes only stuck relay connections (see etlvpn::SelectiveScanner).
   bool vpn = false;
+  bool selective = false;
   std::wstring vpnScope;
   std::string vpnServerIp;
 };
@@ -188,7 +190,9 @@ static Config loadConfig() {
   c.fallbackProtectedToken = readSetting(path, L"fallback_token_protected", L"");
   c.caFile = readSetting(path, L"ca_file", L"");
   c.selectedAgent = utf8(readSetting(path, L"selected_agent", L""));
-  c.vpn = readSetting(path, L"mode", L"proxy") == L"full";
+  const auto mode = readSetting(path, L"mode", L"proxy");
+  c.vpn = mode == L"full" || mode == L"selective";
+  c.selective = mode == L"selective";
   int value;
   if (portValue(readSetting(path, L"server_port", L"443"), value)) c.serverPort = value;
   if (portValue(readSetting(path, L"local_port", L"1080"), value)) c.localPort = value;
@@ -209,7 +213,8 @@ static Config loadConfig() {
 
 static bool saveConfig(const Config& c) {
   auto path = configPath();
-  bool ok = WritePrivateProfileStringW(L"client", L"mode", c.vpn ? L"full" : L"proxy", path.c_str()) &&
+  const wchar_t* mode = !c.vpn ? L"proxy" : c.selective ? L"selective" : L"full";
+  bool ok = WritePrivateProfileStringW(L"client", L"mode", mode, path.c_str()) &&
     WritePrivateProfileStringW(L"client", L"selected_agent",
       std::wstring(c.selectedAgent.begin(), c.selectedAgent.end()).c_str(), path.c_str()) &&
     WritePrivateProfileStringW(L"client", L"server", c.server.c_str(), path.c_str()) &&
@@ -1382,6 +1387,10 @@ static void pollAgents() {
   if (!agentTask.valid() && ConnectClock::now() >= nextAgentRefresh) refreshAgents();
 }
 
+static DesktopMode desktopMode(const Config& c) {
+  return !c.vpn ? DesktopMode::Proxy : c.selective ? DesktopMode::Selective : DesktopMode::Full;
+}
+
 static void loadForm() {
   const auto copy = [](auto& to, const std::wstring& value) {
     const auto encoded = utf8(value);
@@ -1389,7 +1398,7 @@ static void loadForm() {
   };
   copy(form.server, config.server); copy(form.backup, config.fallbackServer); copy(form.ca, config.caFile);
   form.remotePort = config.serverPort; form.backupPort = config.fallbackPort;
-  form.fullMode = config.vpn;
+  form.mode = desktopMode(config);
   form.selectedAgent = config.selectedAgent;
   form.localPort = config.localPort; form.timeout = config.connectTimeoutMs;
   form.savedToken = !config.protectedToken.empty();
@@ -1400,7 +1409,8 @@ static bool connectionExists() { return service.running() || fullSession.exists(
 
 static void updateStatus(HWND) {
   const wchar_t* status = stopping ? L"ETL - stopping" : fullSession.exists() ?
-    (fullSession.snapshot().phase == SessionPhase::Running ? L"ETL - full mode active" : L"ETL - connecting") :
+    (fullSession.snapshot().phase != SessionPhase::Running ? L"ETL - connecting" :
+      activeConfig.selective ? L"ETL - selective active" : L"ETL - full mode active") :
     service.running() ? L"ETL - proxy active" : L"ETL - off";
   wcscpy_s(tray.szTip, status);
   Shell_NotifyIconW(NIM_MODIFY, &tray);
@@ -1421,7 +1431,8 @@ static bool readForm(Config& next) {
   next.server = wide(form.server.data()); next.fallbackServer = wide(form.backup.data());
   next.serverPort = form.remotePort; next.fallbackPort = form.backupPort;
   next.localPort = form.localPort; next.connectTimeoutMs = form.timeout; next.caFile = wide(form.ca.data());
-  next.vpn = form.fullMode;
+  next.vpn = form.mode != DesktopMode::Proxy;
+  next.selective = form.mode == DesktopMode::Selective;
   next.selectedAgent = form.selectedAgent;
   if (next.server.empty() || next.serverPort < 1 || next.serverPort > 65535 ||
       next.localPort < 1 || next.localPort > 65535 || next.fallbackPort < 1 || next.fallbackPort > 65535 ||
@@ -1523,7 +1534,7 @@ static void connectOrStop(HWND window, bool proxyOnly = false) {
   if (connectionExists()) { beginStop(window, false); return; }
   Config next;
   if (!readForm(next)) { desktop.showOptions(); return; }
-  if (proxyOnly) next.vpn = false;
+  if (proxyOnly) next.vpn = next.selective = false;
   Config connection;
   if (!selectedConnection(next, connection)) { desktop.showServers(); return; }
   std::wstring error;
@@ -1531,12 +1542,13 @@ static void connectOrStop(HWND window, bool proxyOnly = false) {
     const nlohmann::json payload = {{"server", utf8(connection.server)}, {"serverPort", connection.serverPort},
       {"localPort", connection.localPort}, {"timeout", connection.connectTimeoutMs},
       {"protectedToken", utf8(connection.protectedToken)}, {"ca", utf8(connection.caFile)},
-      {"caPem", connection.caPem}, {"servername", connection.tlsServername}};
+      {"caPem", connection.caPem}, {"servername", connection.tlsServername},
+      {"mode", connection.selective ? "selective" : "full"}};
     if (!fullSession.start(payload.dump(), error, window)) { uiError = utf8(error); return; }
   } else if (!service.start(connection, error)) { uiError = utf8(error); return; }
   activeConfig = connection;
   acceptForm(next);
-  form.fullMode = next.vpn;
+  form.mode = desktopMode(next);
   updateStatus(window);
 }
 
@@ -1570,6 +1582,7 @@ static int runDesktopFull(const std::wstring& id, DWORD parent) {
     next.protectedToken = wide(payload.at("protectedToken").get<std::string>().c_str());
     next.caFile = wide(payload.at("ca").get<std::string>().c_str());
     next.caPem = payload.value("caPem", ""); next.tlsServername = payload.value("servername", "");
+    next.selective = payload.value("mode", "full") == "selective";
     const auto plan = etlvpn::planRoutes(next.server);
     if (!plan.ok) return finish("Server address or default route unavailable.");
     if (session.wait(0)) return finish("");
@@ -1577,21 +1590,32 @@ static int runDesktopFull(const std::wstring& id, DWORD parent) {
     if (!service.start(next, error)) return finish(utf8(error));
     if (!service.checkTunnel()) return finish("Tunnel unavailable. Your normal connection is unchanged.");
     if (session.wait(0)) return finish("");
-    if (!vpn.start(next.localPort, plan, L"", error)) return finish(utf8(error));
+    const auto layout = next.selective ? etlvpn::VpnLayout::Selective : etlvpn::VpnLayout::Full;
+    if (!vpn.start(next.localPort, plan, layout, L"", error)) return finish(utf8(error));
     if (session.wait(0)) return finish("");
     session.publish(SessionPhase::Running);
     etlvpn::TunnelWatch watch(std::chrono::steady_clock::now());
+    etlvpn::SelectiveScanner scanner(plan.server);
+    int routed = 0;
     while (!session.wait(200)) {
       session.traffic(service.sessions(), service.sent(), service.received(), service.failures());
       if (vpn.waitEngine(0)) return finish("Tunnel lost. Your normal connection has been restored.");
+      if (next.selective) {
+        for (const uint32_t address : scanner.scan()) if (vpn.routeDestination(address)) ++routed;
+        session.routed(routed);
+      }
       if (!watch.due(std::chrono::steady_clock::now())) continue;
-      const bool keep = watch.record(vpn.health(), std::chrono::steady_clock::now());
+      // Selective leaves system DNS alone, so only the ETL session is checked.
+      etlvpn::HealthReport report;
+      if (next.selective) report.tunnel = report.dns = service.checkTunnel();
+      else report = vpn.health();
+      const bool keep = watch.record(report, std::chrono::steady_clock::now());
       session.dnsBypassed(!watch.dnsViaTunnel());
       if (!keep) return finish("Tunnel lost. Your normal connection has been restored.");
     }
     return finish("");
   } catch (const std::exception&) {
-    return finish("Full mode could not start. Your normal connection has been restored.");
+    return finish("The tunnel could not start. Your normal connection has been restored.");
   }
 }
 
@@ -1679,7 +1703,8 @@ static LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wparam, LPA
         HMENU menu = CreatePopupMenu();
         AppendMenuW(menu, MF_STRING, ID_OPEN, L"Open ETL");
         AppendMenuW(menu, MF_STRING | (stopping ? MF_GRAYED : 0), ID_CONNECT,
-          stopping ? L"Stopping" : connectionExists() ? L"Disconnect" : form.fullMode ? L"Start full mode" : L"Start proxy");
+          stopping ? L"Stopping" : connectionExists() ? L"Disconnect" : form.mode == DesktopMode::Full ? L"Start full mode" :
+            form.mode == DesktopMode::Selective ? L"Start selective" : L"Start proxy");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING, ID_EXIT, L"Exit");
         SetForegroundWindow(window);
@@ -1703,9 +1728,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
   if (!argv) return 1;
   // The watchdog needs no Winsock initialization or GUI/service startup.
-  if ((argc == 4 || argc == 5) && std::wstring(argv[1]) == L"--vpn-guard") {
+  if (argc >= 4 && argc <= 6 && std::wstring(argv[1]) == L"--vpn-guard") {
     return etlvpn::runGuard(argv[2], std::wcstoul(argv[3], nullptr, 10),
-      argc == 5 ? argv[4] : L"");
+      argc >= 5 ? argv[4] : L"", argc == 6 ? std::wcstoul(argv[5], nullptr, 10) : 0);
   }
   WSADATA data;
   if (WSAStartup(MAKEWORD(2, 2), &data)) { LocalFree(argv); return 1; }
@@ -1764,6 +1789,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   const bool previewFull = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-full";
   const bool previewFullActive = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-full-active";
   const bool previewFullDns = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-full-dns";
+  const bool previewSelective = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-selective";
   const bool previewConnecting = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-connecting";
   const bool previewStopping = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-stopping";
   const bool previewActive = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-active";
@@ -1771,7 +1797,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   const bool previewUpdate = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-update";
   const bool previewDownloading = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-downloading";
   const bool previewUpdateError = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-update-error";
-  const std::wstring previewPath = argc == 3 && (std::wstring(argv[1]) == L"--self-test-ui" || previewOptions || previewActive || previewFull || previewFullActive || previewFullDns || previewConnecting || previewStopping || previewServers || previewServersMany || previewServersEmpty || previewLongServer || previewAgentExport ||
+  const std::wstring previewPath = argc == 3 && (std::wstring(argv[1]) == L"--self-test-ui" || previewOptions || previewActive || previewFull || previewFullActive || previewFullDns || previewSelective || previewConnecting || previewStopping || previewServers || previewServersMany || previewServersEmpty || previewLongServer || previewAgentExport ||
     previewError || previewUpdate || previewDownloading || previewUpdateError || previewReduced) ? argv[2] : L"";
   if (argc == 2 && std::wstring(argv[1]) == L"--self-test-token-storage") {
     std::string original(64, 'a'), restored;
@@ -1806,6 +1832,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
       }
       else if (name == L"--port") { if (!portValue(value, c.localPort)) return 21; }
       else if (name == L"--vpn") { c.vpn = value == L"1"; }
+      else if (name == L"--vpn-selective") { if (value != L"0" && value != L"1") return 20; c.selective = value == L"1"; }
       else if (name == L"--vpn-scope") {
         c.vpnScope = value;
         if (value.empty() || value.size() > 15 ||
@@ -1814,6 +1841,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
       }
       else return 22;
     }
+    // Selective and scoped are layouts of the TUN mode and exclude each other.
+    if ((c.selective || !c.vpnScope.empty()) && !c.vpn) return 20;
+    if (c.selective && !c.vpnScope.empty()) return 20;
     if (c.vpn && !etlvpn::isElevated()) {
       // The UAC consent copies the whole headless command line verbatim.
       std::wstring arguments;
@@ -1843,7 +1873,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
       result = 4;
     }
     if (!result && c.vpn) {
-      if (!vpn.start(c.localPort, plan, c.vpnScope, error)) result = 4;
+      const auto layout = c.selective ? etlvpn::VpnLayout::Selective :
+        c.vpnScope.empty() ? etlvpn::VpnLayout::Full : etlvpn::VpnLayout::Scoped;
+      if (!vpn.start(c.localPort, plan, layout, c.vpnScope, error)) result = 4;
       if (!result && fallbackDisabled) etlvpn::checkpoint("vpn-fallback-disabled");
     }
     // The global Service destructor must never see joinable threads.
@@ -1855,11 +1887,16 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     }
     if (c.vpn) {
       etlvpn::TunnelWatch watch(std::chrono::steady_clock::now());
+      etlvpn::SelectiveScanner scanner(plan.server);
       while (vpn.status().active) {
         bool keep = !vpn.waitEngine(0);
+        if (keep && c.selective) {
+          for (const uint32_t address : scanner.scan())
+            if (vpn.routeDestination(address)) fwprintf(stderr, L"Routing %hs through ETL.\n", etlvpn::ipv4Text(address).c_str());
+        }
         if (keep && watch.due(std::chrono::steady_clock::now())) {
           etlvpn::HealthReport report;
-          if (c.vpnScope.empty()) report = vpn.health();
+          if (c.vpnScope.empty() && !c.selective) report = vpn.health();
           else report.tunnel = report.dns = service.checkTunnel();
           keep = watch.record(report, std::chrono::steady_clock::now());
         }
@@ -1878,7 +1915,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   }
   for (int i = 1; i < argc; ++i) {
     const std::wstring name = argv[i];
-    if (name == L"--vpn" || name == L"--vpn-scope") {
+    if (name == L"--vpn" || name == L"--vpn-scope" || name == L"--vpn-selective") {
       fwprintf(stderr, L"%ls requires --headless as the first argument.\n", argv[i]);
       LocalFree(argv); WSACleanup(); return 22;
     }
@@ -1934,10 +1971,16 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
       state.activeServer = "gateway.research.build-workers.production.cluster.eu-central-1.example.com";
       renderPreview(state);
     }
-    if (previewFull || previewFullActive || previewFullDns || previewConnecting || previewStopping) {
-      form.fullMode = true;
+    if (previewSelective) {
+      form.mode = DesktopMode::Selective;
       DesktopState state{};
-      state.fullMode = true; state.running = previewFullActive || previewFullDns;
+      state.mode = DesktopMode::Selective; state.running = true; state.routed = 2; state.sessions = 8;
+      renderPreview(state);
+    }
+    if (previewFull || previewFullActive || previewFullDns || previewConnecting || previewStopping) {
+      form.mode = DesktopMode::Full;
+      DesktopState state{};
+      state.mode = DesktopMode::Full; state.running = previewFullActive || previewFullDns;
       state.dnsBypassed = previewFullDns;
       state.starting = previewConnecting; state.stopping = previewStopping;
       renderPreview(state);
@@ -2021,10 +2064,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
       state.running = full.phase == SessionPhase::Running;
       state.starting = full.phase == SessionPhase::Starting;
       state.stopping = stopping || full.phase == SessionPhase::Stopping;
-      state.fullMode = true;
+      state.mode = desktopMode(activeConfig);
       state.sessions = full.sessions; state.sent = full.sent;
       state.received = full.received; state.failures = full.failures;
-      state.dnsBypassed = full.dnsBypassed;
+      state.dnsBypassed = full.dnsBypassed; state.routed = full.routed;
     }
     if (updater) state.update = updater->snapshot();
     switch (desktop.render(form, state)) {

@@ -313,6 +313,18 @@ test('native client rejects a trailing headless option',
   assert.throws(() => execFileSync(executable, ['--headless', '--server'], { windowsHide: true }), e => e.status === 22);
 });
 
+test('native client validates the Selective layout options before elevating',
+  { skip: !executable || process.platform !== 'win32' }, () => {
+  const status = args => { try { execFileSync(executable, args, { windowsHide: true }); return 0; } catch (e) { return e.status; } };
+  assert.equal(status(['--vpn-selective', '1']), 22, 'Selective must require --headless');
+  assert.equal(status(['--headless', '--server', 'localhost', '--vpn-selective', '1']), 20,
+    'Selective must require --vpn 1');
+  assert.equal(status(['--headless', '--server', 'localhost', '--vpn', '1', '--vpn-selective', '2']), 20,
+    'Selective takes 0 or 1');
+  assert.equal(status(['--headless', '--server', 'localhost', '--vpn', '1', '--vpn-selective', '1',
+    '--vpn-scope', '192.0.2.1']), 20, 'Selective and a fixed scope exclude each other');
+});
+
 test('native desktop renders compact frames and animates expansion and collapse without starting a proxy',
   { skip: !executable || process.platform !== 'win32', timeout: 30000 }, () => {
   const dir = mkdtempSync(join(tmpdir(), 'etl-ui-'));
@@ -323,7 +335,7 @@ test('native desktop renders compact frames and animates expansion and collapse 
       '--self-test-ui-connecting', '--self-test-ui-stopping', '--self-test-ui-reduced',
       '--self-test-ui-servers', '--self-test-ui-agent-export',
       '--self-test-ui-servers-many', '--self-test-ui-long-server',
-      '--self-test-ui-servers-empty', '--self-test-ui-full-dns'].map((flag, index) => {
+      '--self-test-ui-servers-empty', '--self-test-ui-full-dns', '--self-test-ui-selective'].map((flag, index) => {
       const path = join(dir, `preview-${index}.bmp`);
       execFileSync(executable, [flag, path], { windowsHide: true, timeout: 8000 });
       const bitmap = readFileSync(path);
@@ -359,6 +371,7 @@ test('native desktop renders compact frames and animates expansion and collapse 
     assert.equal(heights[15], heights[6], 'long hostnames and large traffic totals should not change the active layout');
     assert.ok(heights[16] < heights[12], 'a profile without agents should not leave empty server rows');
     assert.ok(heights[17] > heights[8], 'the DNS notice should expand the active Full mode window');
+    assert.ok(heights[18] > heights[8], 'Selective should report its routed relays below the counters');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
