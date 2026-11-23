@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.7.1 (2026-11-23)
+
+- Keep Selective mode running when the ETL server stops answering. It used Full
+  mode's rule and ended with "Tunnel lost. Your normal connection has been
+  restored." after three failed server checks, although Selective never takes
+  the normal connection away; a short outage on the network was enough. Selective
+  now fails open: it withdraws its relay routes, so Twingate uses the normal
+  network (no worse than without ETL), shows "Reconnecting", and resumes routing
+  by itself when the server answers. Only a tunnel engine exit ends it.
+- Record why a server check failed (connect, TLS or authentication, failed or
+  timed out, with the elapsed time) as `health-server-failed` in the runtime log.
+  Selective checks use the configured connect timeout (default five seconds)
+  instead of three seconds.
+- Selective no longer pins a host route to the server; only Full mode needs it.
+  This avoids a stale route when the gateway changes.
+
 ## 0.7.0 (2026-11-23)
 
 - Add **Selective** mode to the Windows client, between Proxy only and Full mode.
