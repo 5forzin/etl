@@ -87,6 +87,31 @@ static void watchPolicy() {
   require(etlvpn::TunnelWatch(start).dnsViaTunnel(), "DNS was reported blocked before the first check");
 }
 
+// The reported bug: Selective ended with "Tunnel lost" after a few failed
+// server checks. It must pause and resume instead, and never ask to stop.
+static void selectiveHealthPolicy() {
+  using namespace std::chrono_literals;
+  using Change = etlvpn::SelectiveHealth::Change;
+  const auto start = etlvpn::SelectiveHealth::Clock::now();
+  etlvpn::SelectiveHealth health(start);
+  require(!health.due(start + 2s) && health.due(start + 3s), "Selective checked before the startup grace");
+  auto at = start + 3s;
+  require(health.record(false, at) == Change::None && health.record(false, at += 2s) == Change::None,
+    "Isolated server failures paused Selective");
+  require(health.record(true, at += 2s) == Change::None && !health.paused(), "A recovery left Selective paused");
+  require(health.record(false, at += 4s) == Change::None && health.record(false, at += 2s) == Change::None,
+    "Failures before a recovery were not forgotten");
+  require(health.record(false, at += 2s) == Change::Pause && health.paused(),
+    "Consecutive server failures did not pause Selective");
+  for (int i = 0; i < 50; ++i)
+    require(health.record(false, at += 2s) == Change::None && health.paused(),
+      "A long outage stopped or re-paused Selective");
+  require(health.due(at + 2s), "A paused Selective stopped retrying the server");
+  require(health.record(true, at += 2s) == Change::Resume && !health.paused(),
+    "Selective did not resume when the server answered");
+  require(health.record(true, at += 4s) == Change::None, "A healthy server resumed Selective twice");
+}
+
 static uint32_t ip(const char* text) {
   in_addr value{};
   require(inet_pton(AF_INET, text, &value) == 1, "Invalid fixture address");
@@ -124,6 +149,7 @@ int main() {
   try {
     watchPolicy();
     selectivePolicy();
+    selectiveHealthPolicy();
     require(exchange(Reply::Valid), "Healthy DNS relay rejected");
     require(!exchange(Reply::WrongId), "Unrelated DNS reply accepted");
     require(!exchange(Reply::Truncated), "Truncated relay reply accepted");

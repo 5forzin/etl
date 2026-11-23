@@ -339,7 +339,7 @@ void checkpoint(const char* step) {
   if (out) out << step << "\n";
 }
 
-static void checkpoint(const char* step, const std::string& detail) {
+void checkpoint(const char* step, const std::string& detail) {
   std::ofstream out(runtimeDirectory() / L"error.log", std::ios::app);
   if (out) out << step << ": " << detail << "\n";
 }
@@ -578,8 +578,9 @@ int runGuard(const std::wstring& server, unsigned long parentPid,
     CloseHandle(watched);
   }
   guardLog("awake parent=" + std::to_string(parentPid));
-  bool removed = false;
-  for (int attempt = 1; attempt <= 2; ++attempt) {
+  // "-" means the session pinned no server route (Selective layout).
+  bool removed = server == L"-";
+  for (int attempt = 1; attempt <= 2 && !removed; ++attempt) {
     std::string error;
     if (runCommand(L"route delete " + server, &error)) { removed = true; break; }
     guardLog("Route delete attempt " + std::to_string(attempt) + ": " + error);
@@ -621,29 +622,35 @@ bool Vpn::start(int localPort, const RoutePlan& plan, VpnLayout layout,
     // Only an interface whose weak host send is off is changed (and restored);
     // the guard learns about it before anything is modified.
     const unsigned long weakHostInterface = weakHostSendEnabled(plan.interfaceIndex) ? 0 : plan.interfaceIndex;
+    // Selective never routes the server's address into the tunnel (it is
+    // excluded from the candidates), so it pins no host route and survives a
+    // change of gateway without a stale route to the server.
+    const bool pinServer = layout != VpnLayout::Selective;
     HANDLE guard = nullptr;
-    if (!spawnGuard(serverIp, weakHostInterface, guard)) {
+    if (!spawnGuard(pinServer ? serverIp : L"-", weakHostInterface, guard)) {
       error = L"Restoration guard could not be armed."; return false;
     }
     guard_ = guard;
     checkpoint("guard");
     // The engine must reach the ETL server outside the tunnel, so the host
     // route goes in before anything points at the adapter.
-    std::wstring hostRoute(L"route add ");
-    hostRoute.append(serverIp);
-    hostRoute.append(L" mask 255.255.255.255 ");
-    if (gateway.empty()) hostRoute.append(std::to_wstring(plan.interfaceIndex));
-    else {
-      hostRoute.append(gateway);
-      hostRoute.append(L" if ");
-      hostRoute.append(std::to_wstring(plan.interfaceIndex));
+    if (pinServer) {
+      std::wstring hostRoute(L"route add ");
+      hostRoute.append(serverIp);
+      hostRoute.append(L" mask 255.255.255.255 ");
+      if (gateway.empty()) hostRoute.append(std::to_wstring(plan.interfaceIndex));
+      else {
+        hostRoute.append(gateway);
+        hostRoute.append(L" if ");
+        hostRoute.append(std::to_wstring(plan.interfaceIndex));
+      }
+      checkpoint("host-route");
+      if (!runCommand(hostRoute)) {
+        stop();
+        error = L"Server host route could not be installed."; return false;
+      }
+      serverRoute_ = serverIp;
     }
-    checkpoint("host-route");
-    if (!runCommand(hostRoute)) {
-      stop();
-      error = L"Server host route could not be installed."; return false;
-    }
-    serverRoute_ = serverIp;
     checkpoint("job");
     HANDLE job = CreateJobObjectW(nullptr, nullptr);
     if (!job) {
@@ -775,17 +782,45 @@ bool Vpn::start(int localPort, const RoutePlan& plan, VpnLayout layout,
 
 bool Vpn::routeDestination(uint32_t address) {
   if (layout_ != VpnLayout::Selective || !selectiveAdapter_ || !publicIpv4(address)) return false;
-  const std::wstring ip = widen(ipv4Text(address));
-  if (ip.empty() || std::find(selectiveRoutes_.begin(), selectiveRoutes_.end(), ip) != selectiveRoutes_.end()) return false;
+  if (std::find(selectiveRoutes_.begin(), selectiveRoutes_.end(), address) != selectiveRoutes_.end()) return false;
   std::string error;
-  if (!runCommand(L"route add " + ip + L" mask 255.255.255.255 " + kTunAddress +
+  if (!runCommand(L"route add " + widen(ipv4Text(address)) + L" mask 255.255.255.255 " + kTunAddress +
       L" metric 1 if " + std::to_wstring(selectiveAdapter_), &error)) {
     checkpoint("selective-route-failed", ipv4Text(address) + " " + error);
     return false;
   }
-  selectiveRoutes_.push_back(ip);
+  selectiveRoutes_.push_back(address);
   checkpoint("selective-route", ipv4Text(address));
   return true;
+}
+
+// A route whose gateway is the adapter's own address is stored on-link (next
+// hop 0.0.0.0), so `route delete <ip> mask ... 198.18.0.1` matches nothing and
+// fails silently. Delete the exact /32 row on the adapter instead.
+static bool deleteHostRoute(uint32_t address, unsigned long interfaceIndex) {
+  PMIB_IPFORWARD_TABLE2 table = nullptr;
+  if (GetIpForwardTable2(AF_INET, &table) != NO_ERROR || !table) return false;
+  bool deleted = false;
+  for (ULONG i = 0; i < table->NumEntries; ++i) {
+    MIB_IPFORWARD_ROW2& row = table->Table[i];
+    if (row.InterfaceIndex == interfaceIndex && row.DestinationPrefix.PrefixLength == 32 &&
+        row.DestinationPrefix.Prefix.si_family == AF_INET &&
+        row.DestinationPrefix.Prefix.Ipv4.sin_addr.s_addr == address &&
+        DeleteIpForwardEntry2(&row) == NO_ERROR) deleted = true;
+  }
+  FreeMibTable(table);
+  return deleted;
+}
+
+void Vpn::withdrawDestinations() {
+  if (selectiveRoutes_.empty()) return;
+  size_t deleted = 0;
+  for (const uint32_t address : selectiveRoutes_) {
+    if (deleteHostRoute(address, selectiveAdapter_)) ++deleted;
+    else checkpoint("selective-withdraw-failed", ipv4Text(address));
+  }
+  checkpoint("selective-withdrawn", std::to_string(deleted) + "/" + std::to_string(selectiveRoutes_.size()));
+  selectiveRoutes_.clear();
 }
 
 static void stopGuard(void*& guard) {
@@ -801,8 +836,7 @@ static void stopGuard(void*& guard) {
 void Vpn::stop() {
   if (!job_ && !process_ && !guard_ && serverRoute_.empty() && scopeRoute_.empty() &&
       !mapDnsRoute_ && !fullAdapter_ && selectiveRoutes_.empty() && !physicalWeakHost_) return;
-  for (const auto& route : selectiveRoutes_) runCommand(L"route delete " + route + L" mask 255.255.255.255 " + kTunAddress);
-  selectiveRoutes_.clear();
+  withdrawDestinations();
   selectiveAdapter_ = 0;
   layout_ = VpnLayout::Full;
   if (physicalWeakHost_) {

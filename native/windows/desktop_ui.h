@@ -37,6 +37,7 @@ struct DesktopState {
   // firewall blocks UDP 53); connections still use ETL.
   bool dnsBypassed = false;
   int routed = 0;  // Selective: destinations currently routed through ETL
+  bool paused = false;  // Selective: ETL server unreachable, Twingate on the normal network
   int sessions = 0;
   uint64_t sent = 0, received = 0, failures = 0;
   std::string error;

@@ -11,6 +11,7 @@ struct SessionSnapshot {
   uint64_t sent = 0, received = 0, failures = 0;
   bool dnsBypassed = false;
   int routed = 0;
+  bool paused = false;
   std::string error;
 };
 
@@ -48,6 +49,7 @@ class FullSessionWorker {
   // True when the tunnel works but system DNS cannot reach its mapped DNS.
   void dnsBypassed(bool bypassed);
   void routed(int destinations);  // Selective: destinations routed through the tunnel
+  void paused(bool serverUnreachable);  // Selective: routes withdrawn until the server answers
   ~FullSessionWorker();
  private:
   HANDLE parent_ = nullptr, mapping_ = nullptr, stop_ = nullptr;

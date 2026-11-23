@@ -362,7 +362,8 @@ DesktopAction DesktopUi::render(DesktopForm& form, const DesktopState& state, fl
 
   if (!options_ && !servers_) {
     const char* status = state.stopping ? "Disconnecting" : state.starting ? "Connecting" :
-      state.running ? (state.mode == DesktopMode::Proxy ? "Proxy active" : "Connected") : "Disconnected";
+      state.running ? (state.mode == DesktopMode::Proxy ? "Proxy active" : state.paused ? "Reconnecting" : "Connected") :
+      "Disconnected";
     ImGui::PushFont(heading); ImGui::TextUnformatted(status); ImGui::PopFont();
     const auto statusPosition = ImGui::GetCursorScreenPos();
     if (state.running) {
@@ -593,7 +594,9 @@ DesktopAction DesktopUi::render(DesktopForm& form, const DesktopState& state, fl
   if (!options_ && !servers_ && state.running && state.mode == DesktopMode::Selective) {
     ImGui::Dummy({0, 6});
     ImGui::PushStyleColor(ImGuiCol_Text, muted);
-    if (state.routed > 0) ImGui::TextWrapped("%d Twingate relay %s routed through ETL.", state.routed,
+    if (state.paused) ImGui::TextWrapped("The ETL server is not answering. Twingate uses the normal network "
+      "until it does; routing resumes automatically.");
+    else if (state.routed > 0) ImGui::TextWrapped("%d Twingate relay %s routed through ETL.", state.routed,
       state.routed == 1 ? "address" : "addresses");
     else ImGui::TextWrapped("Waiting for blocked Twingate relay connections.");
     ImGui::PopStyleColor();

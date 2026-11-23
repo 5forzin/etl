@@ -57,6 +57,30 @@ class TunnelWatch {
   bool dnsViaTunnel_ = true;  // unknown until the first check; never warn early
 };
 
+// Selective mode never takes the normal connection away, so an unreachable ETL
+// server is no reason to stop it. Instead it fails open: after the same run of
+// failed checks that ends Full mode it pauses (its relay routes are withdrawn,
+// so Twingate falls back to the normal network, no worse than without ETL) and
+// it resumes as soon as the server answers again.
+class SelectiveHealth {
+ public:
+  enum class Change { None, Pause, Resume };
+  using Clock = TunnelWatch::Clock;
+  explicit SelectiveHealth(Clock::time_point started) : watch_(started) {}
+  bool due(Clock::time_point now) const { return watch_.due(now); }
+  Change record(bool serverReachable, Clock::time_point now) {
+    const bool up = watch_.record({serverReachable, true}, now);
+    if (!up && !paused_) { paused_ = true; return Change::Pause; }
+    if (up && paused_) { paused_ = false; return Change::Resume; }
+    return Change::None;
+  }
+  bool paused() const { return paused_; }
+
+ private:
+  TunnelWatch watch_;
+  bool paused_ = false;
+};
+
 struct RoutePlan {
   std::string server;
   std::string gateway;
@@ -66,6 +90,7 @@ struct RoutePlan {
 
 RoutePlan planRoutes(const std::wstring& server);
 void checkpoint(const char* step);
+void checkpoint(const char* step, const std::string& detail);
 
 // Selective mode routes only the destinations that listed applications cannot
 // reach directly. Twingate opens its relay connections on TCP ports that
@@ -86,6 +111,8 @@ class SelectiveScanner {
   // Destinations seen for the first time since the previous scan.
   std::vector<uint32_t> scan();
   size_t routed() const { return seen_.size(); }
+  // Forget every destination, so they are offered again after a pause.
+  void reset() { seen_.clear(); }
 
  private:
   bool matches(unsigned long pid);
@@ -112,6 +139,9 @@ class Vpn {
   // Selective layout only: send one more destination (network byte order)
   // through the tunnel. Returns false if it is not routable or already routed.
   bool routeDestination(uint32_t address);
+  // Selective layout only: remove every routed destination (pause).
+  void withdrawDestinations();
+  int routedDestinations() const { return static_cast<int>(selectiveRoutes_.size()); }
   // Returns true on engine exit or wait failure; logs the reason for teardown.
   bool waitEngine(unsigned long timeoutMs) const;
   HealthReport health() const;
@@ -131,7 +161,7 @@ class Vpn {
   mutable int dnsState_ = -1;   // last mapped-DNS result, so transitions are logged once
   VpnLayout layout_ = VpnLayout::Full;
   unsigned long selectiveAdapter_ = 0;
-  std::vector<std::wstring> selectiveRoutes_;
+  std::vector<uint32_t> selectiveRoutes_;  // network byte order
   unsigned long physicalWeakHost_ = 0;  // interface whose weak host send to restore
 };
 

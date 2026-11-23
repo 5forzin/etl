@@ -335,7 +335,8 @@ test('native desktop renders compact frames and animates expansion and collapse 
       '--self-test-ui-connecting', '--self-test-ui-stopping', '--self-test-ui-reduced',
       '--self-test-ui-servers', '--self-test-ui-agent-export',
       '--self-test-ui-servers-many', '--self-test-ui-long-server',
-      '--self-test-ui-servers-empty', '--self-test-ui-full-dns', '--self-test-ui-selective'].map((flag, index) => {
+      '--self-test-ui-servers-empty', '--self-test-ui-full-dns', '--self-test-ui-selective',
+      '--self-test-ui-selective-paused'].map((flag, index) => {
       const path = join(dir, `preview-${index}.bmp`);
       execFileSync(executable, [flag, path], { windowsHide: true, timeout: 8000 });
       const bitmap = readFileSync(path);
@@ -372,6 +373,7 @@ test('native desktop renders compact frames and animates expansion and collapse 
     assert.ok(heights[16] < heights[12], 'a profile without agents should not leave empty server rows');
     assert.ok(heights[17] > heights[8], 'the DNS notice should expand the active Full mode window');
     assert.ok(heights[18] > heights[8], 'Selective should report its routed relays below the counters');
+    assert.ok(heights[19] > heights[18], 'a paused Selective should explain that Twingate uses the normal network');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

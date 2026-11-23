@@ -884,10 +884,12 @@ class Service {
   uint64_t received() const { return received_; }
   uint64_t failures() const { return failures_; }
 
-  bool checkTunnel() {
+  // Authenticates once without opening a stream. `failure` receives the stage
+  // that failed and the elapsed time, for the runtime log.
+  bool checkTunnel(std::string* failure = nullptr, int timeoutMs = 3000) {
     SOCKET remote = INVALID_SOCKET;
     SSL* ssl = nullptr;
-    const bool ok = openTunnel(false, remote, ssl, false, 3000);
+    const bool ok = openTunnel(false, remote, ssl, false, timeoutMs, failure);
     closeTunnel(remote, ssl);
     return ok;
   }
@@ -904,15 +906,22 @@ class Service {
   }
 
   bool openTunnel(bool fallback, SOCKET& remote, SSL*& ssl, bool udpSession = false,
-                   int timeoutMs = 0) {
+                   int timeoutMs = 0, std::string* failure = nullptr) {
     const auto& endpoint = fallback ? config_.fallbackServer : config_.server;
     const int endpointPort = fallback ? config_.fallbackPort : config_.serverPort;
-    const auto deadline = ConnectClock::now() + std::chrono::milliseconds(
+    const auto started = ConnectClock::now();
+    const auto deadline = started + std::chrono::milliseconds(
       timeoutMs ? std::min(timeoutMs, config_.connectTimeoutMs) : config_.connectTimeoutMs);
+    enum Step { Connect, Tls, Auth } step = Connect;
+    auto report = [&](bool timeout) {
+      static const char* const names[]{"connect", "tls", "auth"};
+      if (failure) *failure = std::string(names[step]) + (timeout ? " timeout" : " failed") + " after " +
+        std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(ConnectClock::now() - started).count()) + " ms";
+    };
     remote = !fallback && !config_.vpnServerIp.empty() ?
       connectPinned(config_.vpnServerIp, endpointPort, running_, deadline) :
       connectServer(endpoint, endpointPort, running_, deadline);
-    if (remote == INVALID_SOCKET) return false;
+    if (remote == INVALID_SOCKET) { report(ConnectClock::now() >= deadline); return false; }
     {
       std::lock_guard<std::mutex> lock(mu_);
       if (!running_) { closesocket(remote); remote = INVALID_SOCKET; return false; }
@@ -935,6 +944,7 @@ class Service {
       });
     } catch (...) { closeTunnel(remote, ssl); return false; }
     bool ok = false;
+    step = Tls;
     try {
       ssl = SSL_new(ctx_);
       if (ssl) {
@@ -943,6 +953,7 @@ class Service {
             SSL_set_tlsext_host_name(ssl, server.c_str()) == 1 &&
             SSL_set1_host(ssl, server.c_str()) == 1 &&
             SSL_connect(ssl) == 1 && SSL_get_verify_result(ssl) == X509_V_OK) {
+          step = Auth;
           std::string token;
           if (tokenForConfig(config_, token, fallback)) {
             std::string auth;
@@ -962,7 +973,10 @@ class Service {
     attemptWake.notify_one();
     guard.join();
     ok = ok && !timedOut && running_ && ConnectClock::now() < deadline;
-    if (!ok) closeTunnel(remote, ssl);
+    if (!ok) {
+      report(timedOut || ConnectClock::now() >= deadline);
+      closeTunnel(remote, ssl);
+    }
     return ok;
   }
 
@@ -1410,7 +1424,8 @@ static bool connectionExists() { return service.running() || fullSession.exists(
 static void updateStatus(HWND) {
   const wchar_t* status = stopping ? L"ETL - stopping" : fullSession.exists() ?
     (fullSession.snapshot().phase != SessionPhase::Running ? L"ETL - connecting" :
-      activeConfig.selective ? L"ETL - selective active" : L"ETL - full mode active") :
+      !activeConfig.selective ? L"ETL - full mode active" :
+      fullSession.snapshot().paused ? L"ETL - selective reconnecting" : L"ETL - selective active") :
     service.running() ? L"ETL - proxy active" : L"ETL - off";
   wcscpy_s(tray.szTip, status);
   Shell_NotifyIconW(NIM_MODIFY, &tray);
@@ -1594,22 +1609,35 @@ static int runDesktopFull(const std::wstring& id, DWORD parent) {
     if (!vpn.start(next.localPort, plan, layout, L"", error)) return finish(utf8(error));
     if (session.wait(0)) return finish("");
     session.publish(SessionPhase::Running);
+    if (next.selective) {
+      etlvpn::SelectiveHealth health(std::chrono::steady_clock::now());
+      etlvpn::SelectiveScanner scanner(plan.server);
+      while (!session.wait(200)) {
+        session.traffic(service.sessions(), service.sent(), service.received(), service.failures());
+        if (vpn.waitEngine(0)) return finish("Selective mode stopped: the tunnel engine exited. Twingate is using the normal network.");
+        if (!health.paused()) for (const uint32_t address : scanner.scan()) vpn.routeDestination(address);
+        session.routed(vpn.routedDestinations());
+        if (!health.due(std::chrono::steady_clock::now())) continue;
+        std::string failure;
+        const bool reachable = service.checkTunnel(&failure, next.connectTimeoutMs);
+        if (!reachable) etlvpn::checkpoint("health-server-failed", failure);
+        switch (health.record(reachable, std::chrono::steady_clock::now())) {
+          case etlvpn::SelectiveHealth::Change::Pause:
+            etlvpn::checkpoint("selective-paused");
+            vpn.withdrawDestinations(); scanner.reset(); session.paused(true); break;
+          case etlvpn::SelectiveHealth::Change::Resume:
+            etlvpn::checkpoint("selective-resumed"); session.paused(false); break;
+          case etlvpn::SelectiveHealth::Change::None: break;
+        }
+      }
+      return finish("");
+    }
     etlvpn::TunnelWatch watch(std::chrono::steady_clock::now());
-    etlvpn::SelectiveScanner scanner(plan.server);
-    int routed = 0;
     while (!session.wait(200)) {
       session.traffic(service.sessions(), service.sent(), service.received(), service.failures());
       if (vpn.waitEngine(0)) return finish("Tunnel lost. Your normal connection has been restored.");
-      if (next.selective) {
-        for (const uint32_t address : scanner.scan()) if (vpn.routeDestination(address)) ++routed;
-        session.routed(routed);
-      }
       if (!watch.due(std::chrono::steady_clock::now())) continue;
-      // Selective leaves system DNS alone, so only the ETL session is checked.
-      etlvpn::HealthReport report;
-      if (next.selective) report.tunnel = report.dns = service.checkTunnel();
-      else report = vpn.health();
-      const bool keep = watch.record(report, std::chrono::steady_clock::now());
+      const bool keep = watch.record(vpn.health(), std::chrono::steady_clock::now());
       session.dnsBypassed(!watch.dnsViaTunnel());
       if (!keep) return finish("Tunnel lost. Your normal connection has been restored.");
     }
@@ -1790,6 +1818,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   const bool previewFullActive = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-full-active";
   const bool previewFullDns = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-full-dns";
   const bool previewSelective = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-selective";
+  const bool previewSelectivePaused = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-selective-paused";
   const bool previewConnecting = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-connecting";
   const bool previewStopping = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-stopping";
   const bool previewActive = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-active";
@@ -1797,7 +1826,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   const bool previewUpdate = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-update";
   const bool previewDownloading = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-downloading";
   const bool previewUpdateError = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-update-error";
-  const std::wstring previewPath = argc == 3 && (std::wstring(argv[1]) == L"--self-test-ui" || previewOptions || previewActive || previewFull || previewFullActive || previewFullDns || previewSelective || previewConnecting || previewStopping || previewServers || previewServersMany || previewServersEmpty || previewLongServer || previewAgentExport ||
+  const std::wstring previewPath = argc == 3 && (std::wstring(argv[1]) == L"--self-test-ui" || previewOptions || previewActive || previewFull || previewFullActive || previewFullDns || previewSelective || previewSelectivePaused || previewConnecting || previewStopping || previewServers || previewServersMany || previewServersEmpty || previewLongServer || previewAgentExport ||
     previewError || previewUpdate || previewDownloading || previewUpdateError || previewReduced) ? argv[2] : L"";
   if (argc == 2 && std::wstring(argv[1]) == L"--self-test-token-storage") {
     std::string original(64, 'a'), restored;
@@ -1885,18 +1914,39 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
       fwprintf(stderr, L"%ls\n", error.c_str());
       LocalFree(argv); WSACleanup(); return result;
     }
+    if (c.vpn && c.selective) {
+      // Selective fails open (see etlvpn::SelectiveHealth): only an engine exit ends it.
+      etlvpn::SelectiveHealth health(std::chrono::steady_clock::now());
+      etlvpn::SelectiveScanner scanner(plan.server);
+      while (!vpn.waitEngine(500)) {
+        if (!health.paused()) for (const uint32_t address : scanner.scan())
+          if (vpn.routeDestination(address)) fwprintf(stderr, L"Routing %hs through ETL.\n", etlvpn::ipv4Text(address).c_str());
+        if (!health.due(std::chrono::steady_clock::now())) continue;
+        std::string failure;
+        const bool reachable = service.checkTunnel(&failure, c.connectTimeoutMs);
+        if (!reachable) etlvpn::checkpoint("health-server-failed", failure);
+        const auto change = health.record(reachable, std::chrono::steady_clock::now());
+        if (change == etlvpn::SelectiveHealth::Change::Pause) {
+          etlvpn::checkpoint("selective-paused");
+          vpn.withdrawDestinations(); scanner.reset();
+          fwprintf(stderr, L"ETL server unreachable; relay routes withdrawn until it answers.\n");
+        } else if (change == etlvpn::SelectiveHealth::Change::Resume) {
+          etlvpn::checkpoint("selective-resumed");
+          fwprintf(stderr, L"ETL server reachable again; routing resumed.\n");
+        }
+      }
+      vpn.stop();
+      fwprintf(stderr, L"Tunnel engine exited; Selective mode stopped.\n");
+      service.stop();
+      LocalFree(argv); WSACleanup(); return 5;
+    }
     if (c.vpn) {
       etlvpn::TunnelWatch watch(std::chrono::steady_clock::now());
-      etlvpn::SelectiveScanner scanner(plan.server);
       while (vpn.status().active) {
         bool keep = !vpn.waitEngine(0);
-        if (keep && c.selective) {
-          for (const uint32_t address : scanner.scan())
-            if (vpn.routeDestination(address)) fwprintf(stderr, L"Routing %hs through ETL.\n", etlvpn::ipv4Text(address).c_str());
-        }
         if (keep && watch.due(std::chrono::steady_clock::now())) {
           etlvpn::HealthReport report;
-          if (c.vpnScope.empty() && !c.selective) report = vpn.health();
+          if (c.vpnScope.empty()) report = vpn.health();
           else report.tunnel = report.dns = service.checkTunnel();
           keep = watch.record(report, std::chrono::steady_clock::now());
         }
@@ -1971,10 +2021,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
       state.activeServer = "gateway.research.build-workers.production.cluster.eu-central-1.example.com";
       renderPreview(state);
     }
-    if (previewSelective) {
+    if (previewSelective || previewSelectivePaused) {
       form.mode = DesktopMode::Selective;
       DesktopState state{};
-      state.mode = DesktopMode::Selective; state.running = true; state.routed = 2; state.sessions = 8;
+      state.mode = DesktopMode::Selective; state.running = true; state.sessions = 8;
+      state.routed = previewSelectivePaused ? 0 : 2; state.paused = previewSelectivePaused;
       renderPreview(state);
     }
     if (previewFull || previewFullActive || previewFullDns || previewConnecting || previewStopping) {
@@ -2067,7 +2118,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
       state.mode = desktopMode(activeConfig);
       state.sessions = full.sessions; state.sent = full.sent;
       state.received = full.received; state.failures = full.failures;
-      state.dnsBypassed = full.dnsBypassed; state.routed = full.routed;
+      state.dnsBypassed = full.dnsBypassed; state.routed = full.routed; state.paused = full.paused;
     }
     if (updater) state.update = updater->snapshot();
     switch (desktop.render(form, state)) {

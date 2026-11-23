@@ -47,14 +47,17 @@ Run `etl-client.exe`, enter the server and token in Settings, then choose a mode
   retransmission goes through ETL. DNS, the default route and every other
   connection stay on the normal network. The app shows how many relay addresses
   it routed. Use it when Twingate's private resources time out on a restrictive
-  network.
+  network. Selective fails open: if the ETL server stops answering three checks
+  in a row, it withdraws its relay routes (Twingate falls back to the normal
+  network), shows "Reconnecting" and resumes once the server answers again. Each
+  failed check is logged as `health-server-failed` with its stage and duration.
 - **Full mode** routes the whole PC through the TUN adapter.
 
 Selective and Full start a separate elevated worker; the desktop and browser
 keep normal user permissions. Both use the selected server; the primary profile's
 backup remains saved for Proxy only. They authenticate before changing routes and
-restore the normal connection after a tunnel failure, Disconnect, Exit or a
-desktop crash. Closing the window hides it in the tray and keeps the selected
+restore the normal connection after Disconnect, Exit or a desktop crash. Full
+mode also restores it after a tunnel failure; Selective pauses instead. Closing the window hides it in the tray and keeps the selected
 mode running.
 
 The borderless window is 400 pixels wide, with a draggable header and custom
@@ -178,8 +181,8 @@ and the desktop worker lifecycle. Worker tests exercise traffic reporting,
 cancellation, errors and parent death without UAC or network route changes.
 
 `--self-test-ui-full`, `--self-test-ui-full-active`, `--self-test-ui-full-dns`, `--self-test-ui-selective`,
-`--self-test-ui-connecting` and `--self-test-ui-stopping` capture the mode selector
-and connection states.
+`--self-test-ui-selective-paused`, `--self-test-ui-connecting` and
+`--self-test-ui-stopping` capture the mode selector and connection states.
 Previews are 32-bit bitmaps with straight alpha: the corners outside the rounded
 window outline are transparent and the outline is anti-aliased, as on screen.
 `--self-test-ui-active` captures the local proxy's traffic counters. These fixtures
@@ -224,7 +227,8 @@ failure, by the restoration guard after a crash, and by a reboot. If weak host
 sends were already enabled, ETL leaves them alone.
 
 `--vpn-selective 1` (with `--vpn 1`) selects the Selective layout in headless
-mode and prints each relay address it routes. It cannot be combined with
+mode and prints each relay address it routes and each pause or resume. It only
+exits (code 5) when the tunnel engine exits. It cannot be combined with
 `--vpn-scope`.
 
 The same check also sends a UDP query to the engine's mapped DNS. That result is
