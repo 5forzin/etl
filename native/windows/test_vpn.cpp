@@ -56,10 +56,41 @@ static bool exchange(Reply reply) {
   return healthy;
 }
 
+static void watchPolicy() {
+  using namespace std::chrono_literals;
+  using Clock = etlvpn::TunnelWatch::Clock;
+  const etlvpn::HealthReport healthy{true, true}, dnsBlocked{true, false}, down{false, false};
+  const auto start = Clock::now();
+
+  etlvpn::TunnelWatch watch(start);
+  require(!watch.due(start + 2s), "Health check ran before the startup grace");
+  require(watch.due(start + 3s), "Health check never became due");
+  auto at = start + 3s;
+  require(watch.record(down, at), "One missed check restored the network");
+  require(watch.due(at + 2s) && !watch.due(at + 1s), "A failing tunnel was not rechecked quickly");
+  require(watch.record(down, at += 2s), "Two missed checks restored the network");
+  require(watch.record(healthy, at += 2s) && watch.failures() == 0, "A recovery did not clear the failures");
+  require(!watch.due(at + 3s) && watch.due(at + 4s), "A healthy tunnel was rechecked too often");
+  require(watch.record(down, at += 4s) && watch.record(down, at += 2s),
+    "Failures before a recovery were not forgotten");
+  require(!watch.record(down, at += 2s), "Consecutive tunnel failures never restored the network");
+
+  // Other VPNs block UDP port 53 outside their own adapter. That must be
+  // reported without ever disconnecting a tunnel that still relays traffic.
+  etlvpn::TunnelWatch filtered(start);
+  at = start + 3s;
+  for (int i = 0; i < 100; ++i, at += 4s)
+    require(filtered.record(dnsBlocked, at), "Blocked UDP DNS disconnected a working tunnel");
+  require(!filtered.dnsViaTunnel(), "Blocked UDP DNS was not reported");
+  require(filtered.record(healthy, at) && filtered.dnsViaTunnel(), "Restored DNS was not reported");
+  require(etlvpn::TunnelWatch(start).dnsViaTunnel(), "DNS was reported blocked before the first check");
+}
+
 int main() {
   WSADATA data{};
   if (WSAStartup(MAKEWORD(2, 2), &data) != 0) return 1;
   try {
+    watchPolicy();
     require(exchange(Reply::Valid), "Healthy DNS relay rejected");
     require(!exchange(Reply::WrongId), "Unrelated DNS reply accepted");
     require(!exchange(Reply::Truncated), "Truncated relay reply accepted");

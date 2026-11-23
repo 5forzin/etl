@@ -16,7 +16,9 @@ while the connection is active and use actual session data.
   requests administrator permission; the desktop and browser remain unelevated.
   The interface reflects connecting, connected, disconnecting and failure states.
   Cancel and Disconnect request cleanup before the worker exits. The existing
-  health checks and restoration guard remain active.
+  health checks and restoration guard remain active. When another VPN or firewall
+  stops system DNS from reaching the tunnel, a muted notice appears below the
+  traffic counters; the connection stays up.
 
 The mode selection slides with exponential easing. Hover and focus transitions
 use a 90 ms time constant; page content fades over 100 ms. Native window height
@@ -38,8 +40,10 @@ An available update expands inline below the main controls. Later dismisses it;
 Update downloads and verifies it before disconnecting and restarting the client.
 Settings contains the current version and a manual update check.
 
-The window has a draggable header, custom minimize/close controls and native
-rounded corners on supported Windows versions. Closing hides it in the tray;
+The window has a draggable header and custom minimize/close controls. It is
+clipped to its 22-pixel rounded outline on every Windows version, so the grey
+border is the edge of the application and the background never shows past it
+(the clipped rim is not anti-aliased). Closing hides it in the tray;
 Exit disconnects before quitting. Errors expand the content instead of covering
 actions. DirectX targets resize before each frame. The window moves upward when
 necessary to remain inside the monitor's work area.

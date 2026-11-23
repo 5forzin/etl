@@ -698,8 +698,14 @@ bool Vpn::waitEngine(unsigned long timeoutMs) const {
   return true;
 }
 
-bool Vpn::healthy() const {
-  if (!fullAdapter_) return false;
+// Opening a session costs one TLS 1.3 handshake plus authentication, about 1.7 s
+// on a typical link here and several seconds when the network stalls, so the
+// deadline leaves wide headroom while TunnelWatch absorbs isolated misses.
+static constexpr unsigned long kRelayProbeMs = 4000;
+
+HealthReport Vpn::health() const {
+  HealthReport report;
+  if (!fullAdapter_) return report;
   for (const char* address : {"1.1.1.1", "142.250.0.1", "100.64.0.1"}) {
     in_addr destination{};
     InetPtonA(AF_INET, address, &destination);
@@ -707,15 +713,26 @@ bool Vpn::healthy() const {
     if (GetBestRoute(destination.s_addr, 0, &route) != NO_ERROR ||
         route.dwForwardIfIndex != fullAdapter_) {
       checkpoint("health-route-failed");
-      return false;
+      return report;
     }
   }
-  if (!probeMappedDns()) { checkpoint("health-dns-failed"); return false; }
   // Independent resolvers avoid disconnecting because one probe provider is
-  // unavailable. These sockets follow the full-mode routes, never a proxy override.
-  if (probeDnsTcp("1.1.1.1", 53, 2000) || probeDnsTcp("8.8.8.8", 53, 2000)) return true;
-  checkpoint("health-relay-failed");
-  return false;
+  // unavailable. These sockets follow the full-mode routes, never a proxy
+  // override. Both run at once, and alongside the UDP check, so a check costs
+  // one deadline rather than several.
+  bool secondRelay = false;
+  std::thread second([&secondRelay] { secondRelay = probeDnsTcp("8.8.8.8", 53, kRelayProbeMs); });
+  const bool firstRelay = probeDnsTcp("1.1.1.1", 53, kRelayProbeMs);
+  report.dns = probeMappedDns();
+  second.join();
+  report.tunnel = firstRelay || secondRelay;
+  if (!report.tunnel) checkpoint("health-relay-failed");
+  const int dnsState = report.dns ? 1 : 0;
+  if (dnsState != dnsState_) {
+    dnsState_ = dnsState;
+    checkpoint(report.dns ? "dns-via-tunnel" : "dns-bypassed");
+  }
+  return report;
 }
 
 VpnStatus Vpn::status() const {

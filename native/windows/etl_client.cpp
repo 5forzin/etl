@@ -1580,18 +1580,14 @@ static int runDesktopFull(const std::wstring& id, DWORD parent) {
     if (!vpn.start(next.localPort, plan, L"", error)) return finish(utf8(error));
     if (session.wait(0)) return finish("");
     session.publish(SessionPhase::Running);
-    unsigned failedChecks = 0;
-    auto nextCheck = std::chrono::steady_clock::now();
+    etlvpn::TunnelWatch watch(std::chrono::steady_clock::now());
     while (!session.wait(200)) {
       session.traffic(service.sessions(), service.sent(), service.received(), service.failures());
-      const bool engineFailed = vpn.waitEngine(0);
-      if (engineFailed || std::chrono::steady_clock::now() >= nextCheck) {
-        const bool healthy = !engineFailed && vpn.healthy();
-        failedChecks = healthy ? 0 : failedChecks + 1;
-        if (engineFailed || failedChecks >= 2)
-          return finish("Tunnel lost. Your normal connection has been restored.");
-        nextCheck = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-      }
+      if (vpn.waitEngine(0)) return finish("Tunnel lost. Your normal connection has been restored.");
+      if (!watch.due(std::chrono::steady_clock::now())) continue;
+      const bool keep = watch.record(vpn.health(), std::chrono::steady_clock::now());
+      session.dnsBypassed(!watch.dnsViaTunnel());
+      if (!keep) return finish("Tunnel lost. Your normal connection has been restored.");
     }
     return finish("");
   } catch (const std::exception&) {
@@ -1767,6 +1763,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   const bool previewAgentExport = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-agent-export";
   const bool previewFull = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-full";
   const bool previewFullActive = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-full-active";
+  const bool previewFullDns = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-full-dns";
   const bool previewConnecting = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-connecting";
   const bool previewStopping = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-stopping";
   const bool previewActive = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-active";
@@ -1774,7 +1771,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   const bool previewUpdate = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-update";
   const bool previewDownloading = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-downloading";
   const bool previewUpdateError = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-update-error";
-  const std::wstring previewPath = argc == 3 && (std::wstring(argv[1]) == L"--self-test-ui" || previewOptions || previewActive || previewFull || previewFullActive || previewConnecting || previewStopping || previewServers || previewServersMany || previewServersEmpty || previewLongServer || previewAgentExport ||
+  const std::wstring previewPath = argc == 3 && (std::wstring(argv[1]) == L"--self-test-ui" || previewOptions || previewActive || previewFull || previewFullActive || previewFullDns || previewConnecting || previewStopping || previewServers || previewServersMany || previewServersEmpty || previewLongServer || previewAgentExport ||
     previewError || previewUpdate || previewDownloading || previewUpdateError || previewReduced) ? argv[2] : L"";
   if (argc == 2 && std::wstring(argv[1]) == L"--self-test-token-storage") {
     std::string original(64, 'a'), restored;
@@ -1857,13 +1854,16 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
       LocalFree(argv); WSACleanup(); return result;
     }
     if (c.vpn) {
-      unsigned int failedChecks = 0;
+      etlvpn::TunnelWatch watch(std::chrono::steady_clock::now());
       while (vpn.status().active) {
-        const bool engineFailed = vpn.waitEngine(0);
-        const bool healthy = !engineFailed &&
-          (c.vpnScope.empty() ? vpn.healthy() : service.checkTunnel());
-        failedChecks = healthy ? 0 : failedChecks + 1;
-        if (engineFailed || failedChecks >= 2) {
+        bool keep = !vpn.waitEngine(0);
+        if (keep && watch.due(std::chrono::steady_clock::now())) {
+          etlvpn::HealthReport report;
+          if (c.vpnScope.empty()) report = vpn.health();
+          else report.tunnel = report.dns = service.checkTunnel();
+          keep = watch.record(report, std::chrono::steady_clock::now());
+        }
+        if (!keep) {
           etlvpn::checkpoint("restoring-network");
           vpn.stop();
           etlvpn::checkpoint("network-restored");
@@ -1871,7 +1871,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
           service.stop();
           LocalFree(argv); WSACleanup(); return 5;
         }
-        if (vpn.waitEngine(2000)) continue;
+        if (vpn.waitEngine(500)) continue;
       }
     }
     while (true) Sleep(1000);
@@ -1934,10 +1934,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
       state.activeServer = "gateway.research.build-workers.production.cluster.eu-central-1.example.com";
       renderPreview(state);
     }
-    if (previewFull || previewFullActive || previewConnecting || previewStopping) {
+    if (previewFull || previewFullActive || previewFullDns || previewConnecting || previewStopping) {
       form.fullMode = true;
       DesktopState state{};
-      state.fullMode = true; state.running = previewFullActive;
+      state.fullMode = true; state.running = previewFullActive || previewFullDns;
+      state.dnsBypassed = previewFullDns;
       state.starting = previewConnecting; state.stopping = previewStopping;
       renderPreview(state);
     }
@@ -2023,6 +2024,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
       state.fullMode = true;
       state.sessions = full.sessions; state.sent = full.sent;
       state.received = full.received; state.failures = full.failures;
+      state.dnsBypassed = full.dnsBypassed;
     }
     if (updater) state.update = updater->snapshot();
     switch (desktop.render(form, state)) {

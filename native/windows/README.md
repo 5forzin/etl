@@ -164,8 +164,10 @@ release parsing, version ordering, checksums, portable rollback, browser argumen
 and the desktop worker lifecycle. Worker tests exercise traffic reporting,
 cancellation, errors and parent death without UAC or network route changes.
 
-`--self-test-ui-full`, `--self-test-ui-full-active`, `--self-test-ui-connecting`
+`--self-test-ui-full`, `--self-test-ui-full-active`, `--self-test-ui-full-dns`, `--self-test-ui-connecting`
 and `--self-test-ui-stopping` capture the mode selector and connection states.
+Previews are 32-bit bitmaps whose corners outside the rounded window outline have
+zero alpha, matching the clipped window.
 `--self-test-ui-active` captures the local proxy's traffic counters. These fixtures
 render synthetic test data without starting a connection or loading saved tokens.
 Preview animations are deterministic and independent of the host's animation
@@ -185,12 +187,22 @@ Headless mode takes `--server`, `--server-port`, `--port`, `--token-file`,
 default 30000). Headless mode never renders the desktop.
 
 Add `--vpn 1` to headless mode from an elevated terminal to route traffic
-through the TUN adapter. ETL authenticates before changing routes. Full mode
-checks the adapter's DNS and relays DNS over TCP through the tunnel, trying
-Cloudflare and Google independently. Two consecutive failed checks restore the
-normal connection; an engine exit restores it immediately. The client then
+through the TUN adapter. ETL authenticates before changing routes. Three seconds
+after connecting, and then every four seconds, Full mode checks that the routes
+still point at the adapter and relays a DNS exchange over TCP through the
+tunnel, trying Cloudflare and Google at the same time with four seconds each.
+Three consecutive failed checks restore the normal connection (one every two
+seconds while failing); an engine exit restores it immediately. The client then
 exits with code 5. Physical default routes and DNS settings remain unchanged,
 and restoration removes the TUN routes and flushes cached synthetic DNS answers.
+
+The same check also sends a UDP query to the engine's mapped DNS. That result is
+informational: other VPN clients (Twingate, for example) block UDP port 53 outside
+their own adapter, which leaves the tunnel working while the system resolver can
+not use ETL's DNS. ETL then keeps running, logs `dns-bypassed` in
+`%LOCALAPPDATA%\ETL\runtime\error.log` and shows "DNS is not reaching the tunnel".
+Name lookups in that situation are answered by the other client's resolver
+instead of the ETL server.
 
 `ctest` also checks fragmented, invalid and stalled connectivity probe replies.
 To test real network restoration, stop any active ETL VPN and run the following

@@ -323,14 +323,26 @@ test('native desktop renders compact frames and animates expansion and collapse 
       '--self-test-ui-connecting', '--self-test-ui-stopping', '--self-test-ui-reduced',
       '--self-test-ui-servers', '--self-test-ui-agent-export',
       '--self-test-ui-servers-many', '--self-test-ui-long-server',
-      '--self-test-ui-servers-empty'].map((flag, index) => {
+      '--self-test-ui-servers-empty', '--self-test-ui-full-dns'].map((flag, index) => {
       const path = join(dir, `preview-${index}.bmp`);
       execFileSync(executable, [flag, path], { windowsHide: true, timeout: 8000 });
       const bitmap = readFileSync(path);
       assert.equal(bitmap.subarray(0, 2).toString(), 'BM');
       assert.equal(bitmap.readInt32LE(18), 400, 'content changes should preserve the compact width');
       assert.ok(bitmap.length > 400_000);
-      return Math.abs(bitmap.readInt32LE(22));
+      const height = Math.abs(bitmap.readInt32LE(22));
+      // Top-down 32-bit pixels. The window is clipped to its rounded outline, so
+      // the grey border is the edge of the application: the corners outside it
+      // are transparent and everything the border encloses is opaque.
+      const alpha = (x, y) => bitmap[bitmap.readUInt32LE(10) + (y * 400 + x) * 4 + 3];
+      assert.equal(alpha(3, 3), 0, 'top-left corner outside the border should be clipped');
+      assert.equal(alpha(396, 3), 0, 'top-right corner outside the border should be clipped');
+      assert.equal(alpha(3, height - 4), 0, 'bottom-left corner outside the border should be clipped');
+      assert.equal(alpha(396, height - 4), 0, 'bottom-right corner outside the border should be clipped');
+      assert.equal(alpha(8, 8), 255, 'the area inside the rounded border should be opaque');
+      assert.equal(alpha(0, height >> 1), 255, 'the straight border should reach the window edge');
+      assert.equal(alpha(200, height >> 1), 255, 'the interior should be opaque');
+      return height;
     });
     assert.ok(heights[0] >= 440 && heights[0] <= 520, 'collapsed desktop should remain compact');
     assert.ok(heights[1] > heights[0] + 150, 'Settings should expand the native window');
@@ -346,6 +358,7 @@ test('native desktop renders compact frames and animates expansion and collapse 
     assert.ok(heights[14] < 600, 'long server lists should scroll within a bounded window');
     assert.equal(heights[15], heights[6], 'long hostnames and large traffic totals should not change the active layout');
     assert.ok(heights[16] < heights[12], 'a profile without agents should not leave empty server rows');
+    assert.ok(heights[17] > heights[8], 'the DNS notice should expand the active Full mode window');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

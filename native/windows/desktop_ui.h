@@ -27,6 +27,9 @@ struct DesktopServer {
 struct DesktopState {
   bool running = false, stopping = false;
   bool starting = false, fullMode = false;
+  // Full mode is up but system DNS cannot reach the tunnel (another VPN or
+  // firewall blocks UDP 53); connections still use ETL.
+  bool dnsBypassed = false;
   int sessions = 0;
   uint64_t sent = 0, received = 0, failures = 0;
   std::string error;
@@ -54,6 +57,7 @@ class DesktopUi {
  private:
   bool createTarget();
   void releaseDevice();
+  void applyShape();
   void animateHeight(float target, float delta);
   HWND window_ = nullptr;
   ID3D11Device* device_ = nullptr;
