@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.6.1 (2026-11-23)
+
+- Keep Full mode connected when another VPN or firewall blocks UDP port 53.
+  Twingate and similar clients block DNS outside their own adapter, so ETL's
+  UDP check of its mapped DNS never got an answer and Full mode restored the
+  normal connection a few seconds after connecting. A blocked mapped DNS is now
+  reported in the app ("DNS is not reaching the tunnel") instead of ending the
+  session; connections still go through ETL.
+- Make tunnel failure detection tolerant of slow links. The relay check now
+  allows four seconds on both resolvers at once (it previously allowed two, while
+  opening an ETL session takes about two seconds on a slow network), waits three
+  seconds after connecting, and needs three consecutive failures. An engine exit
+  or a lost route still restores the connection immediately.
+- Fix the window outline: the dark background no longer shows past the rounded
+  grey border at the corners. The window is clipped to the border's shape, so the
+  border is the edge of the application on Windows 10 and 11.
+- Build with the current MSYS2 OpenSSL 4, whose static libraries need `bcrypt`.
+
+Desktop upgrades preserve saved settings and encrypted credentials.
+
 ## 0.6.0 (2026-10-29)
 
 - Redesign the Windows desktop with a monochrome interface, an abstract logo,
