@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.7.0 (2026-11-23)
+
+- Add **Selective** mode to the Windows client, between Proxy only and Full mode.
+  It routes only the connections that the network blocks for Twingate: when
+  `Twingate.Service.exe` tries to reach a relay on a dropped port (the attempt
+  sits in SYN-SENT; ports 53, 80 and 443 are never touched), ETL adds a /32 route
+  for that relay to the TUN adapter and the next retransmission goes through ETL.
+  DNS, the default route and all other traffic stay on the normal network. The
+  app shows how many relay addresses it routed. This replaces the separate
+  tunnel script previously needed for Twingate on restrictive networks.
+- Make Full mode work with Twingate. Twingate binds its relay sockets to the
+  physical adapter's address, and Windows only lets such packets leave through
+  another interface when the interface that owns the address allows weak host
+  sends. Measured on a network that blocks the relay ports: the TUN setting alone
+  kept every attempt in SYN-SENT; allowing weak host sends on the physical
+  interface connected them in both modes. Selective and Full mode now enable it
+  while they run (store=active) and restore it on Disconnect, on a tunnel
+  failure, from the restoration guard after a crash, and on reboot.
+- Headless mode accepts `--vpn-selective 1` together with `--vpn 1`.
+- The recovery integration test checks that physical weak host settings return
+  to their original values in every scenario.
+
 ## 0.6.1 (2026-11-23)
 
 - Keep Full mode connected when another VPN or firewall blocks UDP port 53.
