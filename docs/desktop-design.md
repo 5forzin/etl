@@ -40,10 +40,11 @@ An available update expands inline below the main controls. Later dismisses it;
 Update downloads and verifies it before disconnecting and restarting the client.
 Settings contains the current version and a manual update check.
 
-The window has a draggable header and custom minimize/close controls. It is
-clipped to its 22-pixel rounded outline on every Windows version, so the grey
-border is the edge of the application and the background never shows past it
-(the clipped rim is not anti-aliased). Closing hides it in the tray;
+The window has a draggable header and custom minimize/close controls. Its frame
+buffer is cleared transparent and the desktop compositor honours the alpha
+channel, so the 22-pixel rounded outline is the anti-aliased edge of the
+application on every Windows version and the background never shows past the
+grey border. Closing hides it in the tray;
 Exit disconnects before quitting. Errors expand the content instead of covering
 actions. DirectX targets resize before each frame. The window moves upward when
 necessary to remain inside the monitor's work area.

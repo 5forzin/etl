@@ -20,23 +20,13 @@ const ImVec4 accent{241 / 255.f, 241 / 255.f, 241 / 255.f, 1};
 const ImVec4 muted{156 / 255.f, 156 / 255.f, 156 / 255.f, 1};
 const ImVec4 border{54 / 255.f, 54 / 255.f, 54 / 255.f, 1};
 constexpr float pageInset = 24, panelRadius = 16, controlRadius = 10;
-// The window outline, the ImGui window background and the clipped HWND all use
-// this radius, so the grey border is the real edge of the application.
+// The window outline and the ImGui window background share this radius. The
+// frame buffer is cleared transparent and the DWM composes it with per-pixel
+// alpha, so the grey border is the real, anti-aliased edge of the application.
 constexpr float windowRadius = 22;
 constexpr float primaryHeight = 44, secondaryHeight = 40;
 ImFont *body = nullptr, *heading = nullptr, *brand = nullptr;
 bool reduceMotion = false;
-
-// True when the pixel (x, y) of a width x height window lies inside the rounded
-// outline. The border is stroked half a pixel inside the edge, so its outer
-// rim has a radius of windowRadius + .5.
-bool insideShape(int x, int y, int width, int height) {
-  const float radius = windowRadius + .5f;
-  const float cx = x + .5f < radius ? radius : x + .5f > width - radius ? width - radius : x + .5f;
-  const float cy = y + .5f < radius ? radius : y + .5f > height - radius ? height - radius : y + .5f;
-  const float dx = x + .5f - cx, dy = y + .5f - cy;
-  return dx * dx + dy * dy <= radius * radius;
-}
 
 enum class Icon { Proxy, Full, Browser, Settings, Power, Stop, Back, Chevron, Minimize, Close, Upload, Download };
 
@@ -216,7 +206,9 @@ bool DesktopUi::initialize(HWND window, DesktopMotion motion) {
     if (FAILED(create(D3D_DRIVER_TYPE_WARP))) { releaseDevice(); return false; }
   }
   if (!createTarget()) { releaseDevice(); return false; }
-  applyShape();
+  // Let the DWM honour the alpha channel of the swap chain. Premultiplied alpha
+  // falls out of ImGui's blend state when the target is cleared to transparent.
+  ImGui_ImplWin32_EnableAlphaCompositing(window);
   IMGUI_CHECKVERSION();
   ImGui::CreateContext();
   auto& io = ImGui::GetIO();
@@ -278,24 +270,8 @@ bool DesktopUi::message(HWND window, UINT msg, WPARAM wp, LPARAM lp) {
   return initialized_ && ImGui_ImplWin32_WndProcHandler(window, msg, wp, lp);
 }
 
-// The popup is rectangular (Windows 10 never rounds it, and Windows 11 rounds it
-// by only a few pixels), while the interface draws a rounded outline. Clip the
-// window to that outline so the dark background cannot spill past the border at
-// the corners. Regions have no anti-aliasing, so the clipped rim is hard-edged.
-void DesktopUi::applyShape() {
-  RECT bounds{};
-  if (!window_ || !GetWindowRect(window_, &bounds)) return;
-  const int width = bounds.right - bounds.left, height = bounds.bottom - bounds.top;
-  if (width <= 0 || height <= 0) return;
-  const int diameter = static_cast<int>(2 * (windowRadius + .5f));
-  HRGN region = CreateRoundRectRgn(0, 0, width + 1, height + 1, diameter, diameter);
-  // On success the system owns the region; on failure it must be freed here.
-  if (region && !SetWindowRgn(window_, region, TRUE)) DeleteObject(region);
-}
-
 void DesktopUi::resize(unsigned width, unsigned height) {
   if (!swap_ || !width || !height) return;
-  applyShape();
   context_->OMSetRenderTargets(0, nullptr, nullptr);
   if (target_) { target_->Release(); target_ = nullptr; }
   if (SUCCEEDED(swap_->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0))) createTarget();
@@ -650,7 +626,9 @@ DesktopAction DesktopUi::render(DesktopForm& form, const DesktopState& state, fl
   ImGui::End();
   ImGui::Render();
   context_->OMSetRenderTargets(1, &target_, nullptr);
-  const float clear[]{background.x, background.y, background.z, 1};
+  // Transparent, not the background colour: ImGui paints the rounded window and
+  // everything outside its outline must stay see-through.
+  const float clear[]{0, 0, 0, 0};
   context_->ClearRenderTargetView(target_, clear);
   ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
   const HRESULT result = swap_->Present(1, 0);
@@ -690,12 +668,14 @@ bool DesktopUi::capture(const std::wstring& path) {
   for (UINT y = 0; y < desc.Height; ++y) {
     auto* row = static_cast<unsigned char*>(mapped.pData) + y * mapped.RowPitch;
     for (UINT x = 0; x < desc.Width; ++x) {
-      // Pixels outside the rounded outline are clipped from the real window,
-      // so the preview marks them fully transparent instead of showing them.
-      const bool inside = insideShape(static_cast<int>(x), static_cast<int>(y),
-        static_cast<int>(desc.Width), static_cast<int>(desc.Height));
-      const char bgra[]{static_cast<char>(inside ? row[x*4+2] : 0), static_cast<char>(inside ? row[x*4+1] : 0),
-        static_cast<char>(inside ? row[x*4] : 0), static_cast<char>(inside ? 255 : 0)};
+      // The buffer holds premultiplied alpha; bitmaps store straight alpha, so
+      // anti-aliased edge pixels keep their colour instead of looking darker.
+      const unsigned alpha = row[x*4+3];
+      auto straight = [alpha](unsigned char value) {
+        return static_cast<char>(alpha == 0 ? 0 : std::min(255u, (value * 255u + alpha / 2) / alpha));
+      };
+      const char bgra[]{straight(row[x*4+2]), straight(row[x*4+1]), straight(row[x*4]),
+        static_cast<char>(alpha)};
       file.write(bgra, 4);
     }
   }

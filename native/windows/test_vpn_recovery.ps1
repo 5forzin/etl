@@ -66,6 +66,12 @@ function Start-HealthyEtl {
     $dns = @(Get-DnsClientServerAddress -InterfaceAlias ETL -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses
     $routes.Count -eq 5 -and $dns -contains '198.18.0.2'
   } 'Full mode did not start.'
+  # Sockets bound to the physical adapter's address (Twingate) only reach the TUN
+  # when it uses the weak host model, and only the TUN adapter may be changed.
+  $weakHost = Get-NetIPInterface -InterfaceAlias ETL -AddressFamily IPv4 -ErrorAction SilentlyContinue
+  if ($weakHost.WeakHostSend -ne 'Enabled' -or $weakHost.WeakHostReceive -ne 'Enabled') {
+    throw 'Full mode did not enable weak host routing on the TUN adapter.'
+  }
   & curl.exe --noproxy '*' --silent --show-error --fail --connect-timeout 6 --max-time 12 --output NUL 'https://example.com' 2> (Join-Path $directory 'recovery-https.log')
   if ($LASTEXITCODE -ne 0) { throw 'Full mode could not relay HTTPS.' }
 }

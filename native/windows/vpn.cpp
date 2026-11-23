@@ -574,6 +574,18 @@ bool Vpn::start(int localPort, const RoutePlan& plan,
       error = L"TUN adapter did not come up.";
       return false;
     }
+    // Services such as Twingate bind their sockets to the physical adapter's
+    // address. Under Windows' default strong host model a packet with that source
+    // address is never routed into another interface, so those sockets would go
+    // around the tunnel (a blocked relay port then simply times out). The weak
+    // host model on the TUN adapter alone lets them in and accepts the replies.
+    // The setting lives and dies with this adapter, so no physical interface is
+    // changed and there is nothing to restore. A failure only affects such sockets.
+    checkpoint("weak-host");
+    std::string weakHostError;
+    if (!runCommand(L"netsh interface ipv4 set interface interface=" + std::to_wstring(adapter) +
+        L" weakhostsend=enabled weakhostreceive=enabled store=active", &weakHostError))
+      checkpoint("weak-host-failed", weakHostError);
     if (!scope.empty()) {
       // Scoped traffic must keep the physical adapter's real DNS answers.
       checkpoint("scoped-route");

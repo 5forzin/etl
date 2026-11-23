@@ -166,8 +166,8 @@ cancellation, errors and parent death without UAC or network route changes.
 
 `--self-test-ui-full`, `--self-test-ui-full-active`, `--self-test-ui-full-dns`, `--self-test-ui-connecting`
 and `--self-test-ui-stopping` capture the mode selector and connection states.
-Previews are 32-bit bitmaps whose corners outside the rounded window outline have
-zero alpha, matching the clipped window.
+Previews are 32-bit bitmaps with straight alpha: the corners outside the rounded
+window outline are transparent and the outline is anti-aliased, as on screen.
 `--self-test-ui-active` captures the local proxy's traffic counters. These fixtures
 render synthetic test data without starting a connection or loading saved tokens.
 Preview animations are deterministic and independent of the host's animation
@@ -195,6 +195,13 @@ Three consecutive failed checks restore the normal connection (one every two
 seconds while failing); an engine exit restores it immediately. The client then
 exits with code 5. Physical default routes and DNS settings remain unchanged,
 and restoration removes the TUN routes and flushes cached synthetic DNS answers.
+
+Full mode enables the Windows weak host model (send and receive) on its own TUN
+adapter only, so that adapter may carry packets whose address belongs to another
+interface. Some services, Twingate among them, bind their sockets to the physical
+adapter's address. The setting disappears with the adapter, so no physical
+interface is modified and nothing needs restoring. On its own it does not route
+Twingate's relay connections through the tunnel.
 
 The same check also sends a UDP query to the engine's mapped DNS. That result is
 informational: other VPN clients (Twingate, for example) block UDP port 53 outside

@@ -13,9 +13,13 @@
   opening an ETL session takes about two seconds on a slow network), waits three
   seconds after connecting, and needs three consecutive failures. An engine exit
   or a lost route still restores the connection immediately.
+- Enable the weak host model on Full mode's own TUN adapter, so it may send and
+  receive packets that carry another interface's address. The setting disappears
+  with the adapter; no physical interface is changed. This alone does not yet
+  let Twingate reach relays on a network that blocks their ports.
 - Fix the window outline: the dark background no longer shows past the rounded
-  grey border at the corners. The window is clipped to the border's shape, so the
-  border is the edge of the application on Windows 10 and 11.
+  grey border at the corners. The window is rendered with per-pixel alpha, so the
+  border is the anti-aliased edge of the application on Windows 10 and 11.
 - Build with the current MSYS2 OpenSSL 4, whose static libraries need `bcrypt`.
 
 Desktop upgrades preserve saved settings and encrypted credentials.

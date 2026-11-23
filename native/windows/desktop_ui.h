@@ -57,7 +57,6 @@ class DesktopUi {
  private:
   bool createTarget();
   void releaseDevice();
-  void applyShape();
   void animateHeight(float target, float delta);
   HWND window_ = nullptr;
   ID3D11Device* device_ = nullptr;
