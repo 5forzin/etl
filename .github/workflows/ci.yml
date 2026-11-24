@@ -7,12 +7,14 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest]
+        # 24 is the minimum in package.json; 26 is the current release.
+        node: ['24', '26']
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
-          node-version: '24'
+          node-version: ${{ matrix.node }}
       - run: npm run check
       - run: npm test
       - uses: actions/setup-go@v7
@@ -33,7 +35,7 @@ jobs:
         shell: pwsh
         run: |
           $etlErrors = $null
-          foreach ($etlScript in @('deploy/enroll-azure.ps1', 'native/windows/test_vpn_recovery.ps1')) {
+          foreach ($etlScript in @('deploy/enroll-azure.ps1', 'native/windows/test_vpn_recovery.ps1', 'native/windows/release.ps1')) {
             [System.Management.Automation.Language.Parser]::ParseFile("$PWD/$etlScript", [ref]$null, [ref]$etlErrors) | Out-Null
             if ($etlErrors.Count) { $etlErrors; exit 1 }
           }

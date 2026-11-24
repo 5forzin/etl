@@ -1,0 +1,75 @@
+name: Release
+# A pushed version tag builds the Windows release on a clean runner and opens it
+# as a DRAFT. Clients never see drafts; a maintainer downloads and tests these
+# exact files, then publishes the draft, which makes it the Latest release and
+# starts the in-app updates.
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  windows:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check the tag against package.json
+        shell: pwsh
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          if ("v$version" -ne $env:GITHUB_REF_NAME) { throw "Tag $env:GITHUB_REF_NAME does not match package.json $version" }
+          if (-not (Select-String -Path CHANGELOG.md -Pattern "^## $([regex]::Escape($version))( |$)" -Quiet)) {
+            throw "CHANGELOG.md has no section for $version"
+          }
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.3'
+          cache-dependency-path: agent/go.mod
+      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
+        with:
+          msystem: UCRT64
+          update: true
+          path-type: inherit
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-openssl
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+      - name: Build, test and package the portable client
+        shell: msys2 {0}
+        run: |
+          cmake -S native/windows -B build/windows-portable -G Ninja -DCMAKE_BUILD_TYPE=Release -DETL_PORTABLE=ON
+          cmake --build build/windows-portable
+          ctest --test-dir build/windows-portable --output-on-failure
+          pwsh -NoProfile -File native/windows/package.ps1 -Portable -RuntimeBin "$(cygpath -w /ucrt64/bin)"
+          export ETL_NATIVE_CLIENT="$(cygpath -w "$PWD/dist/windows-portable/etl-client.exe")"
+          export ETL_OPENSSL="$(cygpath -w /ucrt64/bin/openssl.exe)"
+          export ETL_AGENT="$(cygpath -w "$PWD/build/windows-portable/etl-agent-windows-amd64.exe")"
+          node --test test/native-client.test.js test/fallback.test.js test/agent-bundle.test.js
+      - name: Build and check the installer
+        shell: pwsh
+        run: |
+          ./native/windows/installer/build.ps1
+          $setup = Get-ChildItem dist/windows-installer/ETL-Setup-*-x64.exe | Select-Object -First 1
+          ./native/windows/installer/smoke-test.ps1 -InstallerPath $setup.FullName
+      - name: Open the draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = $env:GITHUB_REF_NAME.Substring(1)
+          ./native/windows/release.ps1 -OutputDirectory dist/release -NotesPath dist/release-notes.md
+          $assets = Get-ChildItem dist/release -File | ForEach-Object FullName
+          gh release create $env:GITHUB_REF_NAME --draft --verify-tag --title "ETL $version" --notes-file dist/release-notes.md @assets
+      - uses: actions/upload-artifact@v7
+        with:
+          name: etl-release
+          path: dist/release/
