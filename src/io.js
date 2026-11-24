@@ -1,3 +1,10 @@
+import { isIP } from 'node:net';
+
+// TLS server name for a host. RFC 6066 forbids IP literals in SNI and Node 26
+// rejects them; without a servername Node verifies the certificate against the
+// IP host itself.
+export const serverName = (name) => (name && !isIP(name) ? name : undefined);
+
 // Read exactly n bytes without consuming pipelined application data.
 export async function read(socket, n) {
   const chunks = [];

@@ -4,7 +4,7 @@ import dgram from 'node:dgram';
 import { once } from 'node:events';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { read, readFrame, writeFrame, protect, connected, relay, track } from './io.js';
+import { read, readFrame, writeFrame, protect, connected, relay, track, serverName } from './io.js';
 import { resolveDestination, validateDestination } from './policy.js';
 import { httpDestination, httpReply } from './http-proxy.js';
 import { MAX_DATAGRAM, buildUdpPacket, createUdpRelay, openUdpSession, parseUdpPacket } from './udp.js';
@@ -42,8 +42,10 @@ export function createTunnelServer({ key, cert, getToken, maxConnections = 128,
   validateLimits(maxConnections, handshakeTimeout, idleTimeout);
   validateToken(getToken());
   const udpRelay = createUdpRelay({ resolve, idleTimeout, maxDestinations, maxDatagram });
+  // noDelay: relayed traffic is often interactive, and Nagle would hold small
+  // writes back for a round trip.
   const server = tls.createServer({ key, cert, minVersion: 'TLSv1.3',
-    handshakeTimeout, allowHalfOpen: true }, (socket) => {
+    handshakeTimeout, allowHalfOpen: true, noDelay: true }, (socket) => {
     protect(socket, handshakeTimeout);
     const deadline = setTimeout(() => socket.destroy(), handshakeTimeout);
     let target;
@@ -75,7 +77,7 @@ export function createTunnelServer({ key, cert, getToken, maxConnections = 128,
       for (const { address, family } of addresses) {
         if (socket.destroyed) return;
         target = protect(net.connect({ host: address, port: request.port,
-          family, allowHalfOpen: true }), handshakeTimeout);
+          family, allowHalfOpen: true, noDelay: true }), handshakeTimeout);
         try { await connected(target); break; }
         catch { target.destroy(); target = undefined; }
       }
@@ -142,10 +144,11 @@ export function createClient({ host, port = 443, servername = host, token, ca,
   if (!Number.isInteger(fallbackCheckInterval) || fallbackCheckInterval < 100 || fallbackCheckInterval > 60_000) {
     throw new Error('fallbackCheckInterval must be between 100 and 60000 milliseconds');
   }
-  const endpoints = [{ host, port, servername, token, available: true }, ...fallbacks.map((endpoint) => ({
-    host: endpoint.host, port: endpoint.port ?? port,
-    servername: endpoint.servername ?? endpoint.host, token: endpoint.token ?? token, available: false,
-  }))];
+  const endpoints = [{ host, port, servername: serverName(servername), token, available: true },
+    ...fallbacks.map((endpoint) => ({
+      host: endpoint.host, port: endpoint.port ?? port,
+      servername: serverName(endpoint.servername ?? endpoint.host), token: endpoint.token ?? token, available: false,
+    }))];
   for (const endpoint of endpoints) {
     validateToken(endpoint.token);
     if (typeof endpoint.host !== 'string' || !endpoint.host ||
@@ -270,7 +273,7 @@ export function createClient({ host, port = 443, servername = host, token, ca,
         if (!endpoint.available) continue;
         const candidate = protect(tls.connect({ host: endpoint.host, port: endpoint.port,
           servername: endpoint.servername, ca, rejectUnauthorized: true,
-          minVersion: 'TLSv1.3', allowHalfOpen: true }), connectTimeout);
+          minVersion: 'TLSv1.3', allowHalfOpen: true, noDelay: true }), connectTimeout);
         tunnel = candidate;
         // One absolute budget covers DNS, TCP, TLS and authentication, even if
         // a stalled endpoint sends occasional bytes. No application data is retried.
@@ -278,7 +281,13 @@ export function createClient({ host, port = 443, servername = host, token, ca,
         try {
           await connected(candidate, 'secureConnect');
           if (socket.destroyed) { candidate.destroy(); return; }
+          // The destination rides with the authentication frame: the server
+          // reads frames in order and acts on it only after a successful
+          // authentication, so this saves a round trip per connection.
+          candidate.cork();
           writeFrame(candidate, { v: 1, token: endpoint.token });
+          writeFrame(candidate, destination);
+          candidate.uncork();
           if ((await readFrame(candidate))?.code !== 'OK') throw new Error('Authentication failed');
           candidate.setTimeout(handshakeTimeout);
           break;
@@ -291,7 +300,6 @@ export function createClient({ host, port = 443, servername = host, token, ca,
         }
       }
       if (!tunnel || socket.destroyed) throw new Error('No tunnel endpoint available');
-      writeFrame(tunnel, destination);
       if ((await readFrame(tunnel))?.code !== 'OK') throw new Error('Destination failed');
       clearTimeout(deadline);
       if (isHttp) httpReply(socket, true);

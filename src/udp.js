@@ -2,7 +2,7 @@ import dgram from 'node:dgram';
 import net from 'node:net';
 import tls from 'node:tls';
 import { EventEmitter } from 'node:events';
-import { read, readFrame, writeFrame, protect, connected } from './io.js';
+import { read, readFrame, writeFrame, protect, connected, serverName } from './io.js';
 import { resolveDestination, validateDestination } from './policy.js';
 
 export const MAX_DATAGRAM = 1500;
@@ -153,8 +153,8 @@ export function createUdpRelay({ resolve = resolveDestination, idleTimeout = 120
 export async function openUdpSession({ host, port, servername = host, token, ca,
   connectTimeout = 5000, idleTimeout = 120_000, maxDatagram = MAX_DATAGRAM }) {
   validateUdpLimits(1, maxDatagram);
-  const socket = protect(tls.connect({ host, port, servername, ca,
-    rejectUnauthorized: true, minVersion: 'TLSv1.3' }), connectTimeout);
+  const socket = protect(tls.connect({ host, port, servername: serverName(servername), ca,
+    rejectUnauthorized: true, minVersion: 'TLSv1.3', noDelay: true }), connectTimeout);
   const deadline = setTimeout(() => socket.destroy(), connectTimeout);
   const session = new EventEmitter();
   try {

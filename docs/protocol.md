@@ -24,6 +24,12 @@ authentication closes the connection without resolving a destination. Malformed
 requests receive FAILED when possible. Replies exclude tokens and destination
 details. Successful relays preserve half-close behavior.
 
+Clients may send step 3 immediately after step 1, without waiting for step 2.
+Servers read frames in order and never read past the authentication frame until
+it is accepted, so a rejected client's destination is never examined. The Node
+and native clients send both frames in one TLS record, which saves a round trip
+per connection. Clients and servers disable Nagle's algorithm on these sockets.
+
 ## Local protocols
 
 SOCKS5 uses no local authentication and supports CONNECT with IPv4, IPv6 or a
