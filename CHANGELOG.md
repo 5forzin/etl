@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.8.0 (2026-11-24)
+
+- **Faster connections.** Every new connection used to wait for the server to
+  accept its token before naming the destination, and Nagle's algorithm could
+  hold the small setup frames back for another round trip. Clients now send the
+  destination in the same TLS record as the token and disable Nagle on the
+  tunnel socket (the server also does, after its next deployment). Measured
+  through the production server, a new HTTPS request went from about 2.0 to 1.1
+  seconds. Servers already read frames in order, so older servers benefit too.
+- **Full mode reconnects by itself.** A lost tunnel still restores the normal
+  connection at once, but the session no longer ends: the app shows
+  "Reconnecting" with an amber dot, checks the server after 2, 4, 8 and 16
+  seconds and then every 30 seconds, and rebuilds the tunnel when the server
+  answers. Tested live by blocking the server: the normal connection came back
+  in 8 seconds and the tunnel in under 10 seconds after unblocking.
+- **Network changes no longer break a session.** Selective and Full mode follow
+  the physical network every two seconds. After a switch between Wi-Fi and
+  cable, a new access point or a resume from sleep they re-pin the server route
+  on the new gateway (before removing the old one), move the weak host setting
+  to the new interface and re-arm the restoration guard for it. A host route
+  that Windows drops on reconnection is put back within two seconds.
+- **Sharp on high-DPI displays.** The window is per-monitor DPI aware: at 150%
+  it is drawn at 600 sharp pixels instead of being stretched, and it rescales
+  when moved to another monitor.
+- **Copy diagnostics** in Settings puts the version, Windows build, mode,
+  server, tunnel state, default route, display scale and the latest runtime log
+  lines on the clipboard. It never includes tokens.
+- **One copy at a time.** Opening ETL while it runs shows the existing window
+  instead of starting a second client that competes for the local port.
+- Runtime logs carry the local time and process id on every line and rotate at
+  512 KiB, so they no longer grow without limit.
+- Routes are created and deleted through the IP Helper API instead of
+  `route.exe`: faster starts (about 1.4 seconds to a working tunnel) and no
+  silent deletion failures.
+- Mapped-DNS answers move from `100.64.0.0/10`, which collides with CGNAT,
+  Tailscale and Twingate addresses, to `198.19.0.0/16` in the benchmarking range.
+- Headless Full mode accepts `--vpn-reconnect 1` to reconnect like the desktop.
+- Node 26 support: IP addresses are no longer sent as TLS server names, which
+  Node 26 rejects. This broke backup checks against IP backups; CI now tests
+  Node 24 and 26.
+- OpenSSL 4: certificate names use `SSL_set1_dnsname`, or `SSL_set1_ipaddr` for
+  IP literals, instead of the deprecated `SSL_set1_host`.
+- Releases are built on a clean CI runner from the version tag and opened as a
+  draft for testing before publication.
+
 ## 0.7.1 (2026-11-23)
 
 - Keep Selective mode running when the ETL server stops answering. It used Full
