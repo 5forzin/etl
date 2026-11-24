@@ -1,6 +1,9 @@
 # Windows interface
 
-The desktop is a compact, 400-pixel-wide window. Its monochrome palette uses
+The desktop is a compact window, 400 logical pixels wide. Every measurement is
+defined at 96 DPI and multiplied by the monitor's scale, and fonts are rasterized
+at the final size, so it stays sharp at 125%, 150% or 200% and follows the window
+to a monitor with another scale. Its monochrome palette uses
 near-black backgrounds, graphite surfaces, subtle outlines and a white primary
 action. Inter, consistent line icons and generous spacing define the hierarchy.
 
@@ -21,7 +24,9 @@ while the connection is active and use actual session data.
   Cancel and Disconnect request cleanup before the worker exits. The existing
   health checks and restoration guard remain active. When another VPN or firewall
   stops system DNS from reaching the tunnel, a muted notice appears below the
-  traffic counters; the connection stays up.
+  traffic counters; the connection stays up. When the tunnel drops, the status
+  reads Reconnecting with an amber dot and a notice explains that the PC uses its
+  normal connection until ETL reconnects by itself; Disconnect stays available.
 
 The mode selection slides with exponential easing. Hover and focus transitions
 use a 90 ms time constant; page content fades over 100 ms. Native window height
@@ -41,7 +46,8 @@ only; Full mode requires its explicit primary action.
 
 An available update expands inline below the main controls. Later dismisses it;
 Update downloads and verifies it before disconnecting and restarting the client.
-Settings contains the current version and a manual update check.
+Settings contains the current version, a manual update check and Copy
+diagnostics, which confirms with a short note that the report is on the clipboard.
 
 The window has a draggable header and custom minimize/close controls. Its frame
 buffer is cleared transparent and the desktop compositor honours the alpha

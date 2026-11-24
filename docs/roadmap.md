@@ -15,9 +15,17 @@ certificate renewal, token rotation and rollback are documented.
 3. **Exercise deployment.** Run the public bootstrap, renewal and rollback on a
    clean Ubuntu host. The existing live host is not evidence that a clean install
    works from the current revision.
-4. **Improve desktop integration.** Validate high-DPI layouts, GPU reset recovery,
-   keyboard operation and accessibility. ImGui's screen reader support remains
-   limited.
+4. **Improve desktop integration.** The window is per-monitor DPI aware since 0.8;
+   validate GPU reset recovery, keyboard operation and accessibility. ImGui's
+   screen reader support remains limited.
+5. **Sign updates.** The updater trusts the SHA-256 digest GitHub publishes with
+   each asset, so control of the GitHub account is enough to ship an update.
+   A signature from a key kept outside GitHub (for example minisign, verified by
+   the client before installing) closes that gap; it needs a decision on who
+   holds the key and how it is backed up and rotated.
+6. **Avoid a UAC prompt per connection.** Selective and Full start an elevated
+   worker each time. A per-machine service that accepts only the desktop's
+   requests would need its own security design and an installer change.
 
 ## Transport experiments
 

@@ -37,7 +37,9 @@ struct DesktopState {
   // firewall blocks UDP 53); connections still use ETL.
   bool dnsBypassed = false;
   int routed = 0;  // Selective: destinations currently routed through ETL
-  bool paused = false;  // Selective: ETL server unreachable, Twingate on the normal network
+  // The tunnel is waiting for the ETL server: Selective leaves Twingate on the
+  // normal network, Full mode leaves the whole PC on it until it reconnects.
+  bool paused = false;
   int sessions = 0;
   uint64_t sent = 0, received = 0, failures = 0;
   std::string error;
@@ -45,10 +47,11 @@ struct DesktopState {
   std::vector<DesktopServer> servers;
   bool agentsBusy = false;
   std::string agentMessage, activeServer;
+  bool diagnosticsCopied = false;  // shown briefly after Copy diagnostics
 };
 
 enum class DesktopAction { None, ToggleConnection, OpenBrowser, SaveSettings, CheckUpdates, InstallUpdate,
-  DismissUpdate, RefreshServers, ExportAgent, RemoveServer, SelectServer };
+  DismissUpdate, RefreshServers, ExportAgent, RemoveServer, SelectServer, CopyDiagnostics };
 enum class DesktopMotion { System, Enabled, Reduced };
 
 class DesktopUi {
@@ -59,6 +62,9 @@ class DesktopUi {
   void shutdown();
   bool capture(const std::wstring& path);
   bool message(HWND window, UINT message, WPARAM wparam, LPARAM lparam);
+  // Monitor scale (DPI / 96). Layout, fonts and the window follow it.
+  void setScale(float scale);
+  float scale() const { return scale_; }
   void showOptions(bool show = true) { if (options_ != show || servers_) { options_ = show; servers_ = false; pageAlpha_ = 0; } }
   void showServers() { options_ = false; servers_ = true; exporting_ = false; pageAlpha_ = 0; }
   void showAgentExport() { showServers(); exporting_ = true; }
@@ -79,4 +85,5 @@ class DesktopUi {
   bool servers_ = false, exporting_ = false;
   float height_ = 0, heightFrom_ = 0, heightTarget_ = 0, heightElapsed_ = 0;
   float contentHeight_ = 460;
+  float scale_ = 1;
 };

@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -81,6 +82,27 @@ class SelectiveHealth {
   bool paused_ = false;
 };
 
+// Spacing of server checks while a dropped tunnel waits to come back: quick at
+// first (most outages are Wi-Fi roaming or a resume from sleep), then at most
+// every kLimit, so a long outage costs one TLS attempt per half minute.
+class RetrySchedule {
+ public:
+  using Clock = TunnelWatch::Clock;
+  static constexpr std::chrono::seconds kFirst{2};
+  static constexpr std::chrono::seconds kLimit{30};
+  void reset(Clock::time_point now) { delay_ = kFirst; next_ = now + kFirst; }
+  bool due(Clock::time_point now) const { return now >= next_; }
+  void failed(Clock::time_point now) {
+    delay_ = std::min<std::chrono::seconds>(delay_ * 2, kLimit);
+    next_ = now + delay_;
+  }
+  std::chrono::seconds delay() const { return delay_; }
+
+ private:
+  std::chrono::seconds delay_ = kFirst;
+  Clock::time_point next_{};
+};
+
 struct RoutePlan {
   std::string server;
   std::string gateway;
@@ -88,9 +110,21 @@ struct RoutePlan {
   bool ok = false;
 };
 
+// True when `next` leaves through a different gateway or interface. The server
+// address is resolved once per session and never compared.
+inline bool pathChanged(const RoutePlan& active, const RoutePlan& next) {
+  return next.ok && (next.interfaceIndex != active.interfaceIndex || next.gateway != active.gateway);
+}
+
 RoutePlan planRoutes(const std::wstring& server);
+// The current physical path to an already resolved server address: the best
+// default route only. It never uses DNS, which in Full mode answers with the
+// tunnel's fake addresses.
+RoutePlan currentPath(const std::string& serverIp);
 void checkpoint(const char* step);
 void checkpoint(const char* step, const std::string& detail);
+// Last lines of a runtime log (error.log, guard.log), for diagnostics.
+std::string logTail(const wchar_t* name, size_t lines);
 
 // Selective mode routes only the destinations that listed applications cannot
 // reach directly. Twingate opens its relay connections on TCP ports that
@@ -142,6 +176,13 @@ class Vpn {
   // Selective layout only: remove every routed destination (pause).
   void withdrawDestinations();
   int routedDestinations() const { return static_cast<int>(selectiveRoutes_.size()); }
+  // Keeps what depends on the physical network valid while the session runs:
+  // after a change of Wi-Fi, cable or gateway it re-pins the server route
+  // (added before the old one is removed), moves the weak host setting and
+  // re-arms the guard for the new interface; on the same path it restores a
+  // host route or weak host setting that Windows dropped on reconnection.
+  // Returns true when something had to be changed.
+  bool followNetwork(const RoutePlan& path);
   // Returns true on engine exit or wait failure; logs the reason for teardown.
   bool waitEngine(unsigned long timeoutMs) const;
   HealthReport health() const;
@@ -149,13 +190,16 @@ class Vpn {
   ~Vpn() { stop(); }
 
  private:
+  bool pinServer(const RoutePlan& path);
   void* job_ = nullptr;         // HANDLE, kills the engine with this process
   void* process_ = nullptr;     // HANDLE of hev-socks5-tunnel.exe
   void* guard_ = nullptr;       // HANDLE of the --vpn-guard watchdog copy
-  std::wstring serverRoute_;    // host route to remove on stop
-  std::wstring scopeRoute_;     // scoped test route to remove on stop
+  std::string serverRoute_;     // pinned server address (host route) to remove on stop
+  RoutePlan path_;              // physical path the host route and weak host follow
+  std::string scopeRoute_;      // scoped test route to remove on stop
   bool mapDnsRoute_ = false;
   unsigned long fullAdapter_ = 0;
+  unsigned long tunAdapter_ = 0;
   bool defaultRoutes_[2]{};
   bool ipv6Routes_[2]{};
   mutable int dnsState_ = -1;   // last mapped-DNS result, so transitions are logged once
@@ -163,6 +207,8 @@ class Vpn {
   unsigned long selectiveAdapter_ = 0;
   std::vector<uint32_t> selectiveRoutes_;  // network byte order
   unsigned long physicalWeakHost_ = 0;  // interface whose weak host send to restore
+  unsigned long guardWeakHost_ = 0;     // interface the running guard restores
+  unsigned long guardAttempt_ = 0;      // last interface a re-arm was tried for
 };
 
 bool extractRuntime(const std::filesystem::path& directory, std::wstring& error);

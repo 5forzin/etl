@@ -34,7 +34,7 @@ $baselineWeakHost = (Get-WeakHostState) -join ','
 
 function Test-EtlRoutes {
   return @(Get-NetRoute -InterfaceAlias ETL -ErrorAction SilentlyContinue | Where-Object {
-    $_.DestinationPrefix -in @('0.0.0.0/1','128.0.0.0/1','::/1','8000::/1','100.64.0.0/10')
+    $_.DestinationPrefix -in @('0.0.0.0/1','128.0.0.0/1','::/1','8000::/1','198.19.0.0/16')
   }).Count -ne 0
 }
 function Wait-Until([scriptblock]$Check, [string]$Message, [int]$Seconds = 30) {
@@ -68,7 +68,7 @@ function Start-HealthyEtl {
     $script:client.Refresh()
     if ($script:client.HasExited) { throw 'ETL exited during startup.' }
     $routes = @(Get-NetRoute -InterfaceAlias ETL -ErrorAction SilentlyContinue | Where-Object {
-      $_.DestinationPrefix -in @('0.0.0.0/1','128.0.0.0/1','::/1','8000::/1','100.64.0.0/10')
+      $_.DestinationPrefix -in @('0.0.0.0/1','128.0.0.0/1','::/1','8000::/1','198.19.0.0/16')
     })
     $dns = @(Get-DnsClientServerAddress -InterfaceAlias ETL -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses
     $routes.Count -eq 5 -and $dns -contains '198.18.0.2'

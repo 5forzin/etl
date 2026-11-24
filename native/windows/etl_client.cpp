@@ -19,6 +19,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <mutex>
 #include <memory>
@@ -32,12 +33,19 @@
 #include "vpn.h"
 #include "browser.h"
 #include "desktop_session.h"
+#include "etl_version.h"
+#include "backends/imgui_impl_win32.h"
 #include <nlohmann/json.hpp>
+#include <sstream>
 #include <windowsx.h>
 #include <dwmapi.h>
 
 constexpr UINT WM_TRAY = WM_APP + 1;
 constexpr UINT WM_SERVICE_STOPPED = WM_APP + 2;
+constexpr UINT WM_SHOW_INSTANCE = WM_APP + 3;  // another launch asks the running window to show
+constexpr wchar_t kWindowClass[] = L"ETLNativeClient";
+// Logical (96 DPI) size of the desktop window; the height follows the content.
+constexpr int kWindowWidth = 400, kWindowHeight = 460;
 constexpr int ID_CONNECT = 101;
 constexpr int ID_SERVER = 102;
 constexpr int ID_SERVER_PORT = 103;
@@ -275,10 +283,22 @@ static bool sslWrite(SSL* ssl, const void* p, size_t n) {
   return true;
 }
 
-static bool writeFrame(SSL* ssl, const std::string& body) {
+static bool appendFrame(std::string& out, const std::string& body) {
   if (body.size() < 2 || body.size() > 1024) return false;
-  unsigned char size[2]{static_cast<unsigned char>(body.size() >> 8), static_cast<unsigned char>(body.size())};
-  return sslWrite(ssl, size, 2) && sslWrite(ssl, body.data(), body.size());
+  out += static_cast<char>(body.size() >> 8);
+  out += static_cast<char>(body.size() & 0xff);
+  out += body;
+  return true;
+}
+
+// One SSL_write per frame keeps the length prefix and body in a single TLS
+// record; two small records would let Nagle hold the second for an extra RTT.
+static bool writeFrame(SSL* ssl, const std::string& body) {
+  std::string frame;
+  frame.reserve(body.size() + 2);
+  const bool ok = appendFrame(frame, body) && sslWrite(ssl, frame.data(), frame.size());
+  OPENSSL_cleanse(frame.data(), frame.size());
+  return ok;
 }
 
 static bool responseOK(SSL* ssl) {
@@ -720,6 +740,10 @@ static SOCKET connectAddresses(ADDRINFOEXW* addresses, const std::atomic<bool>& 
       closesocket(result);
       return INVALID_SOCKET;
     }
+    // Setup is a chain of small request/response frames and relayed traffic is
+    // often interactive; Nagle would add a round trip to each small write.
+    const BOOL noDelay = TRUE;
+    setsockopt(result, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&noDelay), sizeof(noDelay));
     DWORD timeout = static_cast<DWORD>(std::max<int64_t>(1,
       std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()).count()));
     setsockopt(result, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<char*>(&timeout), sizeof(timeout));
@@ -777,6 +801,20 @@ static SSL_CTX* clientContext(const Config& config) {
   return context;
 }
 
+// Sets SNI and the name the certificate must carry. OpenSSL 4 checks DNS names
+// and IP literals through separate calls; IP literals are never sent as SNI.
+static bool expectPeer(SSL* ssl, const std::string& name) {
+  in_addr ipv4{}; in6_addr ipv6{};
+  const bool literal = InetPtonA(AF_INET, name.c_str(), &ipv4) == 1 || InetPtonA(AF_INET6, name.c_str(), &ipv6) == 1;
+  if (!literal && SSL_set_tlsext_host_name(ssl, name.c_str()) != 1) return false;
+#if OPENSSL_VERSION_NUMBER >= 0x40000000L
+  return (literal ? SSL_set1_ipaddr(ssl, name.c_str()) : SSL_set1_dnsname(ssl, name.c_str())) == 1;
+#else
+  return literal ? X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), name.c_str()) == 1 :
+    SSL_set1_host(ssl, name.c_str()) == 1;
+#endif
+}
+
 static nlohmann::json readJsonFrame(SSL* ssl) {
   unsigned char prefix[2];
   if (!sslRead(ssl, prefix, 2)) throw std::runtime_error("Controller disconnected.");
@@ -800,8 +838,7 @@ static nlohmann::json agentRequest(const Config& controller, const nlohmann::jso
   SocketBudget budget(socket.value, 8000);
   std::unique_ptr<SSL, decltype(&SSL_free)> ssl(SSL_new(context.get()), SSL_free);
   const auto hostname = utf8(controller.server);
-  if (!ssl || SSL_set_fd(ssl.get(), static_cast<int>(socket.value)) != 1 ||
-      SSL_set_tlsext_host_name(ssl.get(), hostname.c_str()) != 1 || SSL_set1_host(ssl.get(), hostname.c_str()) != 1 ||
+  if (!ssl || SSL_set_fd(ssl.get(), static_cast<int>(socket.value)) != 1 || !expectPeer(ssl.get(), hostname) ||
       SSL_connect(ssl.get()) != 1 || SSL_get_verify_result(ssl.get()) != X509_V_OK)
     throw std::runtime_error("Controller TLS verification failed.");
   std::string token;
@@ -905,8 +942,12 @@ class Service {
     }
   }
 
+  // `request`, when given, is the destination frame. It is sent in the same
+  // TLS record as the authentication frame (the server reads frames in order
+  // and only acts on the destination after a successful authentication), which
+  // saves one round trip per connection. Its reply is left for the caller.
   bool openTunnel(bool fallback, SOCKET& remote, SSL*& ssl, bool udpSession = false,
-                   int timeoutMs = 0, std::string* failure = nullptr) {
+                   int timeoutMs = 0, std::string* failure = nullptr, const std::string* request = nullptr) {
     const auto& endpoint = fallback ? config_.fallbackServer : config_.server;
     const int endpointPort = fallback ? config_.fallbackPort : config_.serverPort;
     const auto started = ConnectClock::now();
@@ -949,9 +990,7 @@ class Service {
       ssl = SSL_new(ctx_);
       if (ssl) {
         std::string server = !fallback && !config_.tlsServername.empty() ? config_.tlsServername : utf8(endpoint);
-        if (SSL_set_fd(ssl, static_cast<int>(remote)) == 1 &&
-            SSL_set_tlsext_host_name(ssl, server.c_str()) == 1 &&
-            SSL_set1_host(ssl, server.c_str()) == 1 &&
+        if (SSL_set_fd(ssl, static_cast<int>(remote)) == 1 && expectPeer(ssl, server) &&
             SSL_connect(ssl) == 1 && SSL_get_verify_result(ssl) == X509_V_OK) {
           step = Auth;
           std::string token;
@@ -961,7 +1000,11 @@ class Service {
             auth.assign(udpSession ? "{\"v\":2,\"mode\":\"udp\",\"token\":\"" : "{\"v\":1,\"token\":\"");
             auth.append(token);
             auth.append("\"}");
-            ok = writeFrame(ssl, auth);
+            std::string frames;
+            frames.reserve(auth.size() + (request ? request->size() : 0) + 4);
+            ok = appendFrame(frames, auth) && (!request || appendFrame(frames, *request)) &&
+              sslWrite(ssl, frames.data(), frames.size());
+            OPENSSL_cleanse(frames.data(), frames.size());
             OPENSSL_cleanse(auth.data(), auth.size());
             OPENSSL_cleanse(token.data(), token.size());
             ok = ok && responseOK(ssl);
@@ -1049,6 +1092,9 @@ class Service {
       udpAssociate(client);
       return;
     }
+    const std::string encoded = jsonEscape(host);
+    if (encoded.empty()) { ++failures_; if (socks) socksReply(client, 1); else httpReply(client, 502); return; }
+    const std::string destination = "{\"host\":\"" + encoded + "\",\"port\":" + std::to_string(port) + "}";
     SOCKET remote = INVALID_SOCKET;
     SSL* ssl = nullptr;
     bool ok = false;
@@ -1056,7 +1102,7 @@ class Service {
     for (int attempt = 0; attempt < attempts && running_; ++attempt) {
       const bool fallback = attempt != 0;
       if (fallback && !backupAvailable_) continue;
-      ok = openTunnel(fallback, remote, ssl);
+      ok = openTunnel(fallback, remote, ssl, false, 0, nullptr, &destination);
       if (ok) break;
       if (fallback) backupAvailable_ = false;
     }
@@ -1065,8 +1111,8 @@ class Service {
     DWORD setupTimeout = 10000;
     setsockopt(remote, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<char*>(&setupTimeout), sizeof(setupTimeout));
     setsockopt(remote, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<char*>(&setupTimeout), sizeof(setupTimeout));
-    std::string encoded = jsonEscape(host);
-    ok = !encoded.empty() && writeFrame(ssl, "{\"host\":\"" + encoded + "\",\"port\":" + std::to_string(port) + "}") && responseOK(ssl);
+    // The destination frame already went out with the authentication frame.
+    ok = responseOK(ssl);
     if (ok && !socks && !http.connect) ok = sslWrite(ssl, http.initialData.data(), http.initialData.size());
     destinationBudget.cancel();
     if (ok) {
@@ -1422,10 +1468,11 @@ static void loadForm() {
 static bool connectionExists() { return service.running() || fullSession.exists(); }
 
 static void updateStatus(HWND) {
+  const auto full = fullSession.snapshot();
   const wchar_t* status = stopping ? L"ETL - stopping" : fullSession.exists() ?
-    (fullSession.snapshot().phase != SessionPhase::Running ? L"ETL - connecting" :
-      !activeConfig.selective ? L"ETL - full mode active" :
-      fullSession.snapshot().paused ? L"ETL - selective reconnecting" : L"ETL - selective active") :
+    (full.phase != SessionPhase::Running ? L"ETL - connecting" :
+      !activeConfig.selective ? (full.paused ? L"ETL - full mode reconnecting" : L"ETL - full mode active") :
+      full.paused ? L"ETL - selective reconnecting" : L"ETL - selective active") :
     service.running() ? L"ETL - proxy active" : L"ETL - off";
   wcscpy_s(tray.szTip, status);
   Shell_NotifyIconW(NIM_MODIFY, &tray);
@@ -1567,6 +1614,80 @@ static void connectOrStop(HWND window, bool proxyOnly = false) {
   updateStatus(window);
 }
 
+// Connects the Full mode loop to the elevated desktop worker or to headless runs.
+struct FullModeHost {
+  std::function<bool(DWORD)> wait;      // true once asked to stop
+  std::function<void(bool)> paused;     // the tunnel is down, waiting for the server
+  std::function<void(bool)> dnsBypassed;
+  std::function<void()> tick;           // every loop iteration (traffic counters)
+  bool reconnect = true;                // false: a lost tunnel ends the session
+};
+
+// Runs an already started Full mode tunnel until the host asks to stop
+// (returns "") or the session must end (returns the reason). Full mode heals
+// itself: a lost tunnel (TunnelWatch, or the engine exiting) restores the
+// normal connection at once, but the session stays open, checks the server on
+// a backoff and rebuilds the tunnel when it answers. Meanwhile the session
+// follows the physical network (Wi-Fi to cable, a new access point, a resume).
+static std::string runFullMode(const Config& next, etlvpn::RoutePlan plan, const FullModeHost& host) {
+  using Clock = std::chrono::steady_clock;
+  constexpr auto kFollowInterval = std::chrono::seconds(2);
+  auto nextFollow = Clock::now() + kFollowInterval;
+  etlvpn::TunnelWatch watch(Clock::now());
+  etlvpn::RetrySchedule retry;
+  bool up = true;
+  int restartFailures = 0;
+  while (!host.wait(200)) {
+    host.tick();
+    if (up) {
+      bool lost = vpn.waitEngine(0);
+      if (!lost && Clock::now() >= nextFollow) {
+        nextFollow = Clock::now() + kFollowInterval;
+        vpn.followNetwork(etlvpn::currentPath(plan.server));
+      }
+      if (!lost && watch.due(Clock::now())) {
+        lost = !watch.record(vpn.health(), Clock::now());
+        host.dnsBypassed(!watch.dnsViaTunnel());
+      }
+      if (!lost) continue;
+      etlvpn::checkpoint("tunnel-lost");
+      vpn.stop();
+      etlvpn::checkpoint("network-restored");
+      if (!host.reconnect) return "Tunnel lost. Your normal connection has been restored.";
+      up = false;
+      host.dnsBypassed(false);
+      host.paused(true);
+      retry.reset(Clock::now());
+      continue;
+    }
+    if (!retry.due(Clock::now())) continue;
+    const auto path = etlvpn::currentPath(plan.server);
+    std::string failure = "no default route";
+    const bool reachable = path.ok && service.checkTunnel(&failure, next.connectTimeoutMs);
+    if (host.wait(0)) break;
+    if (reachable) {
+      std::wstring restartError;
+      if (vpn.start(next.localPort, path, etlvpn::VpnLayout::Full, L"", restartError)) {
+        plan = path;
+        up = true;
+        restartFailures = 0;
+        watch = etlvpn::TunnelWatch(Clock::now());
+        nextFollow = Clock::now() + kFollowInterval;
+        host.paused(false);
+        etlvpn::checkpoint("tunnel-restored");
+        continue;
+      }
+      etlvpn::checkpoint("tunnel-restart-failed", utf8(restartError));
+      if (++restartFailures >= 3)
+        return "Full mode could not rebuild the tunnel: " + utf8(restartError) + " Your normal connection is in use.";
+    }
+    retry.failed(Clock::now());
+    if (!reachable) etlvpn::checkpoint("reconnect-waiting",
+      failure + "; next check in " + std::to_string(retry.delay().count()) + " s");
+  }
+  return "";
+}
+
 static int runDesktopFull(const std::wstring& id, DWORD parent) {
   FullSessionWorker session;
   if (!session.open(id, parent)) return 4;
@@ -1598,7 +1719,7 @@ static int runDesktopFull(const std::wstring& id, DWORD parent) {
     next.caFile = wide(payload.at("ca").get<std::string>().c_str());
     next.caPem = payload.value("caPem", ""); next.tlsServername = payload.value("servername", "");
     next.selective = payload.value("mode", "full") == "selective";
-    const auto plan = etlvpn::planRoutes(next.server);
+    auto plan = etlvpn::planRoutes(next.server);
     if (!plan.ok) return finish("Server address or default route unavailable.");
     if (session.wait(0)) return finish("");
     next.vpnServerIp = plan.server;
@@ -1609,12 +1730,23 @@ static int runDesktopFull(const std::wstring& id, DWORD parent) {
     if (!vpn.start(next.localPort, plan, layout, L"", error)) return finish(utf8(error));
     if (session.wait(0)) return finish("");
     session.publish(SessionPhase::Running);
+    // Wi-Fi to cable, a new access point or a resume from sleep changes the
+    // physical path; the session follows it instead of waiting to fail.
+    using Clock = std::chrono::steady_clock;
+    constexpr auto kFollowInterval = std::chrono::seconds(2);
+    auto nextFollow = Clock::now() + kFollowInterval;
+    auto follow = [&](Clock::time_point now) {
+      if (now < nextFollow) return;
+      nextFollow = now + kFollowInterval;
+      vpn.followNetwork(etlvpn::currentPath(plan.server));
+    };
     if (next.selective) {
-      etlvpn::SelectiveHealth health(std::chrono::steady_clock::now());
+      etlvpn::SelectiveHealth health(Clock::now());
       etlvpn::SelectiveScanner scanner(plan.server);
       while (!session.wait(200)) {
         session.traffic(service.sessions(), service.sent(), service.received(), service.failures());
         if (vpn.waitEngine(0)) return finish("Selective mode stopped: the tunnel engine exited. Twingate is using the normal network.");
+        follow(Clock::now());
         if (!health.paused()) for (const uint32_t address : scanner.scan()) vpn.routeDestination(address);
         session.routed(vpn.routedDestinations());
         if (!health.due(std::chrono::steady_clock::now())) continue;
@@ -1632,16 +1764,12 @@ static int runDesktopFull(const std::wstring& id, DWORD parent) {
       }
       return finish("");
     }
-    etlvpn::TunnelWatch watch(std::chrono::steady_clock::now());
-    while (!session.wait(200)) {
-      session.traffic(service.sessions(), service.sent(), service.received(), service.failures());
-      if (vpn.waitEngine(0)) return finish("Tunnel lost. Your normal connection has been restored.");
-      if (!watch.due(std::chrono::steady_clock::now())) continue;
-      const bool keep = watch.record(vpn.health(), std::chrono::steady_clock::now());
-      session.dnsBypassed(!watch.dnsViaTunnel());
-      if (!keep) return finish("Tunnel lost. Your normal connection has been restored.");
-    }
-    return finish("");
+    FullModeHost host;
+    host.wait = [&](DWORD milliseconds) { return session.wait(milliseconds); };
+    host.paused = [&](bool paused) { session.paused(paused); };
+    host.dnsBypassed = [&](bool bypassed) { session.dnsBypassed(bypassed); };
+    host.tick = [&] { session.traffic(service.sessions(), service.sent(), service.received(), service.failures()); };
+    return finish(runFullMode(next, plan, host));
   } catch (const std::exception&) {
     return finish("The tunnel could not start. Your normal connection has been restored.");
   }
@@ -1650,6 +1778,111 @@ static int runDesktopFull(const std::wstring& id, DWORD parent) {
 static void showWindow(HWND window) {
   ShowWindow(window, IsIconic(window) ? SW_RESTORE : SW_SHOW);
   SetForegroundWindow(window);
+}
+
+// One desktop per Windows session: opening ETL again (Start menu, shortcut,
+// installer) shows the window that is already running instead of a second
+// tray icon competing for the same local port. A launch that follows an update
+// waits for the previous process to finish exiting.
+static HANDLE desktopInstance = nullptr;
+
+static bool claimDesktop(bool afterUpdate) {
+  desktopInstance = CreateMutexW(nullptr, FALSE, L"Local\\ETL.Desktop");
+  if (!desktopInstance) return true;
+  const DWORD wait = WaitForSingleObject(desktopInstance, afterUpdate ? 15000 : 0);
+  if (wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED) return true;
+  if (HWND existing = FindWindowW(kWindowClass, nullptr)) {
+    DWORD owner = 0;
+    GetWindowThreadProcessId(existing, &owner);
+    AllowSetForegroundWindow(owner);
+    PostMessageW(existing, WM_SHOW_INSTANCE, 0, 0);
+  }
+  CloseHandle(desktopInstance);
+  desktopInstance = nullptr;
+  return false;
+}
+
+static void enableDpiAwareness() {
+  // Per-monitor v2 (Windows 10 1703+) scales the non-client area and dialogs
+  // too; older systems fall back to what the ImGui backend can enable.
+  using SetContext = BOOL (WINAPI*)(HANDLE);
+  const auto set = reinterpret_cast<SetContext>(
+    GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetProcessDpiAwarenessContext"));
+  if (set && set(reinterpret_cast<HANDLE>(static_cast<INT_PTR>(-4)))) return;
+  ImGui_ImplWin32_EnableDpiAwareness();
+}
+
+static void applyWindowScale(HWND window, float scale, const RECT* suggested = nullptr) {
+  desktop.setScale(scale);
+  RECT bounds{};
+  if (suggested) bounds = *suggested;
+  else GetWindowRect(window, &bounds);
+  SetWindowPos(window, nullptr, bounds.left, bounds.top, static_cast<int>(std::lround(kWindowWidth * desktop.scale())),
+    suggested ? suggested->bottom - suggested->top : static_cast<int>(std::lround(kWindowHeight * desktop.scale())),
+    SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+static std::wstring lenientWide(const std::string& value) {
+  if (value.empty()) return {};
+  const int n = MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0);
+  std::wstring out(static_cast<size_t>(std::max(0, n)), L'\0');
+  if (n > 0) MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), out.data(), n);
+  return out;
+}
+
+// Plain-text report for support. It never contains tokens: settings are listed
+// by name, and the runtime logs only record steps, addresses and error codes.
+static std::string diagnosticsText() {
+  std::ostringstream out;
+  out << "ETL " << etlVersion << " diagnostics\r\n";
+  using RtlGetVersion = LONG (WINAPI*)(OSVERSIONINFOW*);
+  OSVERSIONINFOW os{sizeof(os)};
+  if (const auto get = reinterpret_cast<RtlGetVersion>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion")))
+    get(&os);
+  out << "Windows: " << os.dwMajorVersion << "." << os.dwMinorVersion << "." << os.dwBuildNumber << "\r\n";
+  const auto mode = [](const Config& c) { return !c.vpn ? "proxy only" : c.selective ? "selective" : "full"; };
+  const bool active = connectionExists();
+  out << "Mode: " << mode(active ? activeConfig : config) << (active ? " (connected)" : " (disconnected)") << "\r\n";
+  const Config& shown = active ? activeConfig : config;
+  out << "Server: " << utf8(shown.server) << ":" << shown.serverPort
+      << (shown.selectedAgent.empty() ? "" : " (agent " + shown.selectedAgent + ")")
+      << "; backup: " << (shown.fallbackServer.empty() ? "none" : utf8(shown.fallbackServer)) << "\r\n";
+  out << "Local proxy: 127.0.0.1:" << shown.localPort << "; timeout " << shown.connectTimeoutMs << " ms\r\n";
+  if (fullSession.exists()) {
+    const auto session = fullSession.snapshot();
+    static const char* const phases[]{"starting", "running", "stopping", "stopped", "failed"};
+    out << "Tunnel: " << phases[static_cast<int>(session.phase)] << (session.paused ? ", reconnecting" : "")
+        << (session.dnsBypassed ? ", DNS bypassed" : "") << ", " << session.routed << " routed, "
+        << session.sessions << " connections, " << session.failures << " failures\r\n";
+  } else if (service.running()) {
+    out << "Proxy: " << service.sessions() << " connections, " << service.failures() << " failures\r\n";
+  }
+  const auto path = etlvpn::currentPath("0.0.0.0");  // the default route only; no server needed
+  out << "Default route: " << (path.ok ? (path.gateway.empty() ? std::string("on-link") : path.gateway) +
+    " via interface " + std::to_string(path.interfaceIndex) : std::string("none")) << "\r\n";
+  out << "Display scale: " << static_cast<int>(std::lround(desktop.scale() * 100)) << "%\r\n";
+  if (!uiError.empty()) out << "Last message: " << uiError << "\r\n";
+  out << "\r\n--- error.log (latest lines) ---\r\n" << etlvpn::logTail(L"error.log", 80);
+  out << "\r\n--- guard.log (latest lines) ---\r\n" << etlvpn::logTail(L"guard.log", 20);
+  return out.str();
+}
+
+static bool copyToClipboard(HWND window, const std::string& text) {
+  const std::wstring value = lenientWide(text);
+  if (!OpenClipboard(window)) return false;
+  bool ok = false;
+  if (EmptyClipboard()) {
+    if (HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, (value.size() + 1) * sizeof(wchar_t))) {
+      if (void* target = GlobalLock(memory)) {
+        std::memcpy(target, value.c_str(), (value.size() + 1) * sizeof(wchar_t));
+        GlobalUnlock(memory);
+        ok = SetClipboardData(CF_UNICODETEXT, memory) != nullptr;
+      }
+      if (!ok) GlobalFree(memory);
+    }
+  }
+  CloseClipboard();
+  return ok;
 }
 
 static void openBrowser(HWND window) {
@@ -1683,10 +1916,17 @@ static LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wparam, LPA
       ScreenToClient(window, &point);
       RECT client{}; GetClientRect(window, &client);
       // Reserve the back button and window controls for normal client input.
-      if (point.y >= 0 && point.y < 50 && point.x >= 54 && point.x < client.right - 90) return HTCAPTION;
+      const float scale = desktop.scale();
+      if (point.y >= 0 && point.y < 50 * scale && point.x >= 54 * scale && point.x < client.right - 90 * scale) return HTCAPTION;
       return HTCLIENT;
     }
     case WM_NCLBUTTONDBLCLK: return 0;
+    case WM_DPICHANGED:
+      // Moving to a monitor with another scale: Windows suggests the position,
+      // the width follows the new scale and the height follows the content.
+      applyWindowScale(window, HIWORD(wparam) / 96.f, reinterpret_cast<const RECT*>(lparam));
+      return 0;
+    case WM_SHOW_INSTANCE: showWindow(window); return 0;
     case WM_COMMAND:
       if (LOWORD(wparam) == ID_CONNECT) connectOrStop(window);
       else if (LOWORD(wparam) == ID_OPEN) showWindow(window);
@@ -1794,7 +2034,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     const int result = applyUpdate(argc, argv);
     LocalFree(argv); WSACleanup(); return result;
   }
-  if (argc == 3 && std::wstring(argv[1]) == L"--cleanup-update") cleanupUpdate(argv[2]);
+  const bool afterUpdate = argc == 3 && std::wstring(argv[1]) == L"--cleanup-update";
+  if (afterUpdate) cleanupUpdate(argv[2]);
   if (argc == 2 && std::wstring(argv[1]) == L"--self-test-vpn-extract") {
     std::wstring error;
     const bool ok = etlvpn::selfTestExtract(error);
@@ -1819,6 +2060,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   const bool previewFullDns = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-full-dns";
   const bool previewSelective = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-selective";
   const bool previewSelectivePaused = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-selective-paused";
+  const bool previewFullReconnecting = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-full-reconnecting";
+  const bool previewScaled = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-scaled";
   const bool previewConnecting = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-connecting";
   const bool previewStopping = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-stopping";
   const bool previewActive = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-active";
@@ -1827,7 +2070,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   const bool previewDownloading = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-downloading";
   const bool previewUpdateError = argc == 3 && std::wstring(argv[1]) == L"--self-test-ui-update-error";
   const std::wstring previewPath = argc == 3 && (std::wstring(argv[1]) == L"--self-test-ui" || previewOptions || previewActive || previewFull || previewFullActive || previewFullDns || previewSelective || previewSelectivePaused || previewConnecting || previewStopping || previewServers || previewServersMany || previewServersEmpty || previewLongServer || previewAgentExport ||
-    previewError || previewUpdate || previewDownloading || previewUpdateError || previewReduced) ? argv[2] : L"";
+    previewError || previewUpdate || previewDownloading || previewUpdateError || previewReduced ||
+    previewFullReconnecting || previewScaled) ? argv[2] : L"";
   if (argc == 2 && std::wstring(argv[1]) == L"--self-test-token-storage") {
     std::string original(64, 'a'), restored;
     std::wstring protectedValue;
@@ -1840,6 +2084,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   if (argc > 1 && std::wstring(argv[1]) == L"--headless") {
     if (argc % 2 != 0) { LocalFree(argv); WSACleanup(); return 22; }
     Config c;
+    bool reconnect = false;
     for (int i = 2; i + 1 < argc; i += 2) {
       std::wstring name = argv[i], value = argv[i + 1];
       if (name == L"--server") c.server = value;
@@ -1862,6 +2107,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
       else if (name == L"--port") { if (!portValue(value, c.localPort)) return 21; }
       else if (name == L"--vpn") { c.vpn = value == L"1"; }
       else if (name == L"--vpn-selective") { if (value != L"0" && value != L"1") return 20; c.selective = value == L"1"; }
+      else if (name == L"--vpn-reconnect") { if (value != L"0" && value != L"1") return 20; reconnect = value == L"1"; }
       else if (name == L"--vpn-scope") {
         c.vpnScope = value;
         if (value.empty() || value.size() > 15 ||
@@ -1873,6 +2119,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     // Selective and scoped are layouts of the TUN mode and exclude each other.
     if ((c.selective || !c.vpnScope.empty()) && !c.vpn) return 20;
     if (c.selective && !c.vpnScope.empty()) return 20;
+    // Reconnecting is how the desktop runs Full mode; headless keeps the
+    // original "exit 5 when the tunnel is lost" unless asked to.
+    if (reconnect && (!c.vpn || c.selective || !c.vpnScope.empty())) return 20;
     if (c.vpn && !etlvpn::isElevated()) {
       // The UAC consent copies the whole headless command line verbatim.
       std::wstring arguments;
@@ -1914,11 +2163,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
       fwprintf(stderr, L"%ls\n", error.c_str());
       LocalFree(argv); WSACleanup(); return result;
     }
+    auto nextFollow = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    auto follow = [&] {
+      if (std::chrono::steady_clock::now() < nextFollow) return;
+      nextFollow = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      if (vpn.followNetwork(etlvpn::currentPath(plan.server))) fwprintf(stderr, L"Network changed; tunnel path updated.\n");
+    };
     if (c.vpn && c.selective) {
       // Selective fails open (see etlvpn::SelectiveHealth): only an engine exit ends it.
       etlvpn::SelectiveHealth health(std::chrono::steady_clock::now());
       etlvpn::SelectiveScanner scanner(plan.server);
       while (!vpn.waitEngine(500)) {
+        follow();
         if (!health.paused()) for (const uint32_t address : scanner.scan())
           if (vpn.routeDestination(address)) fwprintf(stderr, L"Routing %hs through ETL.\n", etlvpn::ipv4Text(address).c_str());
         if (!health.due(std::chrono::steady_clock::now())) continue;
@@ -1940,14 +2196,30 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
       service.stop();
       LocalFree(argv); WSACleanup(); return 5;
     }
+    if (c.vpn && c.vpnScope.empty()) {
+      FullModeHost host;
+      host.wait = [](DWORD milliseconds) { Sleep(milliseconds); return false; };
+      host.paused = [](bool paused) {
+        fwprintf(stderr, paused ? L"Tunnel lost; normal connection restored. Reconnecting when the server answers.\n" :
+          L"Tunnel restored.\n");
+      };
+      host.dnsBypassed = [](bool) {};
+      host.tick = [] {};
+      host.reconnect = reconnect;
+      const std::string failure = runFullMode(c, plan, host);
+      vpn.stop();
+      fwprintf(stderr, L"%hs\n", failure.c_str());
+      service.stop();
+      LocalFree(argv); WSACleanup(); return 5;
+    }
     if (c.vpn) {
       etlvpn::TunnelWatch watch(std::chrono::steady_clock::now());
       while (vpn.status().active) {
         bool keep = !vpn.waitEngine(0);
+        if (keep) follow();
         if (keep && watch.due(std::chrono::steady_clock::now())) {
           etlvpn::HealthReport report;
-          if (c.vpnScope.empty()) report = vpn.health();
-          else report.tunnel = report.dns = service.checkTunnel();
+          report.tunnel = report.dns = service.checkTunnel();
           keep = watch.record(report, std::chrono::steady_clock::now());
         }
         if (!keep) {
@@ -1965,22 +2237,26 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   }
   for (int i = 1; i < argc; ++i) {
     const std::wstring name = argv[i];
-    if (name == L"--vpn" || name == L"--vpn-scope" || name == L"--vpn-selective") {
+    if (name == L"--vpn" || name == L"--vpn-scope" || name == L"--vpn-selective" || name == L"--vpn-reconnect") {
       fwprintf(stderr, L"%ls requires --headless as the first argument.\n", argv[i]);
       LocalFree(argv); WSACleanup(); return 22;
     }
   }
   LocalFree(argv);
+  if (previewPath.empty() && !claimDesktop(afterUpdate)) { WSACleanup(); return 0; }
+  enableDpiAwareness();
   config = previewPath.empty() ? loadConfig() : Config{};
   if (previewPath.empty()) loadAgentCache();
   loadForm();
   WNDCLASSW wc{}; wc.lpfnWndProc = windowProc; wc.hInstance = instance;
   wc.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_ETL));
-  wc.lpszClassName = L"ETLNativeClient"; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+  wc.lpszClassName = kWindowClass; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
   RegisterClassW(&wc);
   HWND window = CreateWindowExW(WS_EX_APPWINDOW, wc.lpszClassName, L"ETL", WS_POPUP | WS_MINIMIZEBOX | WS_SYSMENU,
-    CW_USEDEFAULT, CW_USEDEFAULT, 400, 460, nullptr, nullptr, instance, nullptr);
+    CW_USEDEFAULT, CW_USEDEFAULT, kWindowWidth, kWindowHeight, nullptr, nullptr, instance, nullptr);
   if (!window) { WSACleanup(); return 1; }
+  // Previews render at a fixed scale so their pixel checks hold on any display.
+  applyWindowScale(window, !previewPath.empty() ? (previewScaled ? 1.5f : 1.f) : ImGui_ImplWin32_GetDpiScaleForHwnd(window));
   const int rounded = 2;
   const DWORD noBorder = 0xfffffffe;
   DwmSetWindowAttribute(window, static_cast<DWMWINDOWATTRIBUTE>(33), &rounded, sizeof(rounded));
@@ -2028,11 +2304,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
       state.routed = previewSelectivePaused ? 0 : 2; state.paused = previewSelectivePaused;
       renderPreview(state);
     }
-    if (previewFull || previewFullActive || previewFullDns || previewConnecting || previewStopping) {
+    if (previewFull || previewFullActive || previewFullDns || previewFullReconnecting || previewConnecting || previewStopping) {
       form.mode = DesktopMode::Full;
       DesktopState state{};
-      state.mode = DesktopMode::Full; state.running = previewFullActive || previewFullDns;
-      state.dnsBypassed = previewFullDns;
+      state.mode = DesktopMode::Full; state.running = previewFullActive || previewFullDns || previewFullReconnecting;
+      state.dnsBypassed = previewFullDns; state.paused = previewFullReconnecting;
       state.starting = previewConnecting; state.stopping = previewStopping;
       renderPreview(state);
     }
@@ -2077,7 +2353,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
       renderPreview(state);
       motion = height() > collapsed;
     }
-    POINT drag{100, 20}, control{320, 20};
+    const float scale = desktop.scale();
+    POINT drag{static_cast<LONG>(100 * scale), static_cast<LONG>(20 * scale)},
+      control{static_cast<LONG>(320 * scale), static_cast<LONG>(20 * scale)};
     ClientToScreen(window, &drag); ClientToScreen(window, &control);
     const bool chrome = !(GetWindowLongPtrW(window, GWL_STYLE) & WS_CAPTION) &&
       SendMessageW(window, WM_NCHITTEST, 0, MAKELPARAM(drag.x, drag.y)) == HTCAPTION &&
@@ -2090,6 +2368,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   catch (const std::exception&) { uiError = "Updates are unavailable. Restart ETL to try again."; }
   MSG message{};
   bool quit = false;
+  ConnectClock::time_point diagnosticsShownUntil{};
   while (!quit) {
     while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
       if (message.message == WM_QUIT) { quit = true; break; }
@@ -2121,7 +2400,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
       state.dnsBypassed = full.dnsBypassed; state.routed = full.routed; state.paused = full.paused;
     }
     if (updater) state.update = updater->snapshot();
+    state.diagnosticsCopied = ConnectClock::now() < diagnosticsShownUntil;
     switch (desktop.render(form, state)) {
+      case DesktopAction::CopyDiagnostics:
+        if (copyToClipboard(window, diagnosticsText())) diagnosticsShownUntil = ConnectClock::now() + std::chrono::seconds(4);
+        else uiError = "Diagnostics could not be copied.";
+        break;
       case DesktopAction::ToggleConnection: connectOrStop(window); break;
       case DesktopAction::SaveSettings: {
         Config next;

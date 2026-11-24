@@ -49,7 +49,9 @@ class FullSessionWorker {
   // True when the tunnel works but system DNS cannot reach its mapped DNS.
   void dnsBypassed(bool bypassed);
   void routed(int destinations);  // Selective: destinations routed through the tunnel
-  void paused(bool serverUnreachable);  // Selective: routes withdrawn until the server answers
+  // Routes withdrawn until the server answers: Selective's relay routes, or
+  // Full mode's whole tunnel (the PC is on its normal connection meanwhile).
+  void paused(bool serverUnreachable);
   ~FullSessionWorker();
  private:
   HANDLE parent_ = nullptr, mapping_ = nullptr, stop_ = nullptr;

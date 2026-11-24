@@ -59,8 +59,9 @@ See [agents](docs/agents.md) for execution, persistent state and revocation.
 ## Scope
 
 ETL forwards TCP and supports UDP through SOCKS5 UDP ASSOCIATE. Proxy only
-affects applications configured to use it. Windows Full mode uses a TUN adapter
-and restores normal routing if the tunnel fails. Windows Selective mode uses the
+affects applications configured to use it. Windows Full mode uses a TUN adapter;
+if the tunnel fails it restores normal routing at once and reconnects by itself
+when the server answers again. Windows Selective mode uses the
 same adapter only for Twingate relay connections that the network blocks, so
 Twingate works on networks that allow little more than HTTPS. SOCKS clients should send
 hostnames through the proxy (`socks5h`).

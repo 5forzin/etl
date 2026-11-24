@@ -91,6 +91,55 @@ test('native Windows client protects stored tokens with DPAPI',
     execFileSync(executable, ['--self-test-token-storage'], { windowsHide: true });
   });
 
+test('native Windows client sends the destination with its authentication, saving a round trip',
+  { skip: !executable || process.platform !== 'win32', timeout: 15000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'etl-native-pipeline-'));
+  const certPath = join(dir, 'cert.pem'), keyPath = join(dir, 'key.pem'), tokenPath = join(dir, 'token');
+  let server, child;
+  try {
+    execFileSync(process.env.ETL_OPENSSL ?? 'openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes',
+      '-keyout', keyPath, '-out', certPath, '-days', '1', '-subj', '/CN=localhost',
+      '-addext', 'subjectAltName=DNS:localhost'], { stdio: 'pipe' });
+    writeFileSync(tokenPath, 'a'.repeat(64));
+    const key = readFileSync(keyPath), cert = readFileSync(certPath);
+    const seen = [];
+    server = track(tls.createServer({ key, cert, minVersion: 'TLSv1.3' }, (socket) => {
+      socket.on('error', () => {});
+      void (async () => {
+        const hello = await readFrame(socket);
+        // Before any reply: the destination must already be on its way.
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        seen.push({ token: hello.token, pipelined: socket.readableLength > 2 });
+        socket.write(Buffer.from([0, 13, ...Buffer.from('{"code":"OK"}')]));
+        const request = await readFrame(socket);
+        seen.at(-1).host = request.host;
+        socket.write(Buffer.from([0, 13, ...Buffer.from('{"code":"OK"}')]));
+        socket.pipe(socket);
+      })().catch(() => socket.destroy());
+    }));
+    const serverPort = await listen(server);
+    const localPort = await freePort();
+    child = spawn(executable, ['--headless', '--server', 'localhost', '--server-port', String(serverPort),
+      '--port', String(localPort), '--token-file', tokenPath, '--ca', certPath], { stdio: 'ignore', windowsHide: true });
+    await awaitClient(localPort, child);
+    const socket = protect(net.connect({ host: '127.0.0.1', port: localPort }), 5000);
+    await connected(socket);
+    socket.write(Buffer.from([5, 1, 0]));
+    assert.deepEqual(await read(socket, 2), Buffer.from([5, 0]));
+    const host = Buffer.from('pipelined.example');
+    socket.write(Buffer.concat([Buffer.from([5, 1, 0, 3, host.length]), host, Buffer.from([1, 187])]));
+    assert.equal((await read(socket, 10))[1], 0, 'the pipelined request should succeed');
+    socket.write('echo');
+    assert.equal((await read(socket, 4)).toString(), 'echo');
+    socket.destroy();
+    assert.deepEqual(seen, [{ token: 'a'.repeat(64), pipelined: true, host: 'pipelined.example' }]);
+  } finally {
+    child?.kill();
+    if (server) await server.shutdown();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 async function listen(server, host = '127.0.0.1') {
   server.listen(0, host);
   await once(server, 'listening');
@@ -323,6 +372,13 @@ test('native client validates the Selective layout options before elevating',
     'Selective takes 0 or 1');
   assert.equal(status(['--headless', '--server', 'localhost', '--vpn', '1', '--vpn-selective', '1',
     '--vpn-scope', '192.0.2.1']), 20, 'Selective and a fixed scope exclude each other');
+  assert.equal(status(['--headless', '--server', 'localhost', '--vpn-reconnect', '1']), 20,
+    'reconnecting must require --vpn 1');
+  assert.equal(status(['--headless', '--server', 'localhost', '--vpn', '1', '--vpn-selective', '1',
+    '--vpn-reconnect', '1']), 20, 'only Full mode reconnects; Selective already fails open');
+  assert.equal(status(['--headless', '--server', 'localhost', '--vpn', '1', '--vpn-reconnect', 'yes']), 20,
+    'reconnect takes 0 or 1');
+  assert.equal(status(['--vpn-reconnect', '1']), 22, 'VPN options require --headless');
 });
 
 test('native desktop renders compact frames and animates expansion and collapse without starting a proxy',
@@ -336,7 +392,7 @@ test('native desktop renders compact frames and animates expansion and collapse 
       '--self-test-ui-servers', '--self-test-ui-agent-export',
       '--self-test-ui-servers-many', '--self-test-ui-long-server',
       '--self-test-ui-servers-empty', '--self-test-ui-full-dns', '--self-test-ui-selective',
-      '--self-test-ui-selective-paused'].map((flag, index) => {
+      '--self-test-ui-selective-paused', '--self-test-ui-full-reconnecting'].map((flag, index) => {
       const path = join(dir, `preview-${index}.bmp`);
       execFileSync(executable, [flag, path], { windowsHide: true, timeout: 8000 });
       const bitmap = readFileSync(path);
@@ -374,6 +430,27 @@ test('native desktop renders compact frames and animates expansion and collapse 
     assert.ok(heights[17] > heights[8], 'the DNS notice should expand the active Full mode window');
     assert.ok(heights[18] > heights[8], 'Selective should report its routed relays below the counters');
     assert.ok(heights[19] > heights[18], 'a paused Selective should explain that Twingate uses the normal network');
+    assert.ok(heights[20] > heights[8], 'a reconnecting Full mode should explain that the normal connection is in use');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('native desktop scales its layout for high-DPI displays instead of being stretched',
+  { skip: !executable || process.platform !== 'win32', timeout: 20000 }, () => {
+  const dir = mkdtempSync(join(tmpdir(), 'etl-ui-dpi-'));
+  try {
+    const size = (flag) => {
+      const path = join(dir, `${flag.slice(2)}.bmp`);
+      execFileSync(executable, [flag, path], { windowsHide: true, timeout: 8000 });
+      const bitmap = readFileSync(path);
+      const width = bitmap.readInt32LE(18), height = Math.abs(bitmap.readInt32LE(22));
+      const alpha = (x, y) => bitmap[bitmap.readUInt32LE(10) + (y * width + x) * 4 + 3];
+      assert.equal(alpha(3, 3), 0, 'the scaled window should keep its rounded, clipped corners');
+      assert.equal(alpha(width >> 1, height >> 1), 255, 'the scaled interior should be opaque');
+      return { width, height };
+    };
+    const normal = size('--self-test-ui'), scaled = size('--self-test-ui-scaled');
+    assert.equal(scaled.width, 600, 'a 150% display should get a 600-pixel window');
+    assert.ok(Math.abs(scaled.height - normal.height * 1.5) <= 3, 'the layout should scale as a whole');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

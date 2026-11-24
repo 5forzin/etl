@@ -13,7 +13,10 @@
 #include <cstring>
 #include <ctime>
 #include <cwctype>
+#include <deque>
 #include <fstream>
+#include <functional>
+#include <mutex>
 #include <sstream>
 #include <thread>
 #include <vector>
@@ -31,10 +34,16 @@ static const wchar_t* const kComponentNames[] = {L"hev-socks5-tunnel.exe",
   L"msys-2.0.dll", L"wintun.dll"};
 static const int kComponentIds[] = {IDR_HEV_EXE, IDR_MSYS_DLL, IDR_WINTUN_DLL};
 static const wchar_t kAdapterName[] = L"ETL";
-static const wchar_t kTunAddress[] = L"198.18.0.1";
 static const wchar_t kTunDns[] = L"198.18.0.2";
-static const wchar_t* const kHalfDefaults[] = {L"0.0.0.0", L"128.0.0.0"};
+static const char* const kHalfDefaults[] = {"0.0.0.0", "128.0.0.0"};
 static const wchar_t* const kIpv6HalfDefaults[] = {L"::/1", L"8000::/1"};
+// Mapped-DNS answers ("fake IPs"). The range stays inside 198.18.0.0/15, which
+// is reserved for benchmarking and never routed on the internet; 100.64.0.0/10
+// (used until 0.7) collides with CGNAT, Tailscale and Twingate addresses.
+static const char kFakeNetwork[] = "198.19.0.0";
+static const char kFakeNetmask[] = "255.255.0.0";
+static constexpr uint8_t kFakePrefixLength = 16;
+static const char kFakeProbe[] = "198.19.0.1";
 
 using ProbeClock = std::chrono::steady_clock;
 
@@ -332,16 +341,128 @@ static bool runCommand(const std::wstring& command, std::string* error = nullptr
   return success;
 }
 
-// Startup checkpoint log: the VPN path runs elevated and windowless, so a
-// crash leaves nothing behind unless each step writes here first.
-void checkpoint(const char* step) {
-  std::ofstream out(runtimeDirectory() / L"error.log", std::ios::app);
-  if (out) out << step << "\n";
+// Runtime logs. The desktop, the elevated worker and the guard write to the
+// same directory, so each line carries the local time and the process id. A
+// log past kLogLimit is moved to <name>.1 (replacing the previous one), which
+// bounds the directory at about twice the limit per log.
+static constexpr uintmax_t kLogLimit = 512 * 1024;
+
+static void appendLog(const wchar_t* name, const std::string& line) {
+  static std::mutex mutex;
+  std::lock_guard<std::mutex> lock(mutex);
+  const std::filesystem::path directory = runtimeDirectory();
+  std::error_code ec;
+  std::filesystem::create_directories(directory, ec);
+  const std::filesystem::path path = directory / name;
+  const uintmax_t size = std::filesystem::file_size(path, ec);
+  if (!ec && size > kLogLimit)
+    MoveFileExW(path.c_str(), (path.wstring() + L".1").c_str(), MOVEFILE_REPLACE_EXISTING);
+  SYSTEMTIME now{};
+  GetLocalTime(&now);
+  char stamp[64];
+  std::snprintf(stamp, sizeof(stamp), "%04u-%02u-%02u %02u:%02u:%02u.%03u [%lu] ",
+    now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond, now.wMilliseconds,
+    static_cast<unsigned long>(GetCurrentProcessId()));
+  std::ofstream out(path, std::ios::app | std::ios::binary);
+  if (out) out << stamp << line << "\r\n";
 }
 
+std::string logTail(const wchar_t* name, size_t lines) {
+  std::ifstream in(runtimeDirectory() / name, std::ios::binary);
+  if (!in) return {};
+  std::deque<std::string> kept;
+  std::string line;
+  while (std::getline(in, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    kept.push_back(line);
+    if (kept.size() > lines) kept.pop_front();
+  }
+  std::string out;
+  for (const auto& entry : kept) { out += entry; out += "\r\n"; }
+  return out;
+}
+
+// Startup checkpoint log: the VPN path runs elevated and windowless, so a
+// crash leaves nothing behind unless each step writes here first.
+void checkpoint(const char* step) { appendLog(L"error.log", step); }
+
 void checkpoint(const char* step, const std::string& detail) {
-  std::ofstream out(runtimeDirectory() / L"error.log", std::ios::app);
-  if (out) out << step << ": " << detail << "\n";
+  appendLog(L"error.log", std::string(step) + ": " + detail);
+}
+
+// Routes go through the IP Helper API instead of route.exe: no process per
+// change, exact error codes, and deletes that match the stored row. (A route
+// whose gateway is the adapter's own address is stored on-link, with next hop
+// 0.0.0.0, so `route delete ... 198.18.0.1` matched nothing and failed silently.)
+// Addresses are in network byte order; a zero next hop means on-link.
+static uint32_t ipv4Address(const std::string& text) {
+  in_addr value{};
+  return !text.empty() && inet_pton(AF_INET, text.c_str(), &value) == 1 ? value.s_addr : 0;
+}
+
+static bool addRoute(uint32_t prefix, uint8_t length, unsigned long interfaceIndex, uint32_t nextHop,
+                     std::string* error = nullptr) {
+  MIB_IPFORWARD_ROW2 row;
+  InitializeIpForwardEntry(&row);
+  row.InterfaceIndex = interfaceIndex;
+  row.DestinationPrefix.Prefix.si_family = AF_INET;
+  row.DestinationPrefix.Prefix.Ipv4.sin_addr.s_addr = prefix;
+  row.DestinationPrefix.PrefixLength = length;
+  row.NextHop.si_family = AF_INET;
+  row.NextHop.Ipv4.sin_addr.s_addr = nextHop;
+  row.Metric = 1;
+  row.Protocol = static_cast<NL_ROUTE_PROTOCOL>(MIB_IPPROTO_NETMGMT);
+  const DWORD result = CreateIpForwardEntry2(&row);
+  if (result == NO_ERROR || result == ERROR_OBJECT_ALREADY_EXISTS) return true;
+  if (error) *error = "CreateIpForwardEntry2 failed: " + std::to_string(result);
+  return false;
+}
+
+static bool matchesPrefix(const MIB_IPFORWARD_ROW2& row, uint32_t prefix, uint8_t length) {
+  return row.DestinationPrefix.Prefix.si_family == AF_INET && row.DestinationPrefix.PrefixLength == length &&
+    row.DestinationPrefix.Prefix.Ipv4.sin_addr.s_addr == prefix;
+}
+
+// Deletes every IPv4 row for prefix/length that `match` accepts; returns how many.
+static int deleteRoutes(uint32_t prefix, uint8_t length,
+                        const std::function<bool(const MIB_IPFORWARD_ROW2&)>& match) {
+  PMIB_IPFORWARD_TABLE2 table = nullptr;
+  if (GetIpForwardTable2(AF_INET, &table) != NO_ERROR || !table) return 0;
+  int deleted = 0;
+  for (ULONG i = 0; i < table->NumEntries; ++i) {
+    MIB_IPFORWARD_ROW2& row = table->Table[i];
+    if (matchesPrefix(row, prefix, length) && match(row) && DeleteIpForwardEntry2(&row) == NO_ERROR) ++deleted;
+  }
+  FreeMibTable(table);
+  return deleted;
+}
+
+static int deleteRoutes(uint32_t prefix, uint8_t length, unsigned long interfaceIndex) {
+  return deleteRoutes(prefix, length, [interfaceIndex](const MIB_IPFORWARD_ROW2& row) {
+    return !interfaceIndex || row.InterfaceIndex == interfaceIndex;
+  });
+}
+
+static bool routePresent(uint32_t prefix, uint8_t length, unsigned long interfaceIndex, uint32_t nextHop) {
+  PMIB_IPFORWARD_TABLE2 table = nullptr;
+  if (GetIpForwardTable2(AF_INET, &table) != NO_ERROR || !table) return false;
+  bool found = false;
+  for (ULONG i = 0; i < table->NumEntries && !found; ++i) {
+    const MIB_IPFORWARD_ROW2& row = table->Table[i];
+    found = matchesPrefix(row, prefix, length) && row.InterfaceIndex == interfaceIndex &&
+      row.NextHop.Ipv4.sin_addr.s_addr == nextHop;
+  }
+  FreeMibTable(table);
+  return found;
+}
+
+static bool routePresentAnywhere(uint32_t prefix, uint8_t length) {
+  PMIB_IPFORWARD_TABLE2 table = nullptr;
+  if (GetIpForwardTable2(AF_INET, &table) != NO_ERROR || !table) return true;  // unknown: not proven gone
+  bool found = false;
+  for (ULONG i = 0; i < table->NumEntries && !found; ++i) found = matchesPrefix(table->Table[i], prefix, length);
+  FreeMibTable(table);
+  return found;
 }
 
 static bool writeConfig(const std::filesystem::path& path, int localPort) {
@@ -360,8 +481,8 @@ static bool writeConfig(const std::filesystem::path& path, int localPort) {
       << "mapdns:\n"
       << "  address: 198.18.0.2\n"
       << "  port: 53\n"
-      << "  network: 100.64.0.0\n"
-      << "  netmask: 255.192.0.0\n"
+      << "  network: " << kFakeNetwork << "\n"
+      << "  netmask: " << kFakeNetmask << "\n"
       << "  cache-size: 10000\n"
       << "misc:\n"
       << "  log-file: hev.log\n"
@@ -401,15 +522,21 @@ static DWORD waitForAdapter(const std::wstring& name, const char* address, int s
 }
 
 RoutePlan planRoutes(const std::wstring& server) {
-  RoutePlan plan;
   ADDRINFOW hints{};
   hints.ai_family = AF_INET;
   PADDRINFOW result = nullptr;
-  if (GetAddrInfoW(server.c_str(), nullptr, &hints, &result) || !result) return plan;
+  if (GetAddrInfoW(server.c_str(), nullptr, &hints, &result) || !result) return {};
   char address[INET_ADDRSTRLEN]{};
   const sockaddr_in* ipv4 = reinterpret_cast<const sockaddr_in*>(result->ai_addr);
-  if (inet_ntop(AF_INET, &ipv4->sin_addr, address, sizeof(address))) plan.server = address;
+  std::string resolved;
+  if (inet_ntop(AF_INET, &ipv4->sin_addr, address, sizeof(address))) resolved = address;
   FreeAddrInfoW(result);
+  return currentPath(resolved);
+}
+
+RoutePlan currentPath(const std::string& serverIp) {
+  RoutePlan plan;
+  plan.server = serverIp;
   ULONG size = 0;
   if (GetIpForwardTable(nullptr, &size, 0) != ERROR_INSUFFICIENT_BUFFER || !size) return plan;
   std::vector<unsigned char> buffer(size);
@@ -521,10 +648,7 @@ static bool spawnGuard(const std::wstring& server, unsigned long weakHostInterfa
   return true;
 }
 
-static void guardLog(const std::string& message) {
-  std::ofstream out(runtimeDirectory() / L"guard.log", std::ios::app);
-  if (out) out << message << "\n";
-}
+static void guardLog(const std::string& message) { appendLog(L"guard.log", message); }
 
 int runGuard(const std::wstring& server, unsigned long parentPid,
              const std::wstring& readyEvent, unsigned long weakHostInterface) {
@@ -578,13 +702,15 @@ int runGuard(const std::wstring& server, unsigned long parentPid,
     CloseHandle(watched);
   }
   guardLog("awake parent=" + std::to_string(parentPid));
-  // "-" means the session pinned no server route (Selective layout).
+  // "-" means the session pinned no server route (Selective layout). Success
+  // means no host route to the server is left, however many there were.
   bool removed = server == L"-";
+  const uint32_t serverAddress = removed ? 0 : ipv4Address(std::string(server.begin(), server.end()));
   for (int attempt = 1; attempt <= 2 && !removed; ++attempt) {
-    std::string error;
-    if (runCommand(L"route delete " + server, &error)) { removed = true; break; }
-    guardLog("Route delete attempt " + std::to_string(attempt) + ": " + error);
-    if (attempt == 1) Sleep(250);
+    const int deleted = serverAddress ? deleteRoutes(serverAddress, 32, 0) : 0;
+    removed = serverAddress && !routePresentAnywhere(serverAddress, 32);
+    guardLog("Host routes deleted: " + std::to_string(deleted) + (removed ? "" : " (some remain)"));
+    if (!removed && attempt == 1) Sleep(250);
   }
   // A clean stop already restored it; disabling again is then a no-op.
   if (weakHostInterface) {
@@ -617,39 +743,30 @@ bool Vpn::start(int localPort, const RoutePlan& plan, VpnLayout layout,
     checkpoint("plan");
     if (!plan.ok) { error = L"Server address or default route unavailable."; return false; }
     checkpoint("plan-ok", plan.server + " via " + (plan.gateway.empty() ? std::string("if") : plan.gateway));
-    const std::wstring serverIp = widen(plan.server);
-    const std::wstring gateway = widen(plan.gateway);
+    if (!ipv4Address(plan.server)) { error = L"Server address unavailable."; return false; }
     // Only an interface whose weak host send is off is changed (and restored);
     // the guard learns about it before anything is modified.
     const unsigned long weakHostInterface = weakHostSendEnabled(plan.interfaceIndex) ? 0 : plan.interfaceIndex;
     // Selective never routes the server's address into the tunnel (it is
     // excluded from the candidates), so it pins no host route and survives a
     // change of gateway without a stale route to the server.
-    const bool pinServer = layout != VpnLayout::Selective;
+    const bool pinned = layout != VpnLayout::Selective;
     HANDLE guard = nullptr;
-    if (!spawnGuard(pinServer ? serverIp : L"-", weakHostInterface, guard)) {
+    if (!spawnGuard(pinned ? widen(plan.server) : L"-", weakHostInterface, guard)) {
       error = L"Restoration guard could not be armed."; return false;
     }
     guard_ = guard;
+    guardWeakHost_ = guardAttempt_ = weakHostInterface;
+    path_ = plan;
     checkpoint("guard");
     // The engine must reach the ETL server outside the tunnel, so the host
     // route goes in before anything points at the adapter.
-    if (pinServer) {
-      std::wstring hostRoute(L"route add ");
-      hostRoute.append(serverIp);
-      hostRoute.append(L" mask 255.255.255.255 ");
-      if (gateway.empty()) hostRoute.append(std::to_wstring(plan.interfaceIndex));
-      else {
-        hostRoute.append(gateway);
-        hostRoute.append(L" if ");
-        hostRoute.append(std::to_wstring(plan.interfaceIndex));
-      }
+    if (pinned) {
       checkpoint("host-route");
-      if (!runCommand(hostRoute)) {
+      if (!pinServer(plan)) {
         stop();
         error = L"Server host route could not be installed."; return false;
       }
-      serverRoute_ = serverIp;
     }
     checkpoint("job");
     HANDLE job = CreateJobObjectW(nullptr, nullptr);
@@ -717,24 +834,27 @@ bool Vpn::start(int localPort, const RoutePlan& plan, VpnLayout layout,
       } else checkpoint("physical-weak-host-failed", weakHostError);
     }
     layout_ = layout;
+    tunAdapter_ = adapter;
+    std::string routeError;
     if (layout == VpnLayout::Selective) {
       // Destinations arrive later through routeDestination(); DNS stays untouched.
       selectiveAdapter_ = adapter;
     } else if (layout == VpnLayout::Scoped) {
       // Scoped traffic must keep the physical adapter's real DNS answers.
       checkpoint("scoped-route");
-      if (!runCommand(L"route add " + scope + L" mask 255.255.255.255 " + kTunAddress +
-          L" metric 1 if " + std::to_wstring(adapter))) {
+      const std::string scopeAddress(scope.begin(), scope.end());
+      if (!ipv4Address(scopeAddress) || !addRoute(ipv4Address(scopeAddress), 32, adapter, 0, &routeError)) {
+        checkpoint("scoped-route-failed", routeError);
         stop();
         error = L"Scoped route could not be installed.";
         return false;
       }
-      scopeRoute_ = scope;
+      scopeRoute_ = scopeAddress;
     } else {
       // Full mode must route fake-IP answers before advertising mapdns.
       checkpoint("mapdns-route");
-      if (!runCommand(L"route add 100.64.0.0 mask 255.192.0.0 " +
-          std::wstring(kTunAddress) + L" metric 1 if " + std::to_wstring(adapter))) {
+      if (!addRoute(ipv4Address(kFakeNetwork), kFakePrefixLength, adapter, 0, &routeError)) {
+        checkpoint("mapdns-route-failed", routeError);
         stop();
         error = L"Mapdns route could not be installed.";
         return false;
@@ -744,8 +864,8 @@ bool Vpn::start(int localPort, const RoutePlan& plan, VpnLayout layout,
       // More-specific routes preserve the physical default and the server /32.
       checkpoint("default-routes");
       for (size_t i = 0; i < 2; ++i) {
-        if (!runCommand(L"route add " + std::wstring(kHalfDefaults[i]) +
-            L" mask 128.0.0.0 " + kTunAddress + L" metric 1 if " + std::to_wstring(adapter))) {
+        if (!addRoute(ipv4Address(kHalfDefaults[i]), 1, adapter, 0, &routeError)) {
+          checkpoint("default-route-failed", routeError);
           stop();
           error = L"IPv4 default route could not be installed.";
           return false;
@@ -784,8 +904,7 @@ bool Vpn::routeDestination(uint32_t address) {
   if (layout_ != VpnLayout::Selective || !selectiveAdapter_ || !publicIpv4(address)) return false;
   if (std::find(selectiveRoutes_.begin(), selectiveRoutes_.end(), address) != selectiveRoutes_.end()) return false;
   std::string error;
-  if (!runCommand(L"route add " + widen(ipv4Text(address)) + L" mask 255.255.255.255 " + kTunAddress +
-      L" metric 1 if " + std::to_wstring(selectiveAdapter_), &error)) {
+  if (!addRoute(address, 32, selectiveAdapter_, 0, &error)) {
     checkpoint("selective-route-failed", ipv4Text(address) + " " + error);
     return false;
   }
@@ -794,29 +913,77 @@ bool Vpn::routeDestination(uint32_t address) {
   return true;
 }
 
-// A route whose gateway is the adapter's own address is stored on-link (next
-// hop 0.0.0.0), so `route delete <ip> mask ... 198.18.0.1` matches nothing and
-// fails silently. Delete the exact /32 row on the adapter instead.
-static bool deleteHostRoute(uint32_t address, unsigned long interfaceIndex) {
-  PMIB_IPFORWARD_TABLE2 table = nullptr;
-  if (GetIpForwardTable2(AF_INET, &table) != NO_ERROR || !table) return false;
-  bool deleted = false;
-  for (ULONG i = 0; i < table->NumEntries; ++i) {
-    MIB_IPFORWARD_ROW2& row = table->Table[i];
-    if (row.InterfaceIndex == interfaceIndex && row.DestinationPrefix.PrefixLength == 32 &&
-        row.DestinationPrefix.Prefix.si_family == AF_INET &&
-        row.DestinationPrefix.Prefix.Ipv4.sin_addr.s_addr == address &&
-        DeleteIpForwardEntry2(&row) == NO_ERROR) deleted = true;
+// Adds the server's host route on `path` before removing any other host route
+// to it, so the server is never routed into the tunnel in between.
+bool Vpn::pinServer(const RoutePlan& path) {
+  const uint32_t server = ipv4Address(path.server);
+  const uint32_t gateway = ipv4Address(path.gateway);
+  std::string error;
+  if (!server || !addRoute(server, 32, path.interfaceIndex, gateway, &error)) {
+    checkpoint("host-route-failed", error);
+    return false;
   }
-  FreeMibTable(table);
-  return deleted;
+  serverRoute_ = path.server;
+  const int stale = deleteRoutes(server, 32, [&](const MIB_IPFORWARD_ROW2& row) {
+    return row.InterfaceIndex != path.interfaceIndex || row.NextHop.Ipv4.sin_addr.s_addr != gateway;
+  });
+  if (stale) checkpoint("host-route-replaced", std::to_string(stale));
+  return true;
+}
+
+static std::string describePath(const RoutePlan& path) {
+  return (path.gateway.empty() ? std::string("on-link") : path.gateway) + " if " + std::to_string(path.interfaceIndex);
+}
+
+bool Vpn::followNetwork(const RoutePlan& path) {
+  if (!job_ || !path.ok || path.server != path_.server) return false;
+  const bool moved = pathChanged(path_, path);
+  bool changed = moved;
+  if (moved) checkpoint("network-changed", describePath(path_) + " -> " + describePath(path));
+  if (!serverRoute_.empty() &&
+      (moved || !routePresent(ipv4Address(path.server), 32, path.interfaceIndex, ipv4Address(path.gateway)))) {
+    if (!moved) checkpoint("host-route-missing", describePath(path));
+    changed |= pinServer(path);
+  }
+  // A weak host setting this session enabled moves with the path; one that
+  // Windows reset (reconnecting can recreate the interface state) comes back.
+  if (moved && physicalWeakHost_ && physicalWeakHost_ != path.interfaceIndex) {
+    std::string error;
+    if (setWeakHostSend(physicalWeakHost_, false, &error)) checkpoint("physical-weak-host-restored");
+    else checkpoint("physical-weak-host-restore-failed", error);
+    physicalWeakHost_ = 0;
+  }
+  // A failure is retried only after the next change of path, not every check.
+  if ((moved || physicalWeakHost_ == path.interfaceIndex) && !weakHostSendEnabled(path.interfaceIndex)) {
+    std::string error;
+    if (setWeakHostSend(path.interfaceIndex, true, &error)) {
+      physicalWeakHost_ = path.interfaceIndex;
+      checkpoint("physical-weak-host", std::to_string(path.interfaceIndex));
+      changed = true;
+    } else checkpoint("physical-weak-host-failed", error);
+  }
+  // The guard restores the interface it was armed with; re-arm it before the
+  // old one goes away, so there is never a moment without a guard.
+  if (physicalWeakHost_ != guardWeakHost_ && physicalWeakHost_ != guardAttempt_) {
+    guardAttempt_ = physicalWeakHost_;
+    HANDLE guard = nullptr;
+    if (spawnGuard(serverRoute_.empty() ? L"-" : widen(serverRoute_), physicalWeakHost_, guard)) {
+      HANDLE previous = static_cast<HANDLE>(guard_);
+      guard_ = guard;
+      guardWeakHost_ = physicalWeakHost_;
+      if (previous) { TerminateProcess(previous, 0); CloseHandle(previous); }
+      checkpoint("guard-rearmed", std::to_string(guardWeakHost_));
+    } else checkpoint("guard-rearm-failed");
+  }
+  path_ = path;
+  return changed;
 }
 
 void Vpn::withdrawDestinations() {
   if (selectiveRoutes_.empty()) return;
   size_t deleted = 0;
   for (const uint32_t address : selectiveRoutes_) {
-    if (deleteHostRoute(address, selectiveAdapter_)) ++deleted;
+    if (deleteRoutes(address, 32, selectiveAdapter_)) ++deleted;
     else checkpoint("selective-withdraw-failed", ipv4Text(address));
   }
   checkpoint("selective-withdrawn", std::to_string(deleted) + "/" + std::to_string(selectiveRoutes_.size()));
@@ -849,10 +1016,12 @@ void Vpn::stop() {
   HANDLE process = static_cast<HANDLE>(process_);
   job_ = nullptr;
   process_ = nullptr;
+  // Routes are deleted explicitly before the adapter goes, so a slow adapter
+  // teardown never leaves the default traffic pointing at a dead interface.
   for (size_t i = 0; i < 2; ++i) {
     if (!defaultRoutes_[i]) continue;
-    runCommand(L"route delete " + std::wstring(kHalfDefaults[i]) +
-      L" mask 128.0.0.0 " + kTunAddress + L" if " + std::to_wstring(fullAdapter_));
+    if (!deleteRoutes(ipv4Address(kHalfDefaults[i]), 1, fullAdapter_))
+      checkpoint("default-route-delete-failed", kHalfDefaults[i]);
     defaultRoutes_[i] = false;
   }
   for (size_t i = 0; i < 2; ++i) {
@@ -862,15 +1031,16 @@ void Vpn::stop() {
       L"\" nexthop=:: store=active");
     ipv6Routes_[i] = false;
   }
-  fullAdapter_ = 0;
   if (!scopeRoute_.empty()) {
-    runCommand(L"route delete " + scopeRoute_);
+    deleteRoutes(ipv4Address(scopeRoute_), 32, tunAdapter_);
     scopeRoute_.clear();
   }
   if (mapDnsRoute_) {
-    runCommand(L"route delete 100.64.0.0 mask 255.192.0.0");
+    deleteRoutes(ipv4Address(kFakeNetwork), kFakePrefixLength, fullAdapter_);
     mapDnsRoute_ = false;
   }
+  fullAdapter_ = 0;
+  tunAdapter_ = 0;
   // Killing the job removes the adapter, and Windows drops its routes with it.
   if (job) TerminateJobObject(job, 1);
   if (process) {
@@ -879,10 +1049,12 @@ void Vpn::stop() {
   }
   if (job) CloseHandle(job);
   if (!serverRoute_.empty()) {
-    if (!runCommand(L"route delete " + serverRoute_))
-      runCommand(L"route delete " + serverRoute_);
+    const uint32_t server = ipv4Address(serverRoute_);
+    if (!deleteRoutes(server, 32, 0) && routePresentAnywhere(server, 32)) checkpoint("host-route-delete-failed");
     serverRoute_.clear();
   }
+  path_ = RoutePlan{};
+  guardWeakHost_ = guardAttempt_ = 0;
   runCommand(L"ipconfig /flushdns");
   stopGuard(guard_);
 }
@@ -904,7 +1076,7 @@ static constexpr unsigned long kRelayProbeMs = 4000;
 HealthReport Vpn::health() const {
   HealthReport report;
   if (!fullAdapter_) return report;
-  for (const char* address : {"1.1.1.1", "142.250.0.1", "100.64.0.1"}) {
+  for (const char* address : {"1.1.1.1", "142.250.0.1", kFakeProbe}) {
     in_addr destination{};
     InetPtonA(AF_INET, address, &destination);
     MIB_IPFORWARDROW route{};

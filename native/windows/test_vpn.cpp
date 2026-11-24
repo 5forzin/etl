@@ -112,6 +112,38 @@ static void selectiveHealthPolicy() {
   require(health.record(true, at += 4s) == Change::None, "A healthy server resumed Selective twice");
 }
 
+// Full mode no longer ends when the tunnel drops: it waits for the server on
+// this schedule. Retries start quickly and settle at the limit, never faster.
+static void retryPolicy() {
+  using namespace std::chrono_literals;
+  const auto start = etlvpn::RetrySchedule::Clock::now();
+  etlvpn::RetrySchedule retry;
+  retry.reset(start);
+  require(!retry.due(start + 1s) && retry.due(start + 2s), "The first reconnection check was not quick");
+  auto at = start + 2s;
+  const int expected[]{4, 8, 16, 30, 30, 30};
+  for (const int seconds : expected) {
+    retry.failed(at);
+    require(retry.delay().count() == seconds, "Reconnection checks did not back off as expected");
+    require(!retry.due(at + std::chrono::seconds(seconds - 1)) && retry.due(at + std::chrono::seconds(seconds)),
+      "A reconnection check ran at the wrong time");
+    at += std::chrono::seconds(seconds);
+  }
+  retry.reset(at);
+  require(retry.delay().count() == 2 && retry.due(at + 2s), "A new outage did not start with quick checks");
+}
+
+static void pathPolicy() {
+  etlvpn::RoutePlan wifi{"13.140.191.31", "172.16.70.1", 12, true};
+  etlvpn::RoutePlan roamed = wifi, cable = wifi, down;
+  roamed.gateway = "192.168.0.1";
+  cable.interfaceIndex = 7;
+  require(!etlvpn::pathChanged(wifi, wifi), "An unchanged path was reported as moved");
+  require(etlvpn::pathChanged(wifi, roamed), "A new gateway on the same adapter was missed");
+  require(etlvpn::pathChanged(wifi, cable), "A switch to another adapter was missed");
+  require(!etlvpn::pathChanged(wifi, down), "A missing default route must not move the tunnel");
+}
+
 static uint32_t ip(const char* text) {
   in_addr value{};
   require(inet_pton(AF_INET, text, &value) == 1, "Invalid fixture address");
@@ -133,7 +165,7 @@ static void selectivePolicy() {
   require(!etlvpn::selectiveCandidate(L"Twingate.Service.exe", stuck, server, 30501, server),
     "The ETL server itself would be routed into its own tunnel");
   for (const char* local : {"10.1.2.3", "172.16.79.254", "192.168.0.1", "100.96.30.29", "127.0.0.1",
-                            "169.254.1.1", "198.18.0.2", "224.0.0.251", "0.0.0.0"})
+                            "169.254.1.1", "198.18.0.2", "198.19.4.1", "224.0.0.251", "0.0.0.0"})
     require(!etlvpn::selectiveCandidate(L"Twingate.Service.exe", stuck, ip(local), 30501, server),
       "A private, local or special address was routed");
   require(!etlvpn::selectiveCandidate(L"chrome.exe", stuck, relay, 30501, server),
@@ -150,6 +182,8 @@ int main() {
     watchPolicy();
     selectivePolicy();
     selectiveHealthPolicy();
+    retryPolicy();
+    pathPolicy();
     require(exchange(Reply::Valid), "Healthy DNS relay rejected");
     require(!exchange(Reply::WrongId), "Unrelated DNS reply accepted");
     require(!exchange(Reply::Truncated), "Truncated relay reply accepted");

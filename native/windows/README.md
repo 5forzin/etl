@@ -29,12 +29,16 @@ in their existing folder. Portable copies replace only their executable, with
 rollback if the copy fails. Saved settings and DPAPI tokens remain in `%APPDATA%\ETL`.
 Network failures leave the current client usable and can be retried.
 
-To publish an update, increase `package.json`'s version, build the portable client
-and installer, and attach `etl-client.exe` and `ETL-Setup-VERSION-x64.exe` to a
-published stable Release tagged `vVERSION` (or `VERSION`) and marked as Latest.
-GitHub supplies the asset digests on upload. Drafts, prereleases, older versions
-and assets without a valid digest are not installed. The first release containing
-this updater must be installed manually by users of earlier versions.
+To publish an update, increase `package.json`'s version, add its `CHANGELOG.md`
+section and push the tag `vVERSION`. The Release workflow builds and tests the
+client and installer on a clean Windows runner and opens a **draft** release named
+`ETL VERSION` with every download, the aggregated `SHA256SUMS` and the changelog
+section as notes (`native/windows/release.ps1` assembles the same files locally).
+Test those exact files, then publish the draft and mark it as Latest; only then
+do clients offer the update. GitHub supplies the asset digests on upload. Drafts,
+prereleases, older versions and assets without a valid digest are not installed.
+The first release containing this updater must be installed manually by users of
+earlier versions.
 
 Run `etl-client.exe`, enter the server and token in Settings, then choose a mode.
 
@@ -51,20 +55,36 @@ Run `etl-client.exe`, enter the server and token in Settings, then choose a mode
   in a row, it withdraws its relay routes (Twingate falls back to the normal
   network), shows "Reconnecting" and resumes once the server answers again. Each
   failed check is logged as `health-server-failed` with its stage and duration.
-- **Full mode** routes the whole PC through the TUN adapter.
+- **Full mode** routes the whole PC through the TUN adapter. It heals itself: when
+  the tunnel is lost (three failed checks, or the engine exiting) it restores the
+  normal connection at once, shows "Reconnecting" with an amber dot, checks the
+  server after 2, 4, 8 and 16 seconds and then every 30 seconds, and rebuilds the
+  tunnel as soon as the server answers. Only Disconnect, or a tunnel that cannot
+  be rebuilt three times in a row, ends the session.
 
 Selective and Full start a separate elevated worker; the desktop and browser
 keep normal user permissions. Both use the selected server; the primary profile's
 backup remains saved for Proxy only. They authenticate before changing routes and
-restore the normal connection after Disconnect, Exit or a desktop crash. Full
-mode also restores it after a tunnel failure; Selective pauses instead. Closing the window hides it in the tray and keeps the selected
-mode running.
+restore the normal connection after Disconnect, Exit or a desktop crash. While
+they run they follow the physical network every two seconds: after a switch
+between Wi-Fi and cable, a new access point or a resume from sleep they re-pin
+the server route on the new gateway (the new route goes in before the old one is
+removed), move the weak host setting to the new interface and re-arm the
+restoration guard for it. A host route that Windows dropped on reconnection is
+put back. Closing the window hides it in the tray and keeps the selected mode
+running. Opening ETL again shows the window that is already running instead of
+starting a second copy.
 
-The borderless window is 400 pixels wide, with a draggable header and custom
-minimize and close controls. Settings contains server credentials, ports, backup,
-timeout and CA. Save persists edits without starting a connection. The
-mode selector, hover states, page transitions and window height animate smoothly,
-respecting Windows' reduced-animation preference.
+The borderless window is 400 logical pixels wide, with a draggable header and
+custom minimize and close controls. It is DPI aware (per monitor): layout, icons
+and text are drawn at the display scale (600 sharp pixels at 150%) instead of
+being stretched, and moving the window to a monitor with another scale redraws
+it there. Settings contains server credentials, ports, backup, timeout and CA,
+plus Copy diagnostics, which puts the version, Windows build, mode, server,
+tunnel state, default route, display scale and the latest runtime log lines on
+the clipboard (never tokens). Save persists edits without starting a connection.
+The mode selector, hover states, page transitions and window height animate
+smoothly, respecting Windows' reduced-animation preference.
 
 Open browser opens a separate Edge or Chrome session with
 `--proxy-server=socks5://127.0.0.1:<local port>` and remote hostname resolution.
@@ -102,7 +122,13 @@ Tokens are not included in the executable or release. An existing client profile
 is loaded but does not start automatically when the desktop opens.
 
 Each server attempt has a default five-second deadline covering DNS, TCP, verified
-TLS and authentication. New connections may use a backup with its own token.
+TLS and authentication. A connection sends its destination in the same TLS record
+as the authentication frame and disables Nagle's algorithm, so setup takes three
+round trips: TCP, TLS, then authentication together with the destination. Before
+0.8, authentication and destination took one round trip each and Nagle's
+algorithm could hold a small frame for another. Measured through the production
+server, a new HTTPS request went from about 2.0 to 1.1 seconds.
+New connections may use a backup with its own token.
 The backup is checked in the background at startup and every 30 seconds after
 each check. It receives traffic only after verified TLS and ETL authentication
 succeed. A failed check or connection disables it until a later check succeeds.
@@ -180,9 +206,13 @@ release parsing, version ordering, checksums, portable rollback, browser argumen
 and the desktop worker lifecycle. Worker tests exercise traffic reporting,
 cancellation, errors and parent death without UAC or network route changes.
 
-`--self-test-ui-full`, `--self-test-ui-full-active`, `--self-test-ui-full-dns`, `--self-test-ui-selective`,
+`--self-test-ui-full`, `--self-test-ui-full-active`, `--self-test-ui-full-dns`,
+`--self-test-ui-full-reconnecting`, `--self-test-ui-selective`,
 `--self-test-ui-selective-paused`, `--self-test-ui-connecting` and
 `--self-test-ui-stopping` capture the mode selector and connection states.
+Previews render at 100% scale on any display; `--self-test-ui-scaled` renders
+the main page at 150% and the suite checks that it is 600 pixels wide and scaled
+as a whole.
 Previews are 32-bit bitmaps with straight alpha: the corners outside the rounded
 window outline are transparent and the outline is anti-aliased, as on screen.
 `--self-test-ui-active` captures the local proxy's traffic counters. These fixtures
@@ -210,8 +240,18 @@ still point at the adapter and relays a DNS exchange over TCP through the
 tunnel, trying Cloudflare and Google at the same time with four seconds each.
 Three consecutive failed checks restore the normal connection (one every two
 seconds while failing); an engine exit restores it immediately. The client then
-exits with code 5. Physical default routes and DNS settings remain unchanged,
-and restoration removes the TUN routes and flushes cached synthetic DNS answers.
+exits with code 5, unless `--vpn-reconnect 1` is given: then it keeps running,
+reconnects the way the desktop does and prints each loss and restoration.
+Physical default routes and DNS settings remain unchanged, and restoration
+removes the TUN routes and flushes cached synthetic DNS answers. Routes are
+created and deleted through the IP Helper API, never `route.exe`. Mapped-DNS
+answers use `198.19.0.0/16`, inside the benchmarking range `198.18.0.0/15`
+that is never routed on the internet (until 0.7 they used `100.64.0.0/10`,
+which collides with CGNAT, Tailscale and Twingate addresses).
+
+The worker, the guard and headless runs log to `%LOCALAPPDATA%\ETL\runtime\error.log`
+and `guard.log`. Each line starts with the local time and the process id; a log
+past 512 KiB moves to `error.log.1` (or `guard.log.1`), replacing the older copy.
 
 Some services, Twingate among them, bind their sockets to the physical adapter's
 address. Under Windows' default strong host model such packets never leave
@@ -229,7 +269,7 @@ sends were already enabled, ETL leaves them alone.
 `--vpn-selective 1` (with `--vpn 1`) selects the Selective layout in headless
 mode and prints each relay address it routes and each pause or resume. It only
 exits (code 5) when the tunnel engine exits. It cannot be combined with
-`--vpn-scope`.
+`--vpn-scope` or `--vpn-reconnect`.
 
 The same check also sends a UDP query to the engine's mapped DNS. That result is
 informational: other VPN clients (Twingate, for example) block UDP port 53 outside

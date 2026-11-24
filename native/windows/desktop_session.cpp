@@ -12,7 +12,7 @@ struct SessionMemory {
   volatile LONG phase = static_cast<LONG>(SessionPhase::Starting), sessions = 0;
   volatile LONG dnsBypassed = 0;  // 1 when system DNS cannot use the tunnel's mapped DNS
   volatile LONG routed = 0;       // Selective: destinations routed through the tunnel
-  volatile LONG paused = 0;       // Selective: server unreachable, routes withdrawn
+  volatile LONG paused = 0;       // server unreachable: Selective's routes withdrawn, or Full's tunnel down
   alignas(8) volatile LONG64 sent = 0, received = 0, failures = 0;
   char configuration[8192]{};
   char error[512]{};

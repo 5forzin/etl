@@ -27,18 +27,32 @@ constexpr float windowRadius = 22;
 constexpr float primaryHeight = 44, secondaryHeight = 40;
 ImFont *body = nullptr, *heading = nullptr, *brand = nullptr;
 bool reduceMotion = false;
+// Layout metrics are written at 96 DPI and multiplied by the monitor scale, so
+// a 150% display gets a sharp 600-pixel-wide window instead of a stretched
+// bitmap. Fonts follow through style.FontScaleDpi (ImGui rasterizes them at the
+// final size).
+float uiScale = 1;
+float px(float value) { return value * uiScale; }
+ImVec2 px(float x, float y) { return {x * uiScale, y * uiScale}; }
+// Hairlines stay whole pixels: 1 px up to 199%, then 2 px.
+float hairline() { return std::max(1.f, std::floor(uiScale)); }
 
-enum class Icon { Proxy, Selective, Full, Browser, Settings, Power, Stop, Back, Chevron, Minimize, Close, Upload, Download };
+enum class Icon { Proxy, Selective, Full, Browser, Settings, Power, Stop, Back, Chevron, Minimize, Close, Upload, Download, Copy };
 
+// Icons are drawn on a 24-unit grid scaled to `size`, radii included.
 void icon(ImDrawList* draw, Icon kind, ImVec2 origin, float size, ImU32 color) {
   auto p = [&](float x, float y) { return ImVec2{origin.x + x * size / 24, origin.y + y * size / 24}; };
+  auto r = [&](float units) { return units * size / 24; };
   const float stroke = 1.45f * size / 24;
   auto line = [&](float x, float y, float x2, float y2) { draw->AddLine(p(x, y), p(x2, y2), color, stroke); };
   switch (kind) {
     case Icon::Proxy:
-      draw->AddRect(p(3, 6), p(10, 18), color, 3, 0, stroke);
-      draw->AddRect(p(14, 6), p(21, 18), color, 3, 0, stroke);
+      draw->AddRect(p(3, 6), p(10, 18), color, r(3), 0, stroke);
+      draw->AddRect(p(14, 6), p(21, 18), color, r(3), 0, stroke);
       line(10, 12, 14, 12); break;
+    case Icon::Copy:  // a sheet in front of another
+      draw->AddRect(p(9, 9), p(20, 20), color, r(2.5f), 0, stroke);
+      line(15, 5.5f, 15, 4); line(15, 4, 4, 4); line(4, 4, 4, 15); line(4, 15, 5.5f, 15); break;
     case Icon::Selective:  // one path forks: only part of the traffic is diverted
       line(3, 12, 10, 12); line(10, 12, 17, 6.5f); line(10, 12, 17, 17.5f);
       draw->AddCircle(p(19, 5.5f), size * 2 / 24, color, 12, stroke);
@@ -48,8 +62,8 @@ void icon(ImDrawList* draw, Icon kind, ImVec2 origin, float size, ImU32 color) {
       draw->AddEllipse(p(12, 12), {size * 4 / 24, size * 9 / 24}, color, 0, 32, stroke);
       line(3, 12, 21, 12); break;
     case Icon::Browser:
-      draw->AddRect(p(3, 4), p(21, 20), color, 4, 0, stroke);
-      line(3, 9, 21, 9); draw->AddCircleFilled(p(7, 6.5f), .7f, color, 8); break;
+      draw->AddRect(p(3, 4), p(21, 20), color, r(4), 0, stroke);
+      line(3, 9, 21, 9); draw->AddCircleFilled(p(7, 6.5f), r(.7f), color, 8); break;
     case Icon::Settings:
       for (int i = 0; i < 6; ++i) {
         const float a = (i * 60 - 30) * 3.14159265f / 180;
@@ -60,7 +74,7 @@ void icon(ImDrawList* draw, Icon kind, ImVec2 origin, float size, ImU32 color) {
     case Icon::Power:
       draw->PathArcTo(p(12, 12), size * 8 / 24, -1.0f, 4.14f, 32);
       draw->PathStroke(color, 0, stroke); line(12, 2, 12, 11); break;
-    case Icon::Stop: draw->AddRect(p(6, 6), p(18, 18), color, 3, 0, stroke); break;
+    case Icon::Stop: draw->AddRect(p(6, 6), p(18, 18), color, r(3), 0, stroke); break;
     case Icon::Back: line(14, 6, 8, 12); line(8, 12, 14, 18); break;
     case Icon::Chevron: line(9, 7, 14, 12); line(14, 12, 9, 17); break;
     case Icon::Minimize: line(7, 13, 17, 13); break;
@@ -91,15 +105,15 @@ bool button(const char* label, ImVec2 size, Icon symbol, bool primary = false, b
   fill.x += shade; fill.y += shade; fill.z += shade;
   const bool iconOnly = label[0] == '#' && label[1] == '#';
   if (row || iconOnly) fill.w = hover;
-  draw->AddRectFilled(p, {p.x + size.x, p.y + size.y}, ImGui::GetColorU32(fill), primary ? size.y / 2 : controlRadius);
-  if (focused) draw->AddRect({p.x - 2, p.y - 2}, {p.x + size.x + 2, p.y + size.y + 2},
-    ImGui::GetColorU32(muted), primary ? size.y / 2 : controlRadius + 2, 0, 1);
+  draw->AddRectFilled(p, {p.x + size.x, p.y + size.y}, ImGui::GetColorU32(fill), primary ? size.y / 2 : px(controlRadius));
+  if (focused) draw->AddRect({p.x - px(2), p.y - px(2)}, {p.x + size.x + px(2), p.y + size.y + px(2)},
+    ImGui::GetColorU32(muted), primary ? size.y / 2 : px(controlRadius + 2), 0, hairline());
   const ImU32 foreground = ImGui::GetColorU32(primary ? background : accent);
   const float textWidth = iconOnly ? 0 : ImGui::CalcTextSize(label).x;
-  const float left = row ? 12 : (size.x - (iconOnly ? 20 : textWidth + 30)) / 2;
-  icon(draw, symbol, {p.x + left, p.y + (size.y - 20) / 2}, 20, foreground);
-  if (!iconOnly) draw->AddText({p.x + left + 30, p.y + (size.y - ImGui::GetFontSize()) / 2}, foreground, label);
-  if (row) icon(draw, Icon::Chevron, {p.x + size.x - 32, p.y + (size.y - 18) / 2}, 18, ImGui::GetColorU32(muted));
+  const float left = row ? px(12) : (size.x - (iconOnly ? px(20) : textWidth + px(30))) / 2;
+  icon(draw, symbol, {p.x + left, p.y + (size.y - px(20)) / 2}, px(20), foreground);
+  if (!iconOnly) draw->AddText({p.x + left + px(30), p.y + (size.y - ImGui::GetFontSize()) / 2}, foreground, label);
+  if (row) icon(draw, Icon::Chevron, {p.x + size.x - px(32), p.y + (size.y - px(18)) / 2}, px(18), ImGui::GetColorU32(muted));
   return clicked;
 }
 
@@ -130,7 +144,7 @@ void drawBrand(ImDrawList* draw, ImVec2 origin, float size, ImU32 color) {
 
 void fieldLabel(const char* label) {
   ImGui::TextColored(muted, "%s", label);
-  ImGui::SetCursorPosY(ImGui::GetCursorPosY() - 4);
+  ImGui::SetCursorPosY(ImGui::GetCursorPosY() - px(4));
 }
 
 void input(const char* label, const char* hint, char* value, size_t size, bool secret = false) {
@@ -159,8 +173,49 @@ std::string ellipsize(const char* text, float width) {
 }
 
 void panel(ImDrawList* draw, ImVec2 position, ImVec2 size, float radius = panelRadius) {
-  draw->AddRectFilled(position, {position.x + size.x, position.y + size.y}, ImGui::GetColorU32(surface), radius);
-  draw->AddRect(position, {position.x + size.x, position.y + size.y}, ImGui::GetColorU32(border), radius);
+  draw->AddRectFilled(position, {position.x + size.x, position.y + size.y}, ImGui::GetColorU32(surface), px(radius));
+  draw->AddRect(position, {position.x + size.x, position.y + size.y}, ImGui::GetColorU32(border), px(radius), 0, hairline());
+}
+
+// Builds the style from its 96-DPI values; called again when the DPI changes.
+void applyStyle(float scale) {
+  auto& style = ImGui::GetStyle();
+  style = ImGuiStyle();
+  ImGui::StyleColorsDark();
+  style.WindowPadding = {pageInset, 20};
+  style.FramePadding = {12, 11};
+  style.ItemSpacing = {12, 8};
+  style.FrameRounding = controlRadius;
+  style.PopupRounding = panelRadius;
+  style.WindowRounding = windowRadius;
+  style.WindowBorderSize = 0;
+  style.FrameBorderSize = 1;
+  style.ScrollbarSize = 10;
+  style.ScrollbarRounding = 5;
+  style.Colors[ImGuiCol_WindowBg] = background;
+  style.Colors[ImGuiCol_PopupBg] = surface;
+  style.Colors[ImGuiCol_TitleBg] = surface;
+  style.Colors[ImGuiCol_TitleBgActive] = surface;
+  style.Colors[ImGuiCol_FrameBg] = surface;
+  style.Colors[ImGuiCol_FrameBgHovered] = {.13f, .13f, .13f, 1};
+  style.Colors[ImGuiCol_FrameBgActive] = {.16f, .16f, .16f, 1};
+  style.Colors[ImGuiCol_Border] = border;
+  style.Colors[ImGuiCol_Text] = accent;
+  style.Colors[ImGuiCol_TextDisabled] = muted;
+  style.Colors[ImGuiCol_Separator] = border;
+  style.Colors[ImGuiCol_Header] = surface;
+  style.Colors[ImGuiCol_HeaderHovered] = raised;
+  style.Colors[ImGuiCol_HeaderActive] = raised;
+  style.Colors[ImGuiCol_Button] = raised;
+  style.Colors[ImGuiCol_ButtonHovered] = {.22f, .22f, .22f, 1};
+  style.Colors[ImGuiCol_ButtonActive] = {.25f, .25f, .25f, 1};
+  style.Colors[ImGuiCol_NavCursor] = accent;
+  style.Colors[ImGuiCol_TextSelectedBg] = {.40f, .40f, .40f, .6f};
+  style.Colors[ImGuiCol_CheckMark] = accent;
+  style.Colors[ImGuiCol_ModalWindowDimBg] = {0, 0, 0, .55f};
+  style.ScaleAllSizes(scale);
+  style.FrameBorderSize = hairline();
+  style.FontScaleDpi = scale;
 }
 
 std::string bytes(uint64_t count) {
@@ -225,39 +280,8 @@ bool DesktopUi::initialize(HWND window, DesktopMotion motion) {
   heading = io.Fonts->AddFontFromMemoryTTF(const_cast<unsigned char*>(etlFont), sizeof(etlFont), 26, &font);
   brand = io.Fonts->AddFontFromMemoryTTF(const_cast<unsigned char*>(etlFont), sizeof(etlFont), 18, &font);
   if (!body || !heading || !brand) { ImGui::DestroyContext(); releaseDevice(); return false; }
-  auto& style = ImGui::GetStyle();
-  ImGui::StyleColorsDark();
-  style.WindowPadding = {pageInset, 20};
-  style.FramePadding = {12, 11};
-  style.ItemSpacing = {12, 8};
-  style.FrameRounding = controlRadius;
-  style.PopupRounding = panelRadius;
-  style.WindowRounding = windowRadius;
-  style.WindowBorderSize = 0;
-  style.FrameBorderSize = 1;
-  style.ScrollbarSize = 10;
-  style.ScrollbarRounding = 5;
-  style.Colors[ImGuiCol_WindowBg] = background;
-  style.Colors[ImGuiCol_PopupBg] = surface;
-  style.Colors[ImGuiCol_TitleBg] = surface;
-  style.Colors[ImGuiCol_TitleBgActive] = surface;
-  style.Colors[ImGuiCol_FrameBg] = surface;
-  style.Colors[ImGuiCol_FrameBgHovered] = {.13f, .13f, .13f, 1};
-  style.Colors[ImGuiCol_FrameBgActive] = {.16f, .16f, .16f, 1};
-  style.Colors[ImGuiCol_Border] = border;
-  style.Colors[ImGuiCol_Text] = accent;
-  style.Colors[ImGuiCol_TextDisabled] = muted;
-  style.Colors[ImGuiCol_Separator] = border;
-  style.Colors[ImGuiCol_Header] = surface;
-  style.Colors[ImGuiCol_HeaderHovered] = raised;
-  style.Colors[ImGuiCol_HeaderActive] = raised;
-  style.Colors[ImGuiCol_Button] = raised;
-  style.Colors[ImGuiCol_ButtonHovered] = {.22f, .22f, .22f, 1};
-  style.Colors[ImGuiCol_ButtonActive] = {.25f, .25f, .25f, 1};
-  style.Colors[ImGuiCol_NavCursor] = accent;
-  style.Colors[ImGuiCol_TextSelectedBg] = {.40f, .40f, .40f, .6f};
-  style.Colors[ImGuiCol_CheckMark] = accent;
-  style.Colors[ImGuiCol_ModalWindowDimBg] = {0, 0, 0, .55f};
+  uiScale = scale_;
+  applyStyle(scale_);
   if (!ImGui_ImplWin32_Init(window)) { ImGui::DestroyContext(); releaseDevice(); return false; }
   if (!ImGui_ImplDX11_Init(device_, context_)) {
     ImGui_ImplWin32_Shutdown(); ImGui::DestroyContext(); releaseDevice(); return false;
@@ -274,6 +298,15 @@ bool DesktopUi::message(HWND window, UINT msg, WPARAM wp, LPARAM lp) {
   return initialized_ && ImGui_ImplWin32_WndProcHandler(window, msg, wp, lp);
 }
 
+void DesktopUi::setScale(float scale) {
+  scale = std::clamp(scale, 1.f, 4.f);
+  if (scale == scale_) return;
+  scale_ = uiScale = scale;
+  if (initialized_) applyStyle(scale);
+  // The animated height restarts from the window's new size.
+  height_ = heightFrom_ = heightTarget_ = heightElapsed_ = 0;
+}
+
 void DesktopUi::resize(unsigned width, unsigned height) {
   if (!swap_ || !width || !height) return;
   context_->OMSetRenderTargets(0, nullptr, nullptr);
@@ -285,7 +318,7 @@ void DesktopUi::animateHeight(float target, float delta) {
   if (IsIconic(window_)) return;
   RECT bounds{}; GetWindowRect(window_, &bounds);
   if (!height_) height_ = heightFrom_ = heightTarget_ = static_cast<float>(bounds.bottom - bounds.top);
-  target = std::ceil(std::max(320.f, target));
+  target = std::ceil(std::max(px(320), target));
   if (target != heightTarget_) {
     heightFrom_ = height_;
     heightTarget_ = target;
@@ -328,11 +361,12 @@ DesktopAction DesktopUi::render(DesktopForm& form, const DesktopState& state, fl
     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
   auto* draw = ImGui::GetWindowDrawList();
   const auto windowSize = ImGui::GetWindowSize();
-  draw->AddRect({.5f, .5f}, {windowSize.x - .5f, windowSize.y - .5f},
-    ImGui::GetColorU32(border), windowRadius, 0, 1);
+  const float edge = hairline();
+  draw->AddRect({edge / 2, edge / 2}, {windowSize.x - edge / 2, windowSize.y - edge / 2},
+    ImGui::GetColorU32(border), px(windowRadius), 0, edge);
   const float width = ImGui::GetContentRegionAvail().x;
   const auto header = ImGui::GetCursorPos();
-  constexpr float headerHeight = 28;
+  const float headerHeight = px(28);
   const char* title = servers_ ? (exporting_ ? "Add server" : "Servers") : options_ ? "Settings" : "etl";
   float titleX;
   if (options_ || servers_) {
@@ -340,20 +374,20 @@ DesktopAction DesktopUi::render(DesktopForm& form, const DesktopState& state, fl
       if (servers_ && exporting_) { exporting_ = false; pageAlpha_ = 0; }
       else showOptions(false);
     }
-    titleX = header.x + headerHeight + 8;
+    titleX = header.x + headerHeight + px(8);
   } else {
     const auto origin = ImGui::GetCursorScreenPos();
-    drawBrand(draw, {origin.x, origin.y + 2}, 24, ImGui::GetColorU32(accent));
-    titleX = header.x + 32;
+    drawBrand(draw, {origin.x, origin.y + px(2)}, px(24), ImGui::GetColorU32(accent));
+    titleX = header.x + px(32);
   }
   ImGui::PushFont(brand);
   draw->AddText({titleX, header.y + (headerHeight - ImGui::GetFontSize()) / 2}, ImGui::GetColorU32(accent), title);
   ImGui::PopFont();
-  ImGui::SetCursorPos({windowSize.x - pageInset - headerHeight * 2 - 8, header.y});
+  ImGui::SetCursorPos({windowSize.x - px(pageInset) - headerHeight * 2 - px(8), header.y});
   if (button("##minimize", {headerHeight, headerHeight}, Icon::Minimize)) ShowWindow(window_, SW_MINIMIZE);
-  ImGui::SameLine(0, 8);
+  ImGui::SameLine(0, px(8));
   if (button("##close", {headerHeight, headerHeight}, Icon::Close)) PostMessageW(window_, WM_CLOSE, 0, 0);
-  ImGui::SetCursorPos({pageInset, header.y + 52});
+  ImGui::SetCursorPos({px(pageInset), header.y + px(52)});
   ImGui::PushStyleVar(ImGuiStyleVar_Alpha, pageAlpha_);
   DesktopAction action = DesktopAction::None;
   const bool busy = state.running || state.starting || state.stopping;
@@ -367,63 +401,64 @@ DesktopAction DesktopUi::render(DesktopForm& form, const DesktopState& state, fl
     ImGui::PushFont(heading); ImGui::TextUnformatted(status); ImGui::PopFont();
     const auto statusPosition = ImGui::GetCursorScreenPos();
     if (state.running) {
-      draw->AddCircleFilled({statusPosition.x + 3, statusPosition.y + 7}, 3,
-        ImGui::GetColorU32(ImVec4{.65f, .78f, .65f, 1}), 16);
-      ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 14);
+      const ImVec4 dot = state.paused ? ImVec4{.85f, .74f, .45f, 1} : ImVec4{.65f, .78f, .65f, 1};
+      draw->AddCircleFilled({statusPosition.x + px(3), statusPosition.y + px(7)}, px(3), ImGui::GetColorU32(dot), 16);
+      ImGui::SetCursorPosX(ImGui::GetCursorPosX() + px(14));
     }
     std::string serverLabel = form.server[0] ? form.server.data() : "Server not set";
     for (const auto& server : state.servers) if (server.id == form.selectedAgent) serverLabel = server.name;
     if (busy && !state.activeServer.empty()) serverLabel = state.activeServer;
     const auto displayedServer = ellipsize(serverLabel.c_str(), ImGui::GetContentRegionAvail().x);
     ImGui::TextColored(muted, "%s", displayedServer.c_str());
-    ImGui::Dummy({0, 8});
+    ImGui::Dummy(px(0, 8));
 
     const auto selector = ImGui::GetCursorScreenPos();
     constexpr int modes = 3;
-    const float segment = (width - 8) / modes;
-    panel(draw, selector, {width, 48});
-    const float selectedX = std::round(selector.x + 4 + segment * modePosition_);
-    draw->AddRectFilled({selectedX, selector.y + 4}, {selectedX + segment, selector.y + 44},
-      ImGui::GetColorU32(raised), 12);
+    const float segment = (width - px(8)) / modes;
+    panel(draw, selector, {width, px(48)});
+    const float selectedX = std::round(selector.x + px(4) + segment * modePosition_);
+    draw->AddRectFilled({selectedX, selector.y + px(4)}, {selectedX + segment, selector.y + px(44)},
+      ImGui::GetColorU32(raised), px(12));
     ImGui::BeginDisabled(busy);
     static const char* const labels[modes]{"Proxy only", "Selective", "Full mode"};
     static const char* const hints[modes]{"Only apps set to use 127.0.0.1 go through ETL.",
       "Only Twingate's blocked relay connections go through ETL.", "All traffic of this PC goes through ETL."};
     static const Icon icons[modes]{Icon::Proxy, Icon::Selective, Icon::Full};
     for (int mode = 0; mode < modes; ++mode) {
-      ImGui::SetCursorScreenPos({selector.x + 4 + segment * mode, selector.y + 4});
+      ImGui::SetCursorScreenPos({selector.x + px(4) + segment * mode, selector.y + px(4)});
       const char* label = labels[mode];
-      if (ImGui::InvisibleButton(label, {segment, 40}, ImGuiButtonFlags_EnableNav)) form.mode = static_cast<DesktopMode>(mode);
+      if (ImGui::InvisibleButton(label, {segment, px(40)}, ImGuiButtonFlags_EnableNav)) form.mode = static_cast<DesktopMode>(mode);
       if (!busy && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) ImGui::SetTooltip("%s", hints[mode]);
       const bool selected = form.mode == static_cast<DesktopMode>(mode);
       const float hover = hoverFade(label, ImGui::IsItemHovered());
       const ImU32 color = ImGui::GetColorU32(selected ? accent : ImVec4{muted.x + hover * .18f,
         muted.y + hover * .18f, muted.z + hover * .18f, 1});
       const float labelWidth = ImGui::CalcTextSize(label).x;
-      const float x = selector.x + 4 + segment * mode + (segment - labelWidth - 28) / 2;
-      icon(draw, icons[mode], {x, selector.y + 14}, 20, color);
-      draw->AddText({std::round(x + 28), selector.y + (48 - ImGui::GetFontSize()) / 2}, color, label);
+      const float x = selector.x + px(4) + segment * mode + (segment - labelWidth - px(28)) / 2;
+      icon(draw, icons[mode], {x, selector.y + px(14)}, px(20), color);
+      draw->AddText({std::round(x + px(28)), std::round(selector.y + (px(48) - ImGui::GetFontSize()) / 2)}, color, label);
       if (ImGui::IsItemFocused() && ImGui::GetIO().NavVisible) draw->AddRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
-        ImGui::GetColorU32(muted), 12);
+        ImGui::GetColorU32(muted), px(12), 0, hairline());
     }
     ImGui::EndDisabled();
-    ImGui::SetCursorScreenPos({selector.x, selector.y + 64});
+    ImGui::SetCursorScreenPos({selector.x, selector.y + px(64)});
     ImGui::BeginDisabled(state.stopping);
     const char* connectLabel = state.stopping ? "Disconnecting…" : state.starting ? "Cancel" :
       state.running ? "Disconnect" : "Connect";
-    if (button(connectLabel, {width, primaryHeight}, state.running || state.starting ? Icon::Stop : Icon::Power, true))
+    if (button(connectLabel, {width, px(primaryHeight)}, state.running || state.starting ? Icon::Stop : Icon::Power, true))
       action = DesktopAction::ToggleConnection;
     if (form.mode != DesktopMode::Proxy && !busy && ImGui::IsItemHovered()) ImGui::SetTooltip("Requires administrator permission.");
     ImGui::EndDisabled();
-    ImGui::Dummy({0, 8});
+    ImGui::Dummy(px(0, 8));
 
     const auto actions = ImGui::GetCursorScreenPos();
-    constexpr float rowHeight = 48, rowGap = 8, panelPadding = 8;
-    constexpr float panelHeight = panelPadding * 2 + rowHeight * 3 + rowGap * 2;
+    const float rowHeight = px(48), rowGap = px(8), panelPadding = px(8);
+    const float panelHeight = panelPadding * 2 + rowHeight * 3 + rowGap * 2;
     panel(draw, actions, {width, panelHeight});
     auto actionRow = [&](int row) {
       const float y = actions.y + panelPadding + row * (rowHeight + rowGap);
-      if (row) draw->AddLine({actions.x + 20, y - rowGap / 2}, {actions.x + width - 20, y - rowGap / 2}, ImGui::GetColorU32(border));
+      if (row) draw->AddLine({actions.x + px(20), std::round(y - rowGap / 2) + edge / 2},
+        {actions.x + width - px(20), std::round(y - rowGap / 2) + edge / 2}, ImGui::GetColorU32(border), edge);
       ImGui::SetCursorScreenPos({actions.x + panelPadding, y});
     };
     actionRow(0);
@@ -434,21 +469,21 @@ DesktopAction DesktopUi::render(DesktopForm& form, const DesktopState& state, fl
     if (button("Servers", {width - panelPadding * 2, rowHeight}, Icon::Proxy, false, true)) { showServers(); action = DesktopAction::RefreshServers; }
     actionRow(2);
     if (button("Settings", {width - panelPadding * 2, rowHeight}, Icon::Settings, false, true)) showOptions();
-    ImGui::SetCursorScreenPos({actions.x, actions.y + panelHeight + 16});
+    ImGui::SetCursorScreenPos({actions.x, actions.y + panelHeight + px(16)});
     ImGui::TextColored(muted, "127.0.0.1:%d", form.localPort);
     if (state.running) {
       ImGui::TextColored(muted, "%d %s", state.sessions, state.sessions == 1 ? "connection" : "connections");
       const auto sent = bytes(state.sent), received = bytes(state.received);
       const float sentWidth = ImGui::CalcTextSize(sent.c_str()).x;
       const float receivedWidth = ImGui::CalcTextSize(received.c_str()).x;
-      ImGui::SameLine(); ImGui::SetCursorPosX(windowSize.x - pageInset - sentWidth - receivedWidth - 52);
+      ImGui::SameLine(); ImGui::SetCursorPosX(windowSize.x - px(pageInset) - sentWidth - receivedWidth - px(52));
       auto position = ImGui::GetCursorScreenPos();
-      icon(draw, Icon::Upload, {position.x, position.y - 1}, 16, ImGui::GetColorU32(muted));
-      ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 20); ImGui::TextColored(muted, "%s", sent.c_str());
-      ImGui::SameLine(0, 12);
+      icon(draw, Icon::Upload, {position.x, position.y - px(1)}, px(16), ImGui::GetColorU32(muted));
+      ImGui::SetCursorPosX(ImGui::GetCursorPosX() + px(20)); ImGui::TextColored(muted, "%s", sent.c_str());
+      ImGui::SameLine(0, px(12));
       position = ImGui::GetCursorScreenPos();
-      icon(draw, Icon::Download, {position.x, position.y - 1}, 16, ImGui::GetColorU32(muted));
-      ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 20); ImGui::TextColored(muted, "%s", received.c_str());
+      icon(draw, Icon::Download, {position.x, position.y - px(1)}, px(16), ImGui::GetColorU32(muted));
+      ImGui::SetCursorPosX(ImGui::GetCursorPosX() + px(20)); ImGui::TextColored(muted, "%s", received.c_str());
     }
   } else if (servers_) {
     if (exporting_) {
@@ -464,28 +499,29 @@ DesktopAction DesktopUi::render(DesktopForm& form, const DesktopState& state, fl
       if (form.agentPort > 0 && form.agentPort < 1024 && form.agentPlatform == 1)
         ImGui::TextWrapped("Ports below 1024 may require sudo.");
       ImGui::PopStyleColor();
-      ImGui::Dummy({0, 8});
+      ImGui::Dummy(px(0, 8));
       ImGui::BeginDisabled(state.agentsBusy);
-      if (button("Generate file", {width, primaryHeight}, Icon::Download, true)) action = DesktopAction::ExportAgent;
+      if (button("Generate file", {width, px(primaryHeight)}, Icon::Download, true)) action = DesktopAction::ExportAgent;
       ImGui::EndDisabled();
     } else {
       ImGui::BeginDisabled(busy);
       const float count = 1 + static_cast<float>(state.servers.size());
-      const float listHeight = std::min(292.f, 16 + 52 * count + 4 * (count - 1));
+      const float listHeight = px(std::min(292.f, 16 + 52 * count + 4 * (count - 1)));
       const auto listOrigin = ImGui::GetCursorScreenPos();
       panel(draw, listOrigin, {width, listHeight});
-      ImGui::SetCursorScreenPos({listOrigin.x + 8, listOrigin.y + 8});
+      ImGui::SetCursorScreenPos({listOrigin.x + px(8), listOrigin.y + px(8)});
       ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, 0});
-      ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {0, 4});
+      ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, px(0, 4));
       ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 0);
       ImGui::PushStyleColor(ImGuiCol_ScrollbarBg, {0, 0, 0, 0});
-      if (ImGui::BeginChild("server-list", {width - 16, listHeight - 16}, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground)) {
+      if (ImGui::BeginChild("server-list", {width - px(16), listHeight - px(16)}, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground)) {
         auto serverRow = [&](const std::string& id, const char* name, const char* address, bool online) {
           ImGui::PushID(id.empty() ? "primary" : id.c_str());
           const auto origin = ImGui::GetCursorScreenPos();
           const float rowWidth = ImGui::GetContentRegionAvail().x;
+          const float rowHeight = px(52);
           const bool selected = form.selectedAgent == id;
-          if (ImGui::InvisibleButton("##server", {rowWidth, 52}, ImGuiButtonFlags_EnableNav)) {
+          if (ImGui::InvisibleButton("##server", {rowWidth, rowHeight}, ImGuiButtonFlags_EnableNav)) {
             form.selectedAgent = id; action = DesktopAction::SelectServer;
           }
           const bool focused = ImGui::IsItemFocused() && ImGui::GetIO().NavVisible;
@@ -493,13 +529,14 @@ DesktopAction DesktopUi::render(DesktopForm& form, const DesktopState& state, fl
           auto* listDraw = ImGui::GetWindowDrawList();
           ImVec4 fill = selected ? raised : surface;
           fill.x += .035f * hover; fill.y += .035f * hover; fill.z += .035f * hover;
-          listDraw->AddRectFilled(origin, {origin.x + rowWidth, origin.y + 52}, ImGui::GetColorU32(fill), controlRadius);
-          if (focused) listDraw->AddRect(origin, {origin.x + rowWidth, origin.y + 52}, ImGui::GetColorU32(muted), controlRadius);
-          const float textWidth = rowWidth - (id.empty() ? 24 : 42);
+          listDraw->AddRectFilled(origin, {origin.x + rowWidth, origin.y + rowHeight}, ImGui::GetColorU32(fill), px(controlRadius));
+          if (focused) listDraw->AddRect(origin, {origin.x + rowWidth, origin.y + rowHeight}, ImGui::GetColorU32(muted),
+            px(controlRadius), 0, hairline());
+          const float textWidth = rowWidth - px(id.empty() ? 24 : 42);
           const auto displayName = ellipsize(name, textWidth), displayAddress = ellipsize(address, textWidth);
-          listDraw->AddText({origin.x + 12, origin.y + 10}, ImGui::GetColorU32(accent), displayName.c_str());
-          listDraw->AddText({origin.x + 12, origin.y + 28}, ImGui::GetColorU32(muted), displayAddress.c_str());
-          if (!id.empty()) listDraw->AddCircleFilled({origin.x + rowWidth - 15, origin.y + 26}, 3,
+          listDraw->AddText({origin.x + px(12), origin.y + px(10)}, ImGui::GetColorU32(accent), displayName.c_str());
+          listDraw->AddText({origin.x + px(12), origin.y + px(28)}, ImGui::GetColorU32(muted), displayAddress.c_str());
+          if (!id.empty()) listDraw->AddCircleFilled({origin.x + rowWidth - px(15), origin.y + px(26)}, px(3),
             ImGui::GetColorU32(online ? ImVec4{.65f, .78f, .65f, 1} : muted), 12);
           if (ImGui::IsItemHovered() && !id.empty()) ImGui::SetTooltip("%s", online ? "Online" : "Offline");
           ImGui::PopID();
@@ -511,14 +548,14 @@ DesktopAction DesktopUi::render(DesktopForm& form, const DesktopState& state, fl
       ImGui::EndChild();
       ImGui::PopStyleColor();
       ImGui::PopStyleVar(3);
-      ImGui::SetCursorScreenPos({listOrigin.x, listOrigin.y + listHeight + 8});
+      ImGui::SetCursorScreenPos({listOrigin.x, listOrigin.y + listHeight + px(8)});
       ImGui::EndDisabled();
-      ImGui::Dummy({0, 8});
+      ImGui::Dummy(px(0, 8));
       ImGui::BeginDisabled(state.agentsBusy);
-      if (button("Add server", {width, primaryHeight}, Icon::Proxy, true)) { exporting_ = true; pageAlpha_ = 0; }
-      if (button("Refresh", {width, secondaryHeight}, Icon::Download)) action = DesktopAction::RefreshServers;
+      if (button("Add server", {width, px(primaryHeight)}, Icon::Proxy, true)) { exporting_ = true; pageAlpha_ = 0; }
+      if (button("Refresh", {width, px(secondaryHeight)}, Icon::Download)) action = DesktopAction::RefreshServers;
       ImGui::BeginDisabled(busy || form.selectedAgent.empty());
-      if (button("Remove server", {width, secondaryHeight}, Icon::Close)) ImGui::OpenPopup("Remove server?");
+      if (button("Remove server", {width, px(secondaryHeight)}, Icon::Close)) ImGui::OpenPopup("Remove server?");
       ImGui::EndDisabled();
       ImGui::EndDisabled();
       if (ImGui::BeginPopupModal("Remove server?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
@@ -536,11 +573,11 @@ DesktopAction DesktopUi::render(DesktopForm& form, const DesktopState& state, fl
   } else {
     ImGui::BeginDisabled(busy || state.agentsBusy);
     auto serverInputs = [&](const char* hostLabel, auto& host, int& port, const char* hint) {
-      ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, {6, 0});
+      ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, px(6, 0));
       if (ImGui::BeginTable(hostLabel, 2, ImGuiTableFlags_NoPadOuterX)) {
         ImGui::TableSetupColumn("Host", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Port", ImGuiTableColumnFlags_WidthFixed, 88);
-        ImGui::TableNextRow(ImGuiTableRowFlags_None, ImGui::GetTextLineHeight() + 4);
+        ImGui::TableSetupColumn("Port", ImGuiTableColumnFlags_WidthFixed, px(88));
+        ImGui::TableNextRow(ImGuiTableRowFlags_None, ImGui::GetTextLineHeight() + px(4));
         ImGui::TableNextColumn(); ImGui::TextColored(muted, "%s", hostLabel);
         ImGui::TableNextColumn(); ImGui::TextColored(muted, "Port");
         ImGui::TableNextRow();
@@ -554,17 +591,17 @@ DesktopAction DesktopUi::render(DesktopForm& form, const DesktopState& state, fl
     };
     serverInputs("Server", form.server, form.remotePort, "etl.nora.systems");
     input("Token", form.savedToken ? "Saved" : "", form.token.data(), form.token.size(), true);
-    ImGui::Dummy({0, 8});
+    ImGui::Dummy(px(0, 8));
     ImGui::Separator();
-    ImGui::Dummy({0, 4});
+    ImGui::Dummy(px(0, 4));
     serverInputs(form.mode != DesktopMode::Proxy ? "Backup (proxy only)" : "Backup server", form.backup, form.backupPort, "");
     input("Backup token", form.savedBackupToken ? "Saved" : "Primary token", form.backupToken.data(), form.backupToken.size(), true);
-    ImGui::Dummy({0, 8});
+    ImGui::Dummy(px(0, 8));
     ImGui::Separator();
-    ImGui::Dummy({0, 4});
-    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, {6, 0});
+    ImGui::Dummy(px(0, 4));
+    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, px(6, 0));
     if (ImGui::BeginTable("Local connection", 2, ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_NoPadOuterX)) {
-      ImGui::TableNextRow(ImGuiTableRowFlags_None, ImGui::GetTextLineHeight() + 4);
+      ImGui::TableNextRow(ImGuiTableRowFlags_None, ImGui::GetTextLineHeight() + px(4));
       ImGui::TableNextColumn(); ImGui::TextColored(muted, "Local port");
       ImGui::TableNextColumn(); ImGui::TextColored(muted, "Timeout (ms)");
       ImGui::TableNextRow();
@@ -576,23 +613,29 @@ DesktopAction DesktopUi::render(DesktopForm& form, const DesktopState& state, fl
     }
     ImGui::PopStyleVar();
     input("CA certificate", "System trust store", form.ca.data(), form.ca.size());
-    ImGui::Dummy({0, 8});
-    if (button("Save", {width, primaryHeight}, Icon::Settings, true)) action = DesktopAction::SaveSettings;
+    ImGui::Dummy(px(0, 8));
+    if (button("Save", {width, px(primaryHeight)}, Icon::Settings, true)) action = DesktopAction::SaveSettings;
     ImGui::EndDisabled();
     if (busy) ImGui::TextColored(muted, "Disconnect to edit.");
-    ImGui::Dummy({0, 8});
+    ImGui::Dummy(px(0, 8));
     ImGui::Separator();
     ImGui::TextColored(muted, "v%s", etlVersion);
+    const float half = (width - ImGui::GetStyle().ItemSpacing.x) / 2;
     ImGui::BeginDisabled(update.phase == UpdatePhase::Checking || downloading || state.stopping);
-    if (button(update.phase == UpdatePhase::Checking ? "Checking…" : "Check for updates", {width, secondaryHeight}, Icon::Download))
+    if (button(update.phase == UpdatePhase::Checking ? "Checking…" : "Check for updates", {half, px(secondaryHeight)}, Icon::Download))
       action = DesktopAction::CheckUpdates;
     ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (button("Copy diagnostics", {half, px(secondaryHeight)}, Icon::Copy)) action = DesktopAction::CopyDiagnostics;
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+      ImGui::SetTooltip("Version, mode, network path and recent logs. Never includes tokens.");
+    if (state.diagnosticsCopied) ImGui::TextColored(muted, "Diagnostics copied to the clipboard.");
     if (update.phase == UpdatePhase::Current) ImGui::TextColored(muted, "Up to date");
     if (!update.offered && !update.error.empty()) ImGui::TextWrapped("%s", update.error.c_str());
   }
 
   if (!options_ && !servers_ && state.running && state.mode == DesktopMode::Selective) {
-    ImGui::Dummy({0, 6});
+    ImGui::Dummy(px(0, 6));
     ImGui::PushStyleColor(ImGuiCol_Text, muted);
     if (state.paused) ImGui::TextWrapped("The ETL server is not answering. Twingate uses the normal network "
       "until it does; routing resumes automatically.");
@@ -601,28 +644,34 @@ DesktopAction DesktopUi::render(DesktopForm& form, const DesktopState& state, fl
     else ImGui::TextWrapped("Waiting for blocked Twingate relay connections.");
     ImGui::PopStyleColor();
   }
-  if (!options_ && !servers_ && state.running && state.mode == DesktopMode::Full && state.dnsBypassed) {
-    ImGui::Dummy({0, 6});
+  if (!options_ && !servers_ && state.running && state.mode == DesktopMode::Full && state.paused) {
+    ImGui::Dummy(px(0, 6));
+    ImGui::PushStyleColor(ImGuiCol_Text, muted);
+    ImGui::TextWrapped("The tunnel dropped, so this PC is using its normal connection. "
+      "ETL reconnects as soon as the server answers.");
+    ImGui::PopStyleColor();
+  } else if (!options_ && !servers_ && state.running && state.mode == DesktopMode::Full && state.dnsBypassed) {
+    ImGui::Dummy(px(0, 6));
     ImGui::PushStyleColor(ImGuiCol_Text, muted);
     ImGui::TextWrapped("DNS is not reaching the tunnel. Another VPN or firewall may block UDP port 53. "
       "Connections still go through ETL.");
     ImGui::PopStyleColor();
   }
   if (!state.error.empty()) {
-    ImGui::Dummy({0, 6});
+    ImGui::Dummy(px(0, 6));
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{.94f, .66f, .63f, 1});
     ImGui::TextWrapped("%s", state.error.c_str());
     ImGui::PopStyleColor();
   }
   if (!options_ && !servers_ && update.offered) {
-    ImGui::Dummy({0, 8}); ImGui::Separator(); ImGui::Dummy({0, 4});
+    ImGui::Dummy(px(0, 8)); ImGui::Separator(); ImGui::Dummy(px(0, 4));
     ImGui::TextUnformatted(downloading ? "Updating" : "Update available");
     ImGui::TextColored(muted, "%s → %s", etlVersion, update.version.c_str());
     if (downloading) {
       ImGui::PushStyleColor(ImGuiCol_PlotHistogram, accent);
       ImGui::PushStyleColor(ImGuiCol_FrameBg, raised);
       ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0);
-      ImGui::ProgressBar(update.progress, {width, 6}, "");
+      ImGui::ProgressBar(update.progress, {width, px(6)}, "");
       ImGui::PopStyleVar();
       ImGui::PopStyleColor(2);
       if (update.phase == UpdatePhase::Ready) ImGui::TextColored(muted, "Restarting…");
@@ -633,15 +682,15 @@ DesktopAction DesktopUi::render(DesktopForm& form, const DesktopState& state, fl
       ImGui::PopStyleColor();
       if (!update.error.empty()) ImGui::TextWrapped("%s", update.error.c_str());
       ImGui::BeginDisabled(state.starting || state.stopping);
-      const float half = (width - 12) / 2;
-      if (button("Later", {half, secondaryHeight}, Icon::Close)) action = DesktopAction::DismissUpdate;
+      const float half = (width - px(12)) / 2;
+      if (button("Later", {half, px(secondaryHeight)}, Icon::Close)) action = DesktopAction::DismissUpdate;
       ImGui::SameLine();
-      if (button(update.phase == UpdatePhase::Failed ? "Retry" : "Update", {half, secondaryHeight}, Icon::Download, true))
+      if (button(update.phase == UpdatePhase::Failed ? "Retry" : "Update", {half, px(secondaryHeight)}, Icon::Download, true))
         action = DesktopAction::InstallUpdate;
       ImGui::EndDisabled();
     }
   }
-  contentHeight_ = ImGui::GetCursorPosY() + pageInset - ImGui::GetStyle().ItemSpacing.y;
+  contentHeight_ = ImGui::GetCursorPosY() + px(pageInset) - ImGui::GetStyle().ItemSpacing.y;
   ImGui::PopStyleVar();
   ImGui::SetScrollY(0);
   ImGui::End();
