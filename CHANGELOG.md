@@ -7,8 +7,9 @@
   hold the small setup frames back for another round trip. Clients now send the
   destination in the same TLS record as the token and disable Nagle on the
   tunnel socket (the server also does, after its next deployment). Measured
-  through the production server, a new HTTPS request went from about 2.0 to 1.1
-  seconds. Servers already read frames in order, so older servers benefit too.
+  through the production server, a new HTTPS request went from about 2.0 seconds
+  to between 1.1 and 1.4 seconds. Servers already read frames in order, so
+  older servers benefit too.
 - **Full mode reconnects by itself.** A lost tunnel still restores the normal
   connection at once, but the session no longer ends: the app shows
   "Reconnecting" with an amber dot, checks the server after 2, 4, 8 and 16

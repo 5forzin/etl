@@ -127,7 +127,7 @@ as the authentication frame and disables Nagle's algorithm, so setup takes three
 round trips: TCP, TLS, then authentication together with the destination. Before
 0.8, authentication and destination took one round trip each and Nagle's
 algorithm could hold a small frame for another. Measured through the production
-server, a new HTTPS request went from about 2.0 to 1.1 seconds.
+server, a new HTTPS request went from about 2.0 seconds to between 1.1 and 1.4 seconds.
 New connections may use a backup with its own token.
 The backup is checked in the background at startup and every 30 seconds after
 each check. It receives traffic only after verified TLS and ETL authentication
